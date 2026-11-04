@@ -437,13 +437,8 @@ int main(int argc, char* argv[]) {
             return 5;
         }
         snow_shot::presentation::LanguageManager::instance().initialize();
-        const auto startupSettings = snow_shot::storage::SystemSettings();
-        const auto startupResult = snow_shot::platform::windows::reconcileStartupMode(
-            !startupSettings.autoStartAtBoot() ? snow_shot::platform::windows::StartupMode::Off
-            : startupSettings.launchAsAdministrator()
-                ? snow_shot::platform::windows::StartupMode::ElevatedTask
-                : snow_shot::platform::windows::StartupMode::Registry);
-
+        // A distribution probe must not change the installed application's
+        // auto-start registration. Reconciliation belongs to normal startup.
         snow_shot::presentation::styles::ThemeManager::instance().initialize(probe);
         storage.shutdown();
         return 0;
@@ -724,18 +719,23 @@ int main(int argc, char* argv[]) {
     applicationController.start(launchArguments, [&] {
         const auto startupSettings = snow_shot::storage::SystemSettings();
 #ifdef Q_OS_WIN
+        const bool portableStorage =
+            applicationStorage.status().effectiveMode == snow_shot::storage::StorageMode::Portable;
+        const auto contextMenuMode = applicationStorage.configuration()
+                                         .value(QStringLiteral("system/context_menu_mode"))
+                                         .toString();
         QString shellRegistrationError;
         const snow_shot::platform::windows::ShellContextMenuRegistration shellRegistration;
         const auto contextMenuShortcuts = snow_shot::shortcuts::shortcutBindingsFromJson(
             snow_shot::storage::ApplicationStorage::instance().configuration().value(
                 QStringLiteral("context_menu_shortcuts/edit_with_snow_shot")),
             false);
-        if (!shellRegistration.setMode(
+        // An opt-out portable copy must not remove another installation's
+        // shell registration. Explicit changes in Settings still use the normal adapter.
+        if ((!portableStorage || contextMenuMode != QStringLiteral("disabled")) &&
+            !shellRegistration.setMode(
                 snow_shot::platform::windows::ShellContextMenuRegistration::modeFromValue(
-                    snow_shot::storage::ApplicationStorage::instance()
-                        .configuration()
-                        .value(QStringLiteral("system/context_menu_mode"))
-                        .toString()),
+                    contextMenuMode),
                 contextMenuShortcuts.isEmpty() ? QString()
                                                : contextMenuShortcuts.first().portableText,
                 &shellRegistrationError)) {
@@ -749,7 +749,9 @@ int main(int argc, char* argv[]) {
                       startupSettings.autoStartAtBoot())
                 : snow_shot::platform::macos::LoginItemResult{};
 #else
-        const auto startupResult = snow_shot::platform::windows::reconcileStartupMode(
+        const auto startupResult = portableStorage && !startupSettings.autoStartAtBoot()
+            ? snow_shot::platform::windows::AdministratorResult{true, false, {}}
+            : snow_shot::platform::windows::reconcileStartupMode(
             !startupSettings.autoStartAtBoot() ? snow_shot::platform::windows::StartupMode::Off
             : startupSettings.launchAsAdministrator()
                 ? snow_shot::platform::windows::StartupMode::ElevatedTask

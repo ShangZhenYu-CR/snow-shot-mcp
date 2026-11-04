@@ -27,6 +27,10 @@ pinned OCR submodule reference are included; no additional restriction is impose
 - Focused tests, interface documentation and validation records.
 - MSVC CRT compatibility corrections in the Crashpad, minizip-ng and OpenCV ports
   to honor the selected triplet when building with shared Qt.
+- Configurable distribution version and Windows x64 portable Release packaging.
+- Read-only update probes; an opt-out portable copy no longer removes an installed
+  copy's startup or shell registration during normal startup. Explicit Settings
+  changes retain their original behavior.
 
 ## Validation and distribution scope
 
@@ -38,9 +42,18 @@ See snow_shot/MCP_NATIVE_ACTIONS_AUDIT.md for precise evidence and remaining
 native desktop acceptance. Printing, cloud upload and platform-specific final
 outputs are not all end-to-end verified. No full test suite was run.
 
-No locally downloaded SDKs, credentials, build outputs, screenshots, logs or
-installer binaries are included. The existing upstream build scripts and license
-collection scripts remain available. The unrelated local deletion of
+The Windows x64 Release portable build also passed distribution and offscreen
+update probes with developer directories removed from PATH. Its packaged MCP
+bridge verified all 38 action records and PNG icons, interactive screenshot
+begin/state/cancel, and normal application quit. The packaged OCR worker reports
+version 1.2.1 / protocol 7. Startup and shell-registration registry snapshots
+remained unchanged during these checks. This is a same-machine deployment check,
+not a claim of testing on every clean Windows installation.
+
+The source snapshot excludes local SDKs, credentials, build outputs, screenshots
+and logs. Runnable portable software and corresponding source archives are separate
+release assets. The existing upstream build scripts and license collection scripts
+remain available. The unrelated local deletion of
 scripts/initialize-snow-shot-arm64-libclang.ps1 is not part of this distribution;
 its upstream version is retained in the published snapshot.
 
@@ -48,6 +61,10 @@ its upstream version is retained in the published snapshot.
 
 - `FORK_CHANGES.md`
 - `README.md`
+- `CMakeLists.txt`
+- `docs-portable-mcp-build.md`
+- `scripts/test-snow-shot-portable.py`
+- `snow_shot/src/app/main.cpp`
 - `cmake/vcpkg-overlay-ports/crashpad/portfile.cmake`
 - `cmake/vcpkg-overlay-ports/minizip-ng/portfile.cmake`
 - `cmake/vcpkg-overlay-ports/opencv4/portfile.cmake`

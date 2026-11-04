@@ -24,10 +24,13 @@ Apache-2.0 components and third-party materials retain their own licenses. See [
 [the complete GPLv3 text](snow_shot/LICENSE), component `COPYRIGHT` files and
 `THIRD_PARTY_NOTICES.md` files. No warranty is provided.
 
-This publication contains source, not an installer. Clone recursively to obtain
-the separately licensed OCR submodule. Build instructions and dependencies remain
-in the original documentation. Windows x64 Debug with Qt 6.12.0 was validated;
-individual desktop outputs and other platforms are not all tested.
+Download the portable Windows x64 `.7z` software from
+[Releases](https://github.com/ShangZhenYu-CR/snow-shot-mcp/releases).
+Extract the entire archive and run `Start Snow Shot.cmd`. See
+[portable build and usage](docs-portable-mcp-build.md) for data storage,
+MCP setup, update behavior and source dependencies. Clone recursively to obtain
+the separately licensed OCR submodule when building from Git. Individual desktop
+outputs and other platforms are not all tested; see each release's validation notes.
 
 The upstream installation instructions below install **the original upstream
 application**, not the MCP-modified build in this repository.
