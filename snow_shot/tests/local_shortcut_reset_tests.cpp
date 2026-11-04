@@ -1,0 +1,369 @@
+#include "snow_shot/presentation/globalshortcutmanager.h"
+#include "snow_shot/presentation/settings/settingsbackend.h"
+#include "snow_shot/presentation/settings/settingsregistry.h"
+#include "snow_shot/presentation/settings/settingsruntimesession.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/configurationschema.h"
+
+#include <QApplication>
+#include <QDir>
+#include <QJsonArray>
+#include <QTemporaryDir>
+
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+namespace settings = snow_shot::presentation::settings;
+namespace storage = snow_shot::storage;
+namespace shortcuts = snow_shot::shortcuts;
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void duplicateShortcutSharesOnlyHistoryContexts(settings::SettingsRuntimeSession& session,
+                                                settings::BuiltInSettingsBackend& backend) {
+    constexpr auto scope = settings::SettingsLocalShortcutScope::Screenshot;
+    const QString id = QStringLiteral("duplicate_latest_region");
+    const shortcuts::ShortcutBindingList defaultKeys{QStringLiteral("R")};
+    require(session.localShortcuts(scope, id) == defaultKeys,
+            "duplicate defaults must coexist with previous selection R");
+    require(session.applyLocalShortcuts(scope, id, {QStringLiteral("Shift+R")}),
+            "duplicate may share the next-selection shortcut");
+    require(
+        !session.validateLocalShortcut(scope, id, QStringLiteral("C")).supported &&
+            !backend.applyLocalShortcuts(scope, id, {QStringLiteral("C")}) &&
+            !storage::setLocalShortcutValuesAtomic({{QStringLiteral("screenshot_shortcuts/") + id,
+                                                     QJsonArray{QStringLiteral("C")}}}) &&
+            session.localShortcuts(scope, id) ==
+                shortcuts::ShortcutBindingList{QStringLiteral("Shift+R")},
+        "overlapping shortcut contexts still reject conflicting keys atomically");
+    require(session.applyLocalShortcuts(scope, id, {}) &&
+                session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                session.localShortcuts(scope, id) == defaultKeys,
+            "reset restores contextual R without rejecting previous selection R");
+}
+
+void screenshotSaveHotkeysReset(settings::SettingsRuntimeSession& session) {
+    using Action = snow_shot::presentation::GlobalShortcutAction;
+    require(
+        session.applyShortcuts(Action::ScreenshotSave, {QStringLiteral("Ctrl+Alt+F10")}) &&
+            session.applyShortcuts(Action::ScreenshotQuickSave, {QStringLiteral("Ctrl+Alt+F11")}),
+        "customize both screenshot save hotkeys");
+    require(session.reset(settings::SettingsSectionReset::ScreenshotShortcuts) &&
+                session.shortcutState(Action::ScreenshotSave).shortcuts.isEmpty() &&
+                session.shortcutState(Action::ScreenshotQuickSave).shortcuts.isEmpty(),
+            "Screenshot reset clears both save hotkeys to their unset defaults");
+    const auto& configuration = storage::ApplicationStorage::instance().configuration();
+    require(configuration.value(QStringLiteral("global_shortcuts/screenshot_save"))
+                    .toArray()
+                    .isEmpty() &&
+                configuration.value(QStringLiteral("global_shortcuts/screenshot_quick_save"))
+                    .toArray()
+                    .isEmpty(),
+            "Screenshot reset persists both cleared save hotkeys");
+}
+
+void copyShortcutReset(settings::SettingsRuntimeSession& session) {
+    constexpr auto scope = settings::SettingsLocalShortcutScope::Screenshot;
+    const QString id = QStringLiteral("copy_to_clipboard");
+    const shortcuts::ShortcutBindingList defaults{QStringLiteral("Ctrl+C"),
+                                                  QStringLiteral("Enter")};
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    const auto before = configuration.snapshot();
+    require(session.localShortcuts(scope, id) == defaults,
+            "screenshot copy must initially default to Ctrl+C and Enter");
+    for (const auto& value : {shortcuts::ShortcutBindingList{QStringLiteral("Alt+C")},
+                              shortcuts::ShortcutBindingList{}}) {
+        require(session.applyLocalShortcuts(scope, id, value) &&
+                    session.localShortcuts(scope, id) == value,
+                "screenshot copy must support custom keys and disabling");
+        require(session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                    session.localShortcuts(scope, id) == defaults &&
+                    configuration.snapshot() == before,
+                "reset must restore both Ctrl+C and Enter for screenshot copy");
+    }
+}
+
+void printShortcutsReset(settings::SettingsRuntimeSession& session) {
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    const shortcuts::ShortcutBindingList defaults{QStringLiteral("Ctrl+P")};
+    for (const auto scope : {settings::SettingsLocalShortcutScope::Screenshot,
+                             settings::SettingsLocalShortcutScope::PinToScreen}) {
+        const auto reset = scope == settings::SettingsLocalShortcutScope::Screenshot
+                               ? settings::SettingsSectionReset::ScreenshotEditorShortcuts
+                               : settings::SettingsSectionReset::PinToScreenShortcuts;
+        const auto before = configuration.snapshot();
+        require(session.localShortcuts(scope, QStringLiteral("print")) == defaults,
+                "print shortcuts must initially default to Ctrl+P");
+        for (const auto& value : {shortcuts::ShortcutBindingList{QStringLiteral("Ctrl+Alt+F11"),
+                                                                 QStringLiteral("Ctrl+Alt+F12")},
+                                  shortcuts::ShortcutBindingList{}}) {
+            require(session.applyLocalShortcuts(scope, QStringLiteral("print"), value) &&
+                        session.localShortcuts(scope, QStringLiteral("print")) == value,
+                    "print shortcuts must support custom keys and disabling");
+            require(session.reset(reset) &&
+                        session.localShortcuts(scope, QStringLiteral("print")) == defaults &&
+                        configuration.snapshot() == before,
+                    "reset must restore customized and disabled print shortcuts to Ctrl+P");
+        }
+    }
+}
+
+void selectionTypeShortcutsPersistValidateAndReset(settings::SettingsRuntimeSession& session,
+                                                   settings::BuiltInSettingsBackend& backend,
+                                                   const QString& configurationPath) {
+    constexpr auto scope = settings::SettingsLocalShortcutScope::Screenshot;
+    const QStringList ids{QStringLiteral("next_selection_type"),
+                          QStringLiteral("previous_selection_type")};
+#ifdef Q_OS_MACOS
+    const QStringList expectedDefaults{QStringLiteral("Meta+Tab"),
+                                       QStringLiteral("Meta+Shift+Tab")};
+#else
+    const QStringList expectedDefaults{QStringLiteral("Ctrl+Tab"),
+                                       QStringLiteral("Ctrl+Shift+Tab")};
+#endif
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    for (int index = 0; index < ids.size(); ++index) {
+        const QString& id = ids.at(index);
+        const auto defaults = session.localShortcuts(scope, id);
+        require(defaults.size() == 1 &&
+                    defaults.constFirst().portableText == expectedDefaults.at(index),
+                "selection-type shortcuts must expose the platform's Control+Tab defaults");
+#ifdef Q_OS_MACOS
+        require(shortcuts::macVirtualKeyForBinding(defaults.constFirst()) == 48 &&
+                    shortcuts::effectiveIdentity(defaults.constFirst())
+                        .modifiers.testFlag(Qt::MetaModifier),
+                "macOS selection-type defaults must use physical Control and Tab");
+#endif
+        shortcuts::ShortcutBindingList custom{QStringLiteral("G"), QStringLiteral("Ctrl+Alt+G")};
+#ifdef Q_OS_MACOS
+        custom.first().physicalKeys.insert(shortcuts::ShortcutPlatform::MacOS, 5);
+#endif
+        require(session.applyLocalShortcuts(scope, id, custom) &&
+                    session.localShortcuts(scope, id) == custom,
+                "both cycling directions must support two custom shortcuts");
+        const auto otherDefaults = session.localShortcuts(scope, ids.at(1 - index));
+        require(!session.validateLocalShortcut(scope, id, otherDefaults.constFirst()).supported &&
+                    !backend.applyLocalShortcuts(scope, id, otherDefaults) &&
+                    !backend.applyLocalShortcuts(scope, id, {QStringLiteral("C")}) &&
+                    !backend.applyLocalShortcuts(scope, id, {QStringLiteral("Backspace")}) &&
+                    session.localShortcuts(scope, id) == custom,
+                "conflicting and reserved cycling shortcuts must preserve the existing settings");
+        require(configuration.flushNow().success, "persist custom selection-type shortcuts");
+        storage::ConfigurationStore reloaded(configurationPath, true, true, 60000);
+        require(shortcuts::shortcutBindingsFromJson(
+                    reloaded.value(QStringLiteral("screenshot_shortcuts/") + id), true) == custom,
+                "custom selection-type shortcuts must survive configuration reload");
+        require(session.applyLocalShortcuts(scope, id, {}) &&
+                    session.localShortcuts(scope, id).isEmpty(),
+                "clearing a selection-type shortcut must disable that direction");
+        require(session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                    session.localShortcuts(scope, id) == defaults,
+                "reset must restore the platform's selection-type shortcut defaults");
+    }
+}
+
+void pinWindowShortcutPersistsValidatesAndResets(settings::SettingsRuntimeSession& session,
+                                                 const QString& configurationPath) {
+    constexpr auto scope = settings::SettingsLocalShortcutScope::Screenshot;
+    const QString id = QStringLiteral("pin_window_to_screen");
+    const QString fieldId = QStringLiteral("screenshot-shortcut.") + id;
+    const shortcuts::ShortcutBindingList defaults{QStringLiteral("Alt+W")};
+    const shortcuts::ShortcutBindingList custom{QStringLiteral("Ctrl+Alt+F11"),
+                                                QStringLiteral("Ctrl+Alt+F12")};
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    const auto before = configuration.snapshot();
+    const auto* field = settings::builtInSettingsRegistry().field(fieldId);
+    require(field && field->configurationKey == QStringLiteral("screenshot_shortcuts/") + id &&
+                field->definition->title.translated() == QStringLiteral("Pin Window to Screen") &&
+                field->reset == settings::SettingsSectionReset::ScreenshotEditorShortcuts,
+            "window pin must have a labeled, resettable setting in the screenshot shortcuts");
+    require(session.localShortcuts(scope, id) == defaults &&
+                storage::ScreenshotShortcutSettings().allShortcuts().contains(id),
+            "Pin Window to Screen must expose Alt+W as its default screenshot shortcut");
+    require(
+        !session.validateLocalShortcut(scope, QStringLiteral("pin_to_screen"),
+                                       defaults.constFirst())
+                .supported &&
+            !session.applyLocalShortcuts(scope, id, {QStringLiteral("Ctrl+F")}) &&
+            session.state(fieldId).phase == settings::SettingsWritePhase::Rejected &&
+            storage::ScreenshotShortcutSettings().shortcuts(id) == defaults,
+        "the two pin actions must reject conflicting shortcuts without changing stored bindings");
+    require(session.discard(fieldId) && session.localShortcuts(scope, id) == defaults,
+            "discarding a rejected window pin shortcut must restore its accepted binding");
+    require(session.applyLocalShortcuts(scope, id, custom) &&
+                session.localShortcuts(scope, id) == custom && configuration.flushNow().success,
+            "Pin Window to Screen must support two persistent custom shortcuts");
+    storage::ConfigurationStore reloaded(configurationPath, true, true, 60000);
+    require(shortcuts::shortcutBindingsFromJson(
+                reloaded.value(QStringLiteral("screenshot_shortcuts/") + id), false) == custom,
+            "custom window pin shortcuts must survive configuration reload");
+    for (const auto& value : {custom, shortcuts::ShortcutBindingList{}}) {
+        require(session.applyLocalShortcuts(scope, id, value) &&
+                    session.localShortcuts(scope, id) == value,
+                "Pin Window to Screen must support customization and disabling");
+        require(session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                    session.localShortcuts(scope, id) == defaults &&
+                    configuration.snapshot() == before,
+                "reset must restore customized and disabled window pin shortcuts to Alt+W");
+    }
+}
+
+void allLocalShortcutSectionsReset(settings::SettingsRuntimeSession& session) {
+    const auto& registry = settings::builtInSettingsRegistry();
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    for (const auto reset : {settings::SettingsSectionReset::ScreenshotEditorShortcuts,
+                             settings::SettingsSectionReset::ScreenshotOtherShortcuts,
+                             settings::SettingsSectionReset::DrawingShortcuts,
+                             settings::SettingsSectionReset::PinToScreenShortcuts,
+                             settings::SettingsSectionReset::ScreenRecordingShortcuts}) {
+        // Disabled siblings make preservation observable across scopes and the
+        // screenshot bindings shared by Screenshot, Annotation, and Image Recognition.
+        for (const auto& field : registry.fields()) {
+            if (field.kind != settings::SettingsFieldKind::LocalShortcut) {
+                continue;
+            }
+            const auto& local =
+                std::get<settings::SettingsLocalShortcutDefinition>(field.definition->payload);
+            require(session.applyLocalShortcuts(local.scope, local.shortcutId, {}),
+                    "disable local shortcuts before checking section isolation");
+        }
+        const auto& indexes = registry.fieldsForReset(reset);
+        require(!indexes.isEmpty(), "every local shortcut reset section must have fields");
+        auto expected = configuration.snapshot();
+        for (const int index : indexes) {
+            const auto& field = registry.fields().at(index);
+            require(field.kind == settings::SettingsFieldKind::LocalShortcut,
+                    "application shortcut sections must contain local shortcut fields");
+            const auto normalized = storage::ConfigurationSchema::normalize(
+                field.configurationKey,
+                storage::ConfigurationSchema::defaultValue(field.configurationKey));
+            require(normalized.valid, "local shortcut defaults must be valid");
+            expected.insert(field.configurationKey, normalized.value);
+        }
+        for (const int index : indexes) {
+            const auto& field = registry.fields().at(index);
+            const auto& local =
+                std::get<settings::SettingsLocalShortcutDefinition>(field.definition->payload);
+            for (const auto& value :
+                 {shortcuts::ShortcutBindingList{QStringLiteral("Ctrl+Alt+F11"),
+                                                 QStringLiteral("Ctrl+Alt+F12")},
+                  shortcuts::ShortcutBindingList{}}) {
+                require(session.applyLocalShortcuts(local.scope, local.shortcutId, value),
+                        qPrintable(QStringLiteral("customize local shortcut: %1").arg(field.id)));
+                require(session.reset(reset) && configuration.snapshot() == expected,
+                        qPrintable(QStringLiteral("reset entire section and preserve siblings: %1")
+                                       .arg(field.id)));
+                for (const int resetIndex : indexes) {
+                    const auto& resetField = registry.fields().at(resetIndex);
+                    const auto& resetLocal = std::get<settings::SettingsLocalShortcutDefinition>(
+                        resetField.definition->payload);
+                    const auto bindings = shortcuts::shortcutBindingsFromJson(
+                        expected.value(resetField.configurationKey),
+                        resetLocal.scope == settings::SettingsLocalShortcutScope::Screenshot, 2,
+                        nullptr, nullptr, resetLocal.shortcutId == QStringLiteral("toggle_guides"));
+                    require(session.localShortcuts(resetLocal.scope, resetLocal.shortcutId) ==
+                                    bindings &&
+                                session.state(resetField.id).phase ==
+                                    settings::SettingsWritePhase::Clean,
+                            "reset must refresh every shortcut field in the runtime session");
+                }
+            }
+        }
+    }
+}
+
+void conflictingResetRemainsAtomic(settings::SettingsRuntimeSession& session) {
+    constexpr auto scope = settings::SettingsLocalShortcutScope::Screenshot;
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    require(
+        session.applyLocalShortcuts(scope, QStringLiteral("print"), {}) &&
+            session.applyLocalShortcuts(scope, QStringLiteral("undo"), {QStringLiteral("Ctrl+P")}),
+        "assign print's default key to an Annotation shortcut in the screenshot scope");
+    const auto before = configuration.snapshot();
+    require(!session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                configuration.snapshot() == before,
+            "a conflicting section reset must reject the entire write and preserve siblings");
+    require(session.reset(settings::SettingsSectionReset::DrawingShortcuts) &&
+                session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                session.localShortcuts(scope, QStringLiteral("print")) ==
+                    shortcuts::ShortcutBindingList{QStringLiteral("Ctrl+P")},
+            "print reset must succeed after resetting the conflicting sibling section");
+}
+
+void annotationResetPreservesPrintShortcut(settings::SettingsRuntimeSession& session) {
+    constexpr auto screenshot = settings::SettingsLocalShortcutScope::Screenshot;
+    constexpr auto drawing = settings::SettingsLocalShortcutScope::Drawing;
+    auto& configuration = storage::ApplicationStorage::instance().configuration();
+    const auto redoDefault = session.localShortcuts(screenshot, QStringLiteral("redo"));
+    require(session.applyLocalShortcuts(screenshot, QStringLiteral("redo"), {}) &&
+                session.applyLocalShortcuts(screenshot, QStringLiteral("print"), redoDefault) &&
+                session.applyLocalShortcuts(drawing, QStringLiteral("line"),
+                                            {QStringLiteral("Ctrl+Alt+F10")}),
+            "assign Redo's default to Print while customizing an Annotation tool");
+    const auto before = configuration.snapshot();
+    const auto revision = configuration.revision();
+    int notifications = 0;
+    const auto connection =
+        QObject::connect(&configuration, &storage::ConfigurationStore::valueChanged, &session,
+                         [&](const QString&, const QJsonValue&) { ++notifications; });
+    require(!session.reset(settings::SettingsSectionReset::DrawingShortcuts) &&
+                configuration.snapshot() == before && configuration.revision() == revision &&
+                notifications == 0,
+            "a Print collision must reject the Annotation reset across both shortcut scopes");
+    QObject::disconnect(connection);
+    require(session.reset(settings::SettingsSectionReset::ScreenshotEditorShortcuts) &&
+                session.localShortcuts(screenshot, QStringLiteral("redo")).isEmpty() &&
+                session.localShortcuts(drawing, QStringLiteral("line")) ==
+                    shortcuts::ShortcutBindingList{QStringLiteral("Ctrl+Alt+F10")},
+            "resetting Print must preserve both scopes of the Annotation section");
+    require(session.reset(settings::SettingsSectionReset::DrawingShortcuts) &&
+                session.localShortcuts(screenshot, QStringLiteral("redo")) == redoDefault &&
+                session.localShortcuts(screenshot, QStringLiteral("print")) ==
+                    shortcuts::ShortcutBindingList{QStringLiteral("Ctrl+P")},
+            "Annotation reset must restore Redo and preserve Print once its default is freed");
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication application(argc, argv);
+    QTemporaryDir temporary;
+    require(temporary.isValid(), "create isolated local shortcut settings directory");
+    auto& applicationStorage = storage::ApplicationStorage::instance();
+    const storage::StorageInitializationOptions options{temporary.filePath(QStringLiteral("bin")),
+                                                        temporary.path(), 60000};
+    require(applicationStorage.initialize(options).success,
+            "initialize local shortcut settings storage");
+    {
+        snow_shot::presentation::GlobalShortcutManager manager;
+        settings::BuiltInSettingsBackend backend(manager);
+        settings::SettingsRuntimeSession session(settings::builtInSettingsRegistry(), backend);
+        duplicateShortcutSharesOnlyHistoryContexts(session, backend);
+        screenshotSaveHotkeysReset(session);
+        copyShortcutReset(session);
+        printShortcutsReset(session);
+        selectionTypeShortcutsPersistValidateAndReset(
+            session, backend,
+            QDir(applicationStorage.configurationDirectory())
+                .filePath(QStringLiteral("config.json")));
+        pinWindowShortcutPersistsValidatesAndResets(
+            session, QDir(applicationStorage.configurationDirectory())
+                         .filePath(QStringLiteral("config.json")));
+        allLocalShortcutSectionsReset(session);
+        conflictingResetRemainsAtomic(session);
+        annotationResetPreservesPrintShortcut(session);
+    }
+    const auto expected = applicationStorage.configuration().snapshot();
+    require(applicationStorage.flushNow().success, "persist reset local shortcut settings");
+    applicationStorage.shutdown();
+    require(applicationStorage.initialize(options).success &&
+                applicationStorage.configuration().snapshot() == expected,
+            "reset shortcuts and preserved siblings must survive restart");
+    applicationStorage.shutdown();
+    return 0;
+}

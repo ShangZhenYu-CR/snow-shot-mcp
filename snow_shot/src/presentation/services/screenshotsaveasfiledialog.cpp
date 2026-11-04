@@ -1,0 +1,1499 @@
+#include "snow_shot/presentation/screenshotsaveasfiledialog.h"
+
+#include "snow_shot/presentation/components/actionpopupmenu.h"
+#include "snow_shot/presentation/components/aspectratiolockbutton.h"
+#include "snow_shot/presentation/components/pathinput.h"
+#include "snow_shot/presentation/screenshotexportartifact.h"
+#include "snow_shot/presentation/screenshotsavepreviewcanvas.h"
+#include "snow_shot/storage/settingsadapters.h"
+#include "snow_shot/storage/exportfilename.h"
+#include "screenshotsaveexportpipeline.h"
+#include "screenshotsavefooter.h"
+#include "screenshotsaveresult.h"
+#include "widgets/button.h"
+#include "widgets/context_menu.h"
+#include "widgets/detail/flow_layout.h"
+#include "widgets/field_group.h"
+#include "widgets/form.h"
+#include "widgets/input_line_edit.h"
+#include "widgets/input_number.h"
+#include "widgets/modal.h"
+#include "widgets/select.h"
+#include "widgets/segmented.h"
+#include "widgets/scroll_area.h"
+#include "widgets/slider.h"
+#include "theme/theme_manager.h"
+#include "antd_icons.h"
+
+#include <QApplication>
+#include <QCoreApplication>
+#include <QDir>
+#include <QEvent>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QHBoxLayout>
+#include <QHash>
+#include <QLabel>
+#include <QPointer>
+#include <QRegularExpression>
+#include <QScreen>
+#include <QSignalBlocker>
+#include <QStandardPaths>
+#include <QStackedWidget>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWindow>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <optional>
+
+#if defined(Q_OS_WIN)
+#include <qt_windows.h>
+#endif
+
+namespace {
+using namespace adqt::widgets;
+namespace icons = adqt::icons::antd::outlined;
+namespace pipeline = screenshot_save_export;
+using Format = ScreenshotImageFileFormat;
+using Shortcut = snow_shot::storage::ScreenshotSavePathShortcut;
+
+constexpr int kSaveFormContentWidth = 328;
+constexpr int kAspectRatioLockButtonSize = 32;
+constexpr int kMaximumDimension = 1000000;
+
+constexpr std::array<Format, 7> kFormats{
+    Format::Png, Format::Jpeg, Format::Bmp, Format::Webp, Format::Jxl, Format::Avif, Format::Pdf,
+};
+
+bool formatSupportsLossless(Format format) {
+    return format == Format::Pdf || format == Format::Webp || format == Format::Jxl ||
+           format == Format::Avif;
+}
+
+bool samePreviewPixels(ScreenshotSaveExportOptions left, ScreenshotSaveExportOptions right) {
+    if (left.format == Format::Png && right.format == Format::Png)
+        left.compressionLevel = right.compressionLevel;
+    if (left.format == Format::Pdf && right.format == Format::Pdf) {
+        // The paper is drawn by the preview canvas; title and page layout never alter the tiles.
+        left.pdfPageSize = right.pdfPageSize;
+        left.pdfTitle = right.pdfTitle;
+    }
+    return left == right;
+}
+
+QString translated(const char* text) {
+    return QCoreApplication::translate("ScreenshotSaveAsFileDialog", text);
+}
+
+void configureForm(AdForm* form) {
+    form->setFormLayout(AdForm::FormLayout::Vertical);
+    form->setLabelAlign(AdForm::LabelAlign::Left);
+    form->setColon(false);
+    form->setRequiredMark(AdForm::RequiredMark::Hidden);
+}
+
+class SaveContent final : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(ScreenshotSaveAsFileDialog)
+    enum class Phase { Editing, Saving, Result, Closed };
+
+  public:
+    SaveContent(AdModal* modal, std::shared_ptr<ScreenshotExportArtifact> artifact,
+                ScreenshotSaveAsFileDialog::Saved saved)
+        : m_modal(modal), m_artifact(std::move(artifact)), m_saved(std::move(saved)),
+          m_windowNames(m_artifact->windowNames()) {
+        setObjectName(QStringLiteral("saveDialogContent"));
+        setMinimumHeight(240);
+        setMaximumHeight(540);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        m_renderTimer.setSingleShot(true);
+        m_renderTimer.setInterval(100);
+        connect(&m_renderTimer, &QTimer::timeout, this, [this] { startRender(); });
+        m_state = ScreenshotSaveDialogState::initial({}, m_timestamp, m_windowNames);
+        loadRememberedFormatOptions();
+        applyRememberedFormatOptions();
+        auto* layout = new QHBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(20);
+        m_preview = new ScreenshotSavePreviewCanvas(this);
+        layout->addWidget(m_preview, 1);
+        m_outputDescription = new QLabel(this);
+        m_outputDescription->setObjectName(QStringLiteral("saveOutputDescription"));
+        m_outputDescription->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        m_outputDescription->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        auto* scroll = new AdScrollArea(this);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setWidgetResizable(true);
+        scroll->viewport()->setAutoFillBackground(false);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setFixedWidth(340);
+        scroll->setMinimumHeight(200);
+        m_form = new AdForm;
+        configureForm(m_form);
+        m_form->setContentsMargins(0, 0, 12, 0);
+        scroll->setContentWidget(m_form);
+        m_form->setAutoFillBackground(false);
+        m_rightPanel = new QStackedWidget(this);
+        m_rightPanel->setFixedWidth(340);
+        m_rightPanel->addWidget(scroll);
+        if (m_showSaveResult) {
+            m_result = new ScreenshotSaveResult(
+                this,
+                [this] {
+                    setPhase(Phase::Editing);
+                    validateFields();
+                    m_filename->setFocus();
+                },
+                [this] { m_modal->accept(); });
+            m_rightPanel->addWidget(m_result->view());
+        }
+        layout->addWidget(m_rightPanel);
+
+        auto* directory = new QWidget(m_form);
+        directory->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        auto* directoryLayout = new QVBoxLayout(directory);
+        directoryLayout->setContentsMargins(0, 0, 0, 0);
+        directoryLayout->setSpacing(8);
+        m_directory = new DirectoryPathInput(directory);
+        m_directory->setObjectName(QStringLiteral("saveDirectoryPathInput"));
+        m_directory->lineEdit()->setObjectName(QStringLiteral("saveDirectoryInput"));
+        m_directory->browseButton()->setObjectName(QStringLiteral("saveDirectoryBrowseButton"));
+        m_directory->setText(m_state.directory);
+        directoryLayout->addWidget(m_directory);
+        addField("Save path", directory, "directory");
+        connect(m_directory, &DirectoryPathInput::browseRequested, this, [this] {
+            const QString path = QFileDialog::getExistingDirectory(
+                window(), tr("Select save directory"), m_directory->text());
+            if (!path.isEmpty())
+                m_directory->setText(path);
+        });
+        m_shortcutsHost = new QWidget(directory);
+        m_shortcutsHost->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+        m_shortcutsLayout = new adqt::widgets::detail::FlowLayout(m_shortcutsHost, 0, 6, 6);
+        m_shortcutsHost->installEventFilter(this);
+        directoryLayout->addWidget(m_shortcutsHost);
+        rebuildShortcuts();
+
+        m_filename = new AdLineEdit(m_form);
+        m_filename->setObjectName(QStringLiteral("saveFilenameInput"));
+        m_filename->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        m_filename->setText(m_state.filename);
+        addField("File name", m_filename, "filename");
+        m_format = new AdSelect(m_form);
+        m_format->setObjectName(QStringLiteral("saveFormatSelect"));
+        addField("Image format", m_format, "format");
+
+        auto* dimensions = new QWidget(m_form);
+        dimensions->setObjectName(QStringLiteral("saveDimensionsForm"));
+        dimensions->setFixedWidth(kSaveFormContentWidth);
+        auto* dimensionsLayout = new QVBoxLayout(dimensions);
+        dimensionsLayout->setContentsMargins(0, 0, 0, 0);
+        dimensionsLayout->setSpacing(8);
+        auto* header = new QHBoxLayout;
+        header->setSpacing(8);
+        m_sizeLabel = new QLabel(dimensions);
+        m_sizeLabel->setObjectName(QStringLiteral("saveSizeLabel"));
+        m_sizeLabel->setWordWrap(true);
+        header->addWidget(m_sizeLabel, 1);
+        m_sizeUnit = new AdSegmented(dimensions);
+        m_sizeUnit->setObjectName(QStringLiteral("saveSizeUnitSegmented"));
+        m_sizeUnit->setControlSize(AdSegmented::ControlSize::Small);
+        m_sizeUnit->setDistribution(AdSegmented::Distribution::Content);
+        m_sizeUnit->addOption({}, QStringLiteral("pixels"));
+        m_sizeUnit->addOption({}, QStringLiteral("percentage"));
+        m_sizeUnit->setCurrentValue(QStringLiteral("pixels"));
+        header->addWidget(m_sizeUnit, 0, Qt::AlignRight | Qt::AlignVCenter);
+        dimensionsLayout->addLayout(header);
+        auto* inputs = new QHBoxLayout;
+        inputs->setSpacing(0);
+        m_width = number("saveWidthInput");
+        m_height = number("saveHeightInput");
+        inputs->addWidget(m_width, 1);
+        m_lock = new AspectRatioLockButton(dimensions);
+        m_lock->setObjectName(QStringLiteral("saveAspectLockButton"));
+        m_lock->setFixedSize(kAspectRatioLockButtonSize, kAspectRatioLockButtonSize);
+        m_lock->setChecked(true);
+        inputs->addWidget(m_lock, 0, Qt::AlignVCenter);
+        inputs->addWidget(m_height, 1);
+        dimensionsLayout->addLayout(inputs);
+        m_form->addField({}, dimensions, QStringLiteral("dimensions"));
+
+        m_quality = new AdSlider(m_form);
+        m_quality->setTracking(false);
+        m_quality->setObjectName(QStringLiteral("saveQualitySlider"));
+        m_quality->setRange(0, 100);
+        m_quality->setValue(m_state.output.quality);
+        m_quality->setSingleStep(1);
+        m_qualityItem = addField("Quality", m_quality, "quality");
+        m_compression = new AdSelect(m_form);
+        m_compression->setObjectName(QStringLiteral("saveCompressionLevelSelect"));
+        m_compressionItem = addField("Compression level", m_compression, "compression-level");
+        m_error = new QLabel(m_form);
+        m_error->setObjectName(QStringLiteral("saveErrorLabel"));
+        m_error->setWordWrap(true);
+        auto* errorItem = m_form->addField({}, m_error);
+        errorItem->setNoStyle(true);
+        m_error->hide();
+        m_form->layout()->setAlignment(Qt::AlignTop);
+        connect(&adqt::theme::ThemeManager::instance(), &adqt::theme::ThemeManager::themeChanged,
+                this, [this] {
+                    updateSizeLabelTheme();
+                    updateOutputDescriptionTheme();
+                    showError(m_error->text());
+                    m_preview->update();
+                });
+
+        connect(m_directory, &DirectoryPathInput::textChanged, this, [this](const QString& value) {
+            m_state.directory = value;
+            validateFields();
+        });
+        connect(m_filename, &AdLineEdit::textChanged, this, [this](const QString& value) {
+            // Generated defaults are already literal stems. Only explicit edits interpret a
+            // recognized image suffix; arbitrary dotted titles and names stay intact.
+            QString stem = value.trimmed();
+            if (ScreenshotImageFileService::formatForPath(stem))
+                stem.chop(QFileInfo(stem).suffix().size() + 1);
+            m_state.filename = std::move(stem);
+            if (m_state.output.format == Format::Pdf)
+                changed();
+            else
+                validateFields();
+        });
+        connect(m_format, &AdSelect::currentValueChanged, this, [this](const QVariant& value) {
+            rememberCurrentFormatOptions();
+            m_state.output.format = ScreenshotImageFileService::formatForKey(value.toString());
+            applyRememberedFormatOptions();
+            changed();
+        });
+        connect(m_width, &AdInputNumber::valueChanged, this,
+                [this](double value) { dimensionChanged(true, value); });
+        connect(m_height, &AdInputNumber::valueChanged, this,
+                [this](double value) { dimensionChanged(false, value); });
+        connect(m_width, &AdInputNumber::hasValueChanged, this, [this](bool hasValue) {
+            if (!hasValue)
+                dimensionChanged(true, 0);
+        });
+        connect(m_height, &AdInputNumber::hasValueChanged, this, [this](bool hasValue) {
+            if (!hasValue)
+                dimensionChanged(false, 0);
+        });
+        connect(m_lock, &QAbstractButton::toggled, this, [this](bool checked) {
+            m_state.lockAspectRatio = checked;
+            if (checked && m_state.output.size.width() > 0)
+                dimensionChanged(true,
+                                 m_percentage ? m_width->value() : m_state.output.size.width());
+            updateControls();
+        });
+        connect(m_sizeUnit, &AdSegmented::currentValueChanged, this, [this](const QVariant& value) {
+            commitDimensionEdit();
+            m_percentage = value.toString() == QStringLiteral("percentage");
+            syncDimensionInputs(true);
+        });
+        connect(m_quality, &AdSlider::valueChanged, this, [this](double value) {
+            m_state.output.quality = qRound(value);
+            rememberCurrentFormatOptions();
+            changed();
+        });
+        connect(m_compression, &AdSelect::currentValueChanged, this, [this](const QVariant& value) {
+            m_state.output.compressionLevel =
+                ScreenshotImageFileService::compressionLevelForKey(value.toString());
+            rememberCurrentFormatOptions();
+            changed();
+        });
+        retranslate();
+        m_form->setDisabled(true);
+        m_preview->setBusy(true);
+        QTimer::singleShot(0, this, [this] { loadSource(); });
+    }
+
+    ~SaveContent() override {
+        cancel(!closed());
+    }
+    void cancel(bool cancelSource = false) {
+        m_phase = Phase::Closed;
+        ++m_generation;
+        m_renderTimer.stop();
+        if (m_menu)
+            m_menu->dismissPopup();
+        m_job.cancel();
+        cancelDecode();
+        m_saveJob.cancel();
+        if (m_result)
+            m_result->cancel();
+        if (cancelSource)
+            m_artifact->cancel();
+    }
+    bool saving() const {
+        return m_phase == Phase::Saving;
+    }
+    bool closed() const {
+        return m_phase == Phase::Closed;
+    }
+    void finish(ScreenshotSaveAsFileDialog::Finished finished) {
+        if (closed())
+            return;
+        const QString path = m_lastSavedPath;
+        auto saved = std::move(m_saved);
+        cancel(path.isEmpty());
+        // Completion can destroy the owner and this content. Keep both callbacks and the
+        // successful path locally, preserving the existing Finished-before-Saved ordering.
+        if (finished)
+            finished(!path.isEmpty());
+        if (!path.isEmpty() && saved)
+            saved(path);
+    }
+    void acceptAction() {
+        if (m_phase == Phase::Result)
+            m_result->activateDefaultAction();
+        else if (m_phase == Phase::Editing)
+            save();
+    }
+    QSize sizeHint() const override {
+        // Prefer the full preview height. The modal's layout may shrink the content
+        // to fit its measured header and footer inside the available screen.
+        return {QWidget::sizeHint().width(), maximumHeight()};
+    }
+    void installFooter() {
+        auto closePolicy = m_modal->closeButton()->sizePolicy();
+        closePolicy.setRetainSizeWhenHidden(true);
+        m_modal->closeButton()->setSizePolicy(closePolicy);
+        auto* editing = new QWidget;
+        auto* editingLayout = new QVBoxLayout(editing);
+        editingLayout->setContentsMargins(0, 0, 0, 0);
+        editingLayout->addStretch();
+        auto* layout = new QHBoxLayout;
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(8);
+        layout->addWidget(m_outputDescription, 1, Qt::AlignVCenter);
+        layout->addWidget(m_modal->rejectButton(), 0, Qt::AlignVCenter);
+        layout->addWidget(m_modal->acceptButton(), 0, Qt::AlignVCenter);
+        editingLayout->addLayout(layout);
+        m_footer = new ScreenshotSaveFooter(editing, m_result ? m_result->actions() : nullptr);
+        m_modal->setFooterWidget(m_footer);
+        updatePresentation();
+    }
+    void save() {
+        if (m_phase != Phase::Editing || !m_source.rows.isValid())
+            return;
+        commitDimensionEdit();
+        m_state.directory = m_directory->text();
+        const QString error = m_state.validationError();
+        if (!error.isEmpty()) {
+            validateFields();
+            showError(error);
+            return;
+        }
+        const QString path = m_state.outputPath();
+        if (QFileInfo::exists(path)) {
+            auto* confirm = new AdModal(this);
+            m_overwrite = confirm;
+            confirm->setObjectName(QStringLiteral("saveOverwriteModal"));
+            confirm->setOwnerWindow(window());
+            confirm->setRenderContainer(window());
+            confirm->setWindowTitle(tr("Replace file"));
+            confirm->setText(
+                tr("Replace the existing file \"%1\"?").arg(QFileInfo(path).fileName()));
+            confirm->setProperty("filename", QFileInfo(path).fileName());
+            confirm->setAcceptText(tr("Replace"));
+            confirm->setRejectText(tr("Cancel"));
+            confirm->setClosePolicy(AdModal::ClosePolicy::Manual);
+            connect(confirm, &AdModal::closeRequested, confirm,
+                    [this, confirm](AdModal::CloseReason reason) {
+                        if (reason == AdModal::CloseReason::OkAction) {
+                            confirm->accept();
+                            beginSave();
+                        } else
+                            confirm->reject();
+                    });
+            connect(confirm, &AdModal::finished, confirm, &QObject::deleteLater);
+            confirm->open();
+        } else
+            beginSave();
+    }
+
+  protected:
+    void changeEvent(QEvent* event) override {
+        if (event->type() == QEvent::LanguageChange)
+            retranslate();
+        QWidget::changeEvent(event);
+    }
+    bool eventFilter(QObject* object, QEvent* event) override {
+        if (object == m_shortcutsHost &&
+            (event->type() == QEvent::Resize || event->type() == QEvent::LayoutRequest)) {
+            updateShortcutHeight();
+        }
+        if (event->type() == QEvent::LanguageChange && m_editor &&
+            object == m_editor->contentWidget())
+            retranslateSecondary();
+        return QWidget::eventFilter(object, event);
+    }
+
+  private:
+    void setPhase(Phase phase) {
+        m_phase = phase;
+        updatePresentation();
+    }
+    void updatePresentation() {
+        const bool editing = m_phase == Phase::Editing;
+        const bool result = m_phase == Phase::Result;
+        m_form->setEnabled(editing && m_source.rows.isValid());
+        m_modal->setAcceptButtonBusy(saving());
+        m_modal->setCloseButtonVisible(!saving());
+        m_modal->setCloseOnEscape(!saving());
+        m_modal->rejectButton()->setEnabled(editing);
+        m_modal->acceptButton()->setEnabled(editing && m_source.rows.isValid() &&
+                                            m_state.validationError().isEmpty());
+        m_modal->acceptButton()->setDefault(!result);
+        m_rightPanel->setCurrentIndex(result ? 1 : 0);
+        if (m_footer)
+            m_footer->setResultVisible(result);
+    }
+    AdInputNumber* number(const char* name) {
+        auto* input = new AdInputNumber;
+        input->setObjectName(QString::fromLatin1(name));
+        input->setDecimals(0);
+        input->setKeyboardTracking(false);
+        input->setRange(0, kMaximumDimension);
+        input->setSingleStep(1);
+        input->setStepButtonLayout(AdInputNumber::StepButtonLayout::Compact);
+        input->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        return input;
+    }
+    AdFormItem* addField(const char* label, QWidget* editor, const char* key) {
+        auto* item = m_form->addField({}, editor, QString::fromLatin1(key));
+        item->setProperty("exportLabel", label);
+        return item;
+    }
+    void loadRememberedFormatOptions() {
+        const QJsonObject remembered =
+            snow_shot::storage::ScreenshotSettings().manualSaveFormatOptions();
+        for (Format format : kFormats) {
+            ScreenshotImageEncodingOptions options;
+            const QJsonObject stored =
+                remembered.value(ScreenshotImageFileService::formatKey(format)).toObject();
+            options.quality = stored.value(QStringLiteral("quality")).toInt(100);
+            options.compressionLevel = ScreenshotImageFileService::compressionLevelForKey(
+                stored.value(QStringLiteral("compression_level")).toString());
+            m_formatOptions.insert(static_cast<int>(format), options);
+        }
+    }
+    void rememberCurrentFormatOptions() {
+        m_formatOptions.insert(static_cast<int>(m_state.output.format),
+                               ScreenshotImageEncodingOptions{m_state.output.quality,
+                                                              m_state.output.compressionLevel});
+    }
+    void applyRememberedFormatOptions() {
+        const auto options = m_formatOptions.value(static_cast<int>(m_state.output.format));
+        m_state.output.quality = options.quality;
+        m_state.output.compressionLevel = options.compressionLevel;
+        if (m_quality != nullptr) {
+            const QSignalBlocker blocker(m_quality);
+            m_quality->setValue(options.quality);
+        }
+        if (m_compression != nullptr) {
+            const QSignalBlocker blocker(m_compression);
+            m_compression->setCurrentValue(
+                ScreenshotImageFileService::compressionLevelKey(options.compressionLevel));
+        }
+    }
+    QJsonObject serializedFormatOptions() const {
+        QJsonObject result;
+        for (Format format : kFormats) {
+            const auto options = m_formatOptions.value(static_cast<int>(format));
+            QJsonObject stored;
+            if (ScreenshotImageFileService::supportsQuality(format))
+                stored.insert(QStringLiteral("quality"), qBound(0, options.quality, 100));
+            if (ScreenshotImageFileService::supportsCompressionLevel(format)) {
+                stored.insert(
+                    QStringLiteral("compression_level"),
+                    ScreenshotImageFileService::compressionLevelKey(options.compressionLevel));
+            }
+            if (!stored.isEmpty())
+                result.insert(ScreenshotImageFileService::formatKey(format), stored);
+        }
+        return result;
+    }
+    void validateFields() {
+        if (!m_source.rows.isValid())
+            return;
+        auto setError = [this](const QString& key, const QString& message) {
+            for (auto* item : m_form->findChildren<AdFormItem*>()) {
+                if (item->fieldName() == key)
+                    item->setErrorMessages(message.isEmpty() ? QStringList{}
+                                                             : QStringList{message});
+            }
+        };
+        const QString imageError = m_state.imageValidationError();
+        const QString error = m_state.validationError();
+        const bool badPath = m_state.directory.trimmed().isEmpty() ||
+                             !QDir::isAbsolutePath(m_state.directory.trimmed());
+        setError(QStringLiteral("directory"), badPath ? error : QString());
+        setError(QStringLiteral("filename"), !badPath && error != imageError ? error : QString());
+        const bool existingFile =
+            !badPath && error == imageError && QFileInfo::exists(m_state.outputPath());
+        m_form->itemForName(QStringLiteral("filename"))
+            ->setWarningMessages(existingFile
+                                     ? QStringList{tr("A file with this name already exists")}
+                                     : QStringList{});
+        m_width->setStatus(imageError.isEmpty() ? AdInputNumber::Status::None
+                                                : AdInputNumber::Status::Error);
+        m_height->setStatus(imageError.isEmpty() ? AdInputNumber::Status::None
+                                                 : AdInputNumber::Status::Error);
+        m_modal->acceptButton()->setEnabled(m_phase == Phase::Editing && m_source.rows.isValid() &&
+                                            error.isEmpty());
+    }
+    void showError(const QString& message) {
+        m_error->setText(message);
+        m_error->setVisible(!message.isEmpty());
+        const auto theme = adqt::theme::ThemeManager::instance().resolveTheme(this);
+        QPalette palette = m_error->palette();
+        palette.setColor(QPalette::WindowText, theme.colorError);
+        m_error->setPalette(palette);
+    }
+    void retranslate() {
+        m_modal->setWindowTitle(tr("Save as file"));
+        m_modal->setAcceptText(tr("Save"));
+        m_modal->setRejectText(tr("Cancel"));
+        m_directory->setBrowseButtonText(tr("Select save directory"));
+        m_lock->setToolTip(tr("Lock aspect ratio"));
+        m_lock->setAccessibleName(m_lock->toolTip());
+        m_directory->lineEdit()->setAccessibleName(tr("Save path"));
+        m_filename->setAccessibleName(tr("File name"));
+        m_format->setAccessibleName(tr("Image format"));
+        m_width->setAccessibleName(tr("Width"));
+        m_height->setAccessibleName(tr("Height"));
+        m_width->setToolTip(tr("Width"));
+        m_height->setToolTip(tr("Height"));
+        m_sizeLabel->setText(tr("Size"));
+        m_sizeUnit->setAccessibleName(tr("Size unit"));
+        m_sizeUnit->setOptionLabel(0, tr("pixel"));
+        m_sizeUnit->setOptionLabel(1, tr("Percentage"));
+        updateSizeLabelTheme();
+        updateOutputDescriptionTheme();
+        updateOutputDescription();
+        m_quality->setAccessibleName(tr("Quality"));
+        m_compression->setAccessibleName(tr("Compression level"));
+        for (auto* item : findChildren<AdFormItem*>()) {
+            const QByteArray source = item->property("exportLabel").toByteArray();
+            if (!source.isEmpty())
+                item->setLabel(translated(source.constData()));
+        }
+        const QSignalBlocker blocker(m_format);
+        QVector<AdSelect::Option> options;
+        for (const auto& entry : {std::pair<const char*, const char*>("png", "PNG"),
+                                  {"jpeg", "JPEG"},
+                                  {"bmp", "BMP"},
+                                  {"webp", "WebP"},
+                                  {"jxl", "JPEG XL"},
+                                  {"avif", "AVIF"},
+                                  {"pdf", "PDF"}}) {
+            AdSelect::Option option;
+            option.value = QString::fromLatin1(entry.first);
+            option.label = translated(entry.second);
+            options.push_back(option);
+        }
+        m_format->setOptions(options);
+        const auto key = m_state.output.format == Format::Jpeg
+                             ? QStringLiteral("jpeg")
+                             : ScreenshotImageFileService::extension(m_state.output.format);
+        m_format->setCurrentValue(key);
+        {
+            const QSignalBlocker compressionBlocker(m_compression);
+            m_compression->setOptions({
+                {QStringLiteral("low"), tr("Low")},
+                {QStringLiteral("medium"), tr("Medium")},
+                {QStringLiteral("high"), tr("High")},
+            });
+            m_compression->setCurrentValue(
+                ScreenshotImageFileService::compressionLevelKey(m_state.output.compressionLevel));
+        }
+        rebuildShortcuts();
+        updateControls();
+        retranslateSecondary();
+        validateFields();
+    }
+    void retranslateSecondary() {
+        if (m_menu) {
+            const auto actions = m_menu->actions();
+            if (actions.size() == 2) {
+                actions[0]->setText(tr("Edit"));
+                actions[1]->setText(tr("Delete"));
+            }
+        }
+        if (m_overwrite) {
+            m_overwrite->setWindowTitle(tr("Replace file"));
+            m_overwrite->setText(tr("Replace the existing file \"%1\"?")
+                                     .arg(m_overwrite->property("filename").toString()));
+            m_overwrite->setAcceptText(tr("Replace"));
+            m_overwrite->setRejectText(tr("Cancel"));
+        }
+        if (m_editor) {
+            m_editor->setWindowTitle(m_editor->property("editingShortcut").toBool()
+                                         ? tr("Edit save path")
+                                         : tr("Add save path"));
+            m_editor->setAcceptText(tr("OK"));
+            m_editor->setRejectText(tr("Cancel"));
+            auto* form = qobject_cast<AdForm*>(m_editor->contentWidget());
+            if (form) {
+                form->itemForName(QStringLiteral("name"))->setLabel(tr("Name"));
+                form->itemForName(QStringLiteral("path"))->setLabel(tr("Path"));
+                form->findChild<AdLineEdit*>(QStringLiteral("savePathNameInput"))
+                    ->setAccessibleName(tr("Name"));
+                form->findChild<AdLineEdit*>(QStringLiteral("savePathValueInput"))
+                    ->setAccessibleName(tr("Path"));
+                form->findChild<DirectoryPathInput*>(QStringLiteral("savePathValuePathInput"))
+                    ->setBrowseButtonText(tr("Select save directory"));
+                if (form->property("validationAttempted").toBool())
+                    static_cast<void>(
+                        validateShortcut(form, m_editor->property("shortcutIndex").toInt()));
+            }
+        }
+    }
+    void rebuildShortcuts() {
+        while (auto* item = m_shortcutsLayout->takeAt(0)) {
+            if (item->widget()) {
+                item->widget()->hide();
+                item->widget()->deleteLater();
+            }
+            delete item;
+        }
+        m_shortcuts = snow_shot::storage::ScreenshotSettings().savePathShortcuts();
+        auto add = [this](const QString& name, const QString& path, int index) {
+            auto* group = new AdFieldGroup(m_shortcutsHost);
+            group->setObjectName(QStringLiteral("savePathShortcutGroup_%1").arg(index));
+            auto* button = new AdButton(name, group);
+            button->setSizeClass(AdButton::SizeClass::Small);
+            button->setMaximumWidth(230);
+            button->setToolTip(path);
+            button->setObjectName(QStringLiteral("savePathShortcut_%1").arg(index));
+            group->addControl(button);
+            connect(button, &QAbstractButton::clicked, this,
+                    [this, path] { m_directory->setText(path); });
+            if (index >= 0) {
+                auto* expand = new AdButton(group);
+                expand->setObjectName(QStringLiteral("savePathExpand_%1").arg(index));
+                expand->setSizeClass(AdButton::SizeClass::Small);
+                expand->setIconRef(icons::More());
+                expand->setFixedSize(24, 24);
+                expand->setToolTip(tr("Edit or delete save path"));
+                expand->setAccessibleName(expand->toolTip());
+                group->addControl(expand);
+                new snow_shot::presentation::ActionPopupMenu(
+                    expand, [this, expand, index] { return createShortcutMenu(expand, index); },
+                    snow_shot::presentation::ActionPopupMenu::Placement::BottomLeft,
+                    snow_shot::presentation::ActionPopupMenu::Surface::Widget);
+            }
+            m_shortcutsLayout->addWidget(group);
+        };
+        add(tr("App directory"),
+            snow_shot::storage::expandScreenshotExportVariables(
+                snow_shot::storage::ScreenshotSettings().imageSaveDirectory(), m_timestamp,
+                m_windowNames),
+            -2);
+        add(tr("Desktop"), QStandardPaths::writableLocation(QStandardPaths::DesktopLocation), -1);
+        for (int index = 0; index < m_shortcuts.size(); ++index)
+            add(m_shortcuts.at(index).name, m_shortcuts.at(index).path, index);
+        auto* button = new AdButton(m_shortcutsHost);
+        button->setObjectName(QStringLiteral("savePathAddButton"));
+        button->setSizeClass(AdButton::SizeClass::Small);
+        button->setIconRef(icons::Plus());
+        button->setFixedSize(24, 24);
+        button->setToolTip(tr("Add save path"));
+        button->setAccessibleName(button->toolTip());
+        connect(button, &QAbstractButton::clicked, this, [this] { shortcutDialog(-1); });
+        m_shortcutsLayout->addWidget(button);
+        updateShortcutHeight();
+        m_shortcutsHost->updateGeometry();
+    }
+    void updateShortcutHeight() {
+        const int height = m_shortcutsLayout->heightForWidth(m_shortcutsHost->width());
+        if (m_shortcutsHost->minimumHeight() != height)
+            m_shortcutsHost->setFixedHeight(height);
+    }
+    AdContextMenu* createShortcutMenu(AdButton* trigger, int index) {
+        if (index < 0 || index >= m_shortcuts.size())
+            return nullptr;
+        auto* menu = new AdContextMenu(this);
+        m_menu = menu;
+        menu->setObjectName(QStringLiteral("savePathMenu"));
+        menu->setTriggerWidget(trigger);
+        auto* edit = menu->addItem(tr("Edit"), icons::Edit());
+        auto* remove = menu->addItem(tr("Delete"), icons::IconDelete());
+        menu->setActionDanger(remove);
+        connect(edit, &QAction::triggered, this, [this, index] { shortcutDialog(index); });
+        connect(remove, &QAction::triggered, this, [this, index] {
+            auto shortcuts = m_shortcuts;
+            shortcuts.removeAt(index);
+            if (snow_shot::storage::ScreenshotSettings().setSavePathShortcuts(shortcuts))
+                rebuildShortcuts();
+            else
+                showError(tr("The save paths could not be stored"));
+        });
+        return menu;
+    }
+    void shortcutDialog(int index) {
+        auto* modal = new AdModal(this);
+        m_editor = modal;
+        modal->setProperty("editingShortcut", index >= 0);
+        modal->setProperty("shortcutIndex", index);
+        modal->setObjectName(QStringLiteral("savePathEditorModal"));
+        modal->setOwnerWindow(window());
+        modal->setRenderContainer(window());
+        modal->setMode(AdModal::Mode::Overlay);
+        modal->setWindowTitle(index < 0 ? tr("Add save path") : tr("Edit save path"));
+        modal->setPreferredWidth(400);
+        modal->setCentered(true);
+        modal->setCloseOnMaskClick(false);
+        modal->setClosePolicy(AdModal::ClosePolicy::Manual);
+        modal->setAcceptText(tr("OK"));
+        modal->setRejectText(tr("Cancel"));
+        auto* form = new AdForm;
+        configureForm(form);
+        form->setRequiredMark(AdForm::RequiredMark::Visible);
+        auto* name = new AdLineEdit(form);
+        name->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        name->setObjectName(QStringLiteral("savePathNameInput"));
+        auto* path = new DirectoryPathInput(form);
+        path->setObjectName(QStringLiteral("savePathValuePathInput"));
+        path->lineEdit()->setObjectName(QStringLiteral("savePathValueInput"));
+        path->browseButton()->setObjectName(QStringLiteral("savePathValueBrowseButton"));
+        connect(path, &DirectoryPathInput::browseRequested, path, [this, path] {
+            const QString directory = QFileDialog::getExistingDirectory(
+                window(), tr("Select save directory"), path->text());
+            if (!directory.isEmpty())
+                path->setText(directory);
+        });
+        if (index >= 0) {
+            name->setText(m_shortcuts.at(index).name);
+            path->setText(m_shortcuts.at(index).path);
+        }
+        auto* nameItem = form->addField(tr("Name"), name, QStringLiteral("name"));
+        auto* pathItem = form->addField(tr("Path"), path, QStringLiteral("path"));
+        for (auto* item : {nameItem, pathItem})
+            item->setRequired(true);
+        modal->setContentWidget(form);
+        form->installEventFilter(this);
+        modal->setInitialFocusWidget(name);
+        retranslateSecondary();
+        connect(modal, &AdModal::closeRequested, modal,
+                [this, modal, form, name, path, pathItem, index](AdModal::CloseReason reason) {
+                    if (reason != AdModal::CloseReason::OkAction) {
+                        modal->reject();
+                        return;
+                    }
+                    form->setProperty("validationAttempted", true);
+                    if (!validateShortcut(form, index))
+                        return;
+                    const QString value = name->text().trimmed();
+                    const QString target = path->text().trimmed();
+                    auto shortcuts = m_shortcuts;
+                    const Shortcut shortcut{value, QDir::cleanPath(target)};
+                    if (index < 0)
+                        shortcuts.push_back(shortcut);
+                    else
+                        shortcuts[index] = shortcut;
+                    if (!snow_shot::storage::ScreenshotSettings().setSavePathShortcuts(shortcuts)) {
+                        pathItem->setErrorMessages({tr("The save paths could not be stored")});
+                        return;
+                    }
+                    rebuildShortcuts();
+                    modal->accept();
+                });
+        connect(modal, &AdModal::finished, modal, &QObject::deleteLater);
+        modal->open();
+    }
+    bool validateShortcut(AdForm* form, int index) {
+        const QString name =
+            form->findChild<AdLineEdit*>(QStringLiteral("savePathNameInput"))->text().trimmed();
+        const QString path =
+            form->findChild<AdLineEdit*>(QStringLiteral("savePathValueInput"))->text().trimmed();
+        QString nameError;
+        if (name.isEmpty())
+            nameError = tr("Please enter a name");
+        for (int other = 0; other < m_shortcuts.size(); ++other)
+            if (other != index &&
+                m_shortcuts.at(other).name.compare(name, Qt::CaseInsensitive) == 0)
+                nameError = tr("A save path with this name already exists");
+        const QString pathError = path.isEmpty() || !QDir::isAbsolutePath(path)
+                                      ? tr("Please enter an absolute directory path")
+                                      : QString();
+        form->itemForName(QStringLiteral("name"))
+            ->setErrorMessages(nameError.isEmpty() ? QStringList{} : QStringList{nameError});
+        form->itemForName(QStringLiteral("path"))
+            ->setErrorMessages(pathError.isEmpty() ? QStringList{} : QStringList{pathError});
+        return nameError.isEmpty() && pathError.isEmpty();
+    }
+    void updateSizeLabelTheme() {
+        const auto theme = adqt::theme::ThemeManager::instance().resolveTheme(this);
+        auto font = m_form->font();
+        font.setPixelSize(qMax(12, qRound(theme.fontSize)));
+        font.setWeight(QFont::Normal);
+        m_sizeLabel->setFont(font);
+        auto palette = m_sizeLabel->palette();
+        palette.setColor(QPalette::WindowText, theme.colorText);
+        palette.setColor(QPalette::Disabled, QPalette::WindowText, theme.colorTextDisabled);
+        m_sizeLabel->setPalette(palette);
+    }
+    void updateOutputDescriptionTheme() {
+        const auto theme = adqt::theme::ThemeManager::instance().resolveTheme(this);
+        auto font = m_form->font();
+        font.setPixelSize(qMax(10, qRound(theme.fontSizeSM)));
+        font.setWeight(QFont::Normal);
+        m_outputDescription->setFont(font);
+        m_outputDescription->setFixedHeight(m_outputDescription->fontMetrics().height());
+        auto palette = m_outputDescription->palette();
+        palette.setColor(QPalette::WindowText, theme.colorTextSecondary);
+        m_outputDescription->setPalette(palette);
+    }
+    QString formattedOutputBytes(qint64 bytes) const {
+        constexpr qint64 kibibyte = 1024;
+        constexpr qint64 mebibyte = kibibyte * 1024;
+        constexpr qint64 gibibyte = mebibyte * 1024;
+        if (bytes < kibibyte)
+            return tr("%1B").arg(bytes);
+        if (bytes < mebibyte)
+            return tr("%1KB").arg(qRound64(double(bytes) / kibibyte));
+        if (bytes < gibibyte)
+            return tr("%1MB").arg(qRound64(double(bytes) / mebibyte));
+        return tr("%1GB").arg(qRound64(double(bytes) / gibibyte));
+    }
+    void updateOutputDescription() {
+        if (!m_encoded || !m_requestedOptions || m_encoded->options != *m_requestedOptions ||
+            m_state.sourceSize.width() <= 0 || !QFileInfo::exists(m_encoded->path)) {
+            m_outputDescription->clear();
+            return;
+        }
+        const QSize size = m_encoded->options.size;
+        QString scale = QString::number(100.0 * size.width() / m_state.sourceSize.width(), 'f', 2);
+        while (scale.endsWith(QLatin1Char('0')))
+            scale.chop(1);
+        if (scale.endsWith(QLatin1Char('.')))
+            scale.chop(1);
+        m_outputDescription->setText(
+            tr("%1x%2(%3%) · %4")
+                .arg(size.width())
+                .arg(size.height())
+                .arg(scale)
+                .arg(formattedOutputBytes(QFileInfo(m_encoded->path).size())));
+    }
+    void commitDimensionEdit() {
+        if (auto* focus = QApplication::focusWidget();
+            focus && (focus == m_width || m_width->isAncestorOf(focus) || focus == m_height ||
+                      m_height->isAncestorOf(focus)))
+            focus->clearFocus();
+    }
+    void syncDimensionInputs(bool preserveEmpty = false) {
+        const auto sync = [this, preserveEmpty](AdInputNumber* input, int pixels, int source) {
+            const QSignalBlocker blocker(input);
+            const bool empty = preserveEmpty && !input->hasValue();
+            input->setRange(0, m_percentage && source > 0 ? 100.0 * kMaximumDimension / source
+                                                          : kMaximumDimension);
+            input->setSuffixText(m_percentage ? QStringLiteral("%") : QString());
+            if (empty)
+                input->clear();
+            else
+                input->setValue(m_percentage && source > 0 ? 100.0 * pixels / source : pixels);
+        };
+        // Display rounding must never feed back into the exact pixel export dimensions.
+        sync(m_width, m_state.output.size.width(), m_state.sourceSize.width());
+        sync(m_height, m_state.output.size.height(), m_state.sourceSize.height());
+    }
+    void dimensionChanged(bool width, double value) {
+        const QSignalBlocker widthBlock(m_width);
+        const QSignalBlocker heightBlock(m_height);
+        if (m_percentage) {
+            const auto pixels = [value](int source) {
+                return value > 0 ? qRound(std::clamp(value * source / 100.0, 1.0,
+                                                     double(kMaximumDimension)))
+                                 : 0;
+            };
+            if (width)
+                m_state.output.size.setWidth(pixels(m_state.sourceSize.width()));
+            else
+                m_state.output.size.setHeight(pixels(m_state.sourceSize.height()));
+            if (m_state.lockAspectRatio && value > 0) {
+                m_state.output.size =
+                    QSize(pixels(m_state.sourceSize.width()), pixels(m_state.sourceSize.height()));
+                (width ? m_height : m_width)->setValue(value);
+            }
+        } else {
+            m_state.setDimension(width, qRound(value));
+            if (width && m_state.lockAspectRatio)
+                m_height->setValue(m_state.output.size.height());
+            if (!width && m_state.lockAspectRatio)
+                m_width->setValue(m_state.output.size.width());
+        }
+        changed();
+    }
+    void updateControls() {
+        m_qualityItem->setVisible(
+            ScreenshotImageFileService::supportsQuality(m_state.output.format));
+        m_compressionItem->setVisible(
+            ScreenshotImageFileService::supportsCompressionLevel(m_state.output.format));
+        AdSlider::Mark minimumMark;
+        minimumMark.label = tr("0%");
+        AdSlider::Mark maximumMark;
+        maximumMark.label =
+            formatSupportsLossless(m_state.output.format) ? tr("Lossless") : tr("100%");
+        m_quality->setMarks(
+            {{m_quality->minimum(), minimumMark}, {m_quality->maximum(), maximumMark}});
+    }
+    void changed() {
+        m_state.output.pdfTitle = QFileInfo(m_state.outputPath()).completeBaseName();
+        m_preview->setPdfLayout(
+            m_state.output.format == Format::Pdf
+                ? screenshot_pdf::layout(m_state.output.size, m_state.output.pdfPageSize)
+                : screenshot_pdf::Layout{});
+        updateControls();
+        if (m_phase != Phase::Editing || !m_source.rows.isValid())
+            return;
+        validateFields();
+        const QString error = m_state.imageValidationError();
+        const auto options = error.isEmpty()
+                                 ? std::make_optional(pipeline::normalizedOptions(m_state.output))
+                                 : std::nullopt;
+        if (options && options == m_requestedOptions)
+            return;
+        m_requestedOptions = options;
+        m_renderTimer.stop();
+        m_outputDescription->clear();
+        ++m_generation;
+        m_job.cancel();
+        m_renderGeneration.reset();
+        cancelDecode();
+        showError(error);
+        if (!options) {
+            m_preview->setBusy(false);
+            return;
+        }
+        m_preview->setBusy(true);
+        const bool cachedPng = options->format == Format::Png &&
+                               options->size == m_state.sourceSize &&
+                               m_artifact->cachedPng(options->compressionLevel).isValid();
+        if (m_generation == 1 || cachedPng || (m_encoded && m_encoded->options == *options))
+            startRender();
+        else
+            m_renderTimer.start();
+    }
+    void loadSource() {
+        const bool started = m_artifact->requestRowSource(
+            this, [this](ScreenshotImageRowSource rows, QString error) {
+                if (closed())
+                    return;
+                if (!error.isEmpty() || !rows.isValid()) {
+                    sourceFailed(error);
+                    return;
+                }
+                auto result = std::make_shared<pipeline::Source>();
+                m_job = ScreenshotExportCoordinator::shared().submit(
+                    this, ScreenshotExportCoordinator::Priority::Foreground,
+                    [rows, result](const ScreenshotExportCancellation& cancellation) {
+                        ScreenshotExportTaskResult status;
+                        *result = pipeline::prepare(rows, cancellation, &status.error);
+                        if (!result->rows.isValid())
+                            status.failureStage = ScreenshotExportFailureStage::Source;
+                        return status;
+                    },
+                    [this, result](ScreenshotExportTaskResult status) {
+                        m_job = {};
+                        if (closed())
+                            return;
+                        if (!status.succeeded() || !result->rows.isValid()) {
+                            sourceFailed(status.error);
+                            return;
+                        }
+                        m_source = *result;
+                        m_state.sourceSize = result->rows.size;
+                        m_state.output.size = m_state.sourceSize;
+                        syncDimensionInputs();
+                        updatePresentation();
+                        m_preview->setSource(
+                            m_source.preview, m_state.sourceSize,
+                            [rows = m_source.rows](QRect region,
+                                                   const ScreenshotExportCancellation& cancellation,
+                                                   QString* error) {
+                                return pipeline::readRegion(rows, region, cancellation, error);
+                            });
+                        m_preview->setOutput(m_source.preview, m_state.sourceSize);
+                        changed();
+                    });
+                if (!m_job.isValid())
+                    sourceFailed(tr("The screenshot export queue is full"));
+            });
+        if (!started)
+            sourceFailed(tr("The screenshot could not be prepared"));
+    }
+    void sourceFailed(const QString& error) {
+        m_preview->setBusy(false);
+        showError(tr("The screenshot could not be prepared: %1").arg(error));
+    }
+    void startRender() {
+        if (closed() || !m_source.rows.isValid() || !m_requestedOptions)
+            return;
+        if (m_encoded && m_encoded->options == *m_requestedOptions) {
+            updateOutputDescription();
+            if (saving())
+                writeFile();
+            else
+                startDecode();
+            return;
+        }
+        if (m_renderGeneration == m_generation)
+            return;
+        const quint64 generation = m_generation;
+        const auto options = *m_requestedOptions;
+        m_renderGeneration = generation;
+        if (options.format == Format::Png && options.size == m_state.sourceSize) {
+            auto cached = m_artifact->cachedPng(options.compressionLevel);
+            if (cached.isValid() || !m_artifact->shouldCachePng(options.size)) {
+                renderPrepared(generation, options, std::move(cached));
+                return;
+            }
+            const bool started = m_artifact->requestPng(
+                this, options.compressionLevel,
+                [this, generation, options](ScreenshotExportEncodingResult result) {
+                    if (closed() || generation != m_generation)
+                        return;
+                    if (!result.succeeded()) {
+                        m_renderGeneration.reset();
+                        saveFailed(tr("The export could not be prepared: %1").arg(result.error));
+                        return;
+                    }
+                    renderPrepared(generation, options, std::move(result.image));
+                });
+            if (!started) {
+                m_renderGeneration.reset();
+                saveFailed(tr("The screenshot export queue is full"));
+            }
+            return;
+        }
+        renderPrepared(generation, options);
+    }
+    void renderPrepared(quint64 generation, const ScreenshotSaveExportOptions& options,
+                        snow_shot::storage::PreparedPngImage png = {}) {
+        const auto prepared =
+            m_preparedPixels && m_preparedPixels->size == options.size ? m_preparedPixels : nullptr;
+        auto encoded = std::make_shared<std::shared_ptr<pipeline::Encoded>>();
+        m_job = ScreenshotExportCoordinator::shared().submit(
+            this, ScreenshotExportCoordinator::Priority::Foreground,
+            [source = m_source, options, prepared, cachedPdf = m_encoded ? m_encoded->pdf : nullptr,
+             encoded, png](const ScreenshotExportCancellation& cancellation) {
+                ScreenshotExportTaskResult result;
+                auto pixels = prepared;
+                if (!pixels)
+                    pixels =
+                        pipeline::preparePixels(source, options.size, cancellation, &result.error);
+                if (pixels)
+                    *encoded = pipeline::render(std::move(pixels), options, cancellation,
+                                                &result.error, cachedPdf, png);
+                if (!*encoded)
+                    result.failureStage = ScreenshotExportFailureStage::Render;
+                return result;
+            },
+            [this, generation, encoded](ScreenshotExportTaskResult result) {
+                if (closed() || generation != m_generation)
+                    return;
+                m_renderGeneration.reset();
+                m_job = {};
+                if (*encoded && (*encoded)->pixels) {
+                    m_preparedPixels = (*encoded)->pixels;
+                    setProperty("preparedPixelsIdentity",
+                                QVariant::fromValue<qulonglong>(
+                                    reinterpret_cast<quintptr>(m_preparedPixels.get())));
+                }
+                if (!result.succeeded() || !*encoded) {
+                    saveFailed(tr("The export could not be prepared: %1").arg(result.error));
+                    return;
+                }
+                m_encoded = *encoded;
+                updateOutputDescription();
+                setProperty("encodedGeneration", QVariant::fromValue(generation));
+                if (generation == m_generation)
+                    startRender();
+            });
+        if (!m_job.isValid()) {
+            m_renderGeneration.reset();
+            saveFailed(tr("The screenshot export queue is full"));
+        }
+    }
+    void cancelDecode() {
+        ++m_decodeSerial;
+        m_decodeJob.cancel();
+        m_decodeJob = {};
+    }
+    void publishPreview(QImage image, const ScreenshotSaveExportOptions& options) {
+        m_renderedPreviewOptions = options;
+        m_preview->setOutput(
+            std::move(image), options.size,
+            [encoded = m_encoded](QRect region, const ScreenshotExportCancellation& cancellation,
+                                  QString* error) {
+                return pipeline::decodeRegion(*encoded, region, cancellation, error);
+            });
+        m_preview->setBusy(false);
+        setProperty("previewGeneration", QVariant::fromValue(m_generation));
+    }
+    void startDecode() {
+        if (closed() || saving() || !m_encoded || !m_requestedOptions ||
+            m_encoded->options != *m_requestedOptions)
+            return;
+        if (m_renderedPreviewOptions &&
+            samePreviewPixels(*m_renderedPreviewOptions, *m_requestedOptions)) {
+            const bool metadataChanged = *m_renderedPreviewOptions != *m_requestedOptions;
+            m_renderedPreviewOptions = m_requestedOptions;
+            m_preview->setBusy(false);
+            if (metadataChanged)
+                setProperty("previewGeneration", QVariant::fromValue(m_generation));
+            return;
+        }
+        if (m_encoded->codecResult.roundTrip == snow::image::PixelRoundTrip::exact &&
+            m_encoded->pixels) {
+            if (m_encoded->options.size == m_source.rows.size) {
+                publishPreview(m_source.preview, m_encoded->options);
+                return;
+            }
+            const QImage& exact = m_encoded->pixels->exactImage;
+            if (!exact.isNull() && exact.width() <= 2048 && exact.height() <= 2048) {
+                publishPreview(exact, m_encoded->options);
+                return;
+            }
+        }
+        if (m_decodeJob.isValid())
+            return;
+        m_preview->setBusy(true);
+        if (m_encoded->codecResult.roundTrip != snow::image::PixelRoundTrip::exact)
+            setProperty("previewDecodeCount", property("previewDecodeCount").toInt() + 1);
+        const quint64 generation = m_generation;
+        const quint64 serial = ++m_decodeSerial;
+        const auto options = m_encoded->options;
+        m_decodeJob = ScreenshotExportCoordinator::shared().submit(
+            this, ScreenshotExportCoordinator::Priority::Foreground,
+            [encoded = m_encoded,
+             source = m_source](const ScreenshotExportCancellation& cancellation) {
+                ScreenshotExportTaskResult result;
+                result.image = pipeline::preview(*encoded, source, cancellation, &result.error);
+                if (result.image.isNull())
+                    result.failureStage = ScreenshotExportFailureStage::Render;
+                return result;
+            },
+            [this, generation, serial, options](ScreenshotExportTaskResult result) {
+                if (closed() || serial != m_decodeSerial || generation != m_generation || saving())
+                    return;
+                m_decodeJob = {};
+                m_preview->setBusy(false);
+                if (!result.succeeded()) {
+                    showError(
+                        tr("The encoded preview could not be displayed: %1").arg(result.error));
+                    return;
+                }
+                publishPreview(std::move(result.image), options);
+            });
+        if (!m_decodeJob.isValid()) {
+            m_preview->setBusy(false);
+            showError(tr("The screenshot export queue is full"));
+        }
+    }
+    void beginSave() {
+        if (m_phase != Phase::Editing)
+            return;
+        rememberCurrentFormatOptions();
+        static_cast<void>(snow_shot::storage::ScreenshotSettings().setLastManualSaveState(
+            ScreenshotImageFileService::formatKey(m_state.output.format),
+            serializedFormatOptions()));
+        setPhase(Phase::Saving);
+        m_renderTimer.stop();
+        m_savePath = m_state.outputPath();
+        cancelDecode();
+        startRender();
+    }
+    void saveFailed(const QString& error) {
+        setPhase(Phase::Editing);
+        m_preview->setBusy(false);
+        validateFields();
+        showError(error);
+        startDecode();
+    }
+    void writeFile() {
+        if (m_saveJob.isValid())
+            return;
+        m_saveJob = ScreenshotExportCoordinator::shared().submit(
+            this, ScreenshotExportCoordinator::Priority::Foreground,
+            [encoded = m_encoded,
+             path = m_savePath](const ScreenshotExportCancellation& cancellation) {
+                ScreenshotExportTaskResult result;
+                const auto cancelled = [&cancellation] {
+                    return cancellation.isCancellationRequested();
+                };
+                const auto saved =
+                    encoded->pdf ? ScreenshotImageFileService::writePdf(
+                                       *encoded->pdf, path,
+                                       ScreenshotPdfOptions{encoded->options.pdfPageSize,
+                                                            encoded->options.quality,
+                                                            {},
+                                                            QDateTime::currentDateTimeUtc()},
+                                       cancelled)
+                                 : ScreenshotImageFileService::writeEncodedFile(
+                                       encoded->path, path, encoded->options.format, cancelled);
+                result.savedPath = saved.path;
+                result.error = saved.error;
+                if (!saved.succeeded())
+                    result.failureStage = ScreenshotExportFailureStage::File;
+                return result;
+            },
+            [this](ScreenshotExportTaskResult result) {
+                m_saveJob = {};
+                if (closed())
+                    return;
+                if (!result.succeeded()) {
+                    saveFailed(tr("The screenshot could not be saved: %1").arg(result.error));
+                    return;
+                }
+                static_cast<void>(
+                    snow_shot::storage::ScreenshotSettings().setLastManualSaveDirectory(
+                        QFileInfo(result.savedPath).absolutePath()));
+                m_lastSavedPath = result.savedPath;
+                if (!m_showSaveResult) {
+                    m_modal->accept();
+                    return;
+                }
+                showError({});
+                m_result->present(
+                    {m_lastSavedPath,
+                     m_encoded->pixels,
+                     {m_encoded->options.quality, m_encoded->options.compressionLevel}});
+                setPhase(Phase::Result);
+                startDecode();
+                m_result->focusDefaultAction();
+            });
+        if (!m_saveJob.isValid())
+            saveFailed(tr("The screenshot export queue is full"));
+    }
+
+    AdModal* m_modal;
+    std::shared_ptr<ScreenshotExportArtifact> m_artifact;
+    ScreenshotSaveAsFileDialog::Saved m_saved;
+    const bool m_showSaveResult = snow_shot::storage::ScreenshotSettings().showSaveResult();
+    QString m_lastSavedPath;
+    ScreenshotSaveFooter* m_footer = nullptr;
+    QStackedWidget* m_rightPanel = nullptr;
+    ScreenshotSaveResult* m_result = nullptr;
+    const snow_shot::storage::ScreenshotWindowNames m_windowNames;
+    const QDateTime m_timestamp = QDateTime::currentDateTime();
+    ScreenshotSaveDialogState m_state;
+    pipeline::Source m_source;
+    std::optional<ScreenshotSaveExportOptions> m_requestedOptions;
+    std::optional<ScreenshotSaveExportOptions> m_renderedPreviewOptions;
+    std::shared_ptr<pipeline::PreparedPixels> m_preparedPixels;
+    std::shared_ptr<pipeline::Encoded> m_encoded;
+    QString m_savePath;
+    ScreenshotExportJobHandle m_job;
+    ScreenshotExportJobHandle m_decodeJob;
+    ScreenshotExportJobHandle m_saveJob;
+    QTimer m_renderTimer;
+    quint64 m_generation = 0;
+    quint64 m_decodeSerial = 0;
+    Phase m_phase = Phase::Editing;
+    std::optional<quint64> m_renderGeneration;
+    ScreenshotSavePreviewCanvas* m_preview = nullptr;
+    QLabel* m_outputDescription = nullptr;
+    AdForm* m_form = nullptr;
+    DirectoryPathInput* m_directory = nullptr;
+    AdLineEdit* m_filename = nullptr;
+    AdSelect* m_format = nullptr;
+    AdInputNumber* m_width = nullptr;
+    AdInputNumber* m_height = nullptr;
+    QLabel* m_sizeLabel = nullptr;
+    AdSegmented* m_sizeUnit = nullptr;
+    bool m_percentage = false;
+    AspectRatioLockButton* m_lock = nullptr;
+    AdSlider* m_quality = nullptr;
+    AdFormItem* m_qualityItem = nullptr;
+    AdSelect* m_compression = nullptr;
+    AdFormItem* m_compressionItem = nullptr;
+    QHash<int, ScreenshotImageEncodingOptions> m_formatOptions;
+    QLabel* m_error = nullptr;
+    QWidget* m_shortcutsHost = nullptr;
+    adqt::widgets::detail::FlowLayout* m_shortcutsLayout = nullptr;
+    QVector<Shortcut> m_shortcuts;
+    QPointer<AdContextMenu> m_menu;
+    QPointer<AdModal> m_editor;
+    QPointer<AdModal> m_overwrite;
+};
+
+// Labels translated indirectly by the reusable form builder.
+[[maybe_unused]] constexpr const char* labels[] = {
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Save path"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "File name"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "PDF"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Image format"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Width"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Height"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Quality"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Compression level"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Low"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "Medium"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "High"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "0%"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "100%"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "PNG"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "JPEG"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "BMP"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "WebP"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "JPEG XL"),
+    QT_TRANSLATE_NOOP("ScreenshotSaveAsFileDialog", "AVIF"),
+};
+} // namespace
+
+ScreenshotSaveDialogState
+ScreenshotSaveDialogState::initial(QSize size, const QDateTime& timestamp,
+                                   const snow_shot::storage::ScreenshotWindowNames& names) {
+    ScreenshotSaveDialogState result;
+    const snow_shot::storage::ScreenshotSettings settings;
+    const QFileInfo remembered(settings.lastManualSaveDirectory());
+    const QString configured = snow_shot::storage::expandScreenshotExportVariables(
+        settings.imageSaveDirectory(), timestamp, names);
+    if (remembered.isDir() && remembered.isReadable() && remembered.isWritable())
+        result.directory = remembered.absoluteFilePath();
+    else if (!configured.isEmpty() && QDir::isAbsolutePath(configured))
+        result.directory = QDir::cleanPath(configured);
+    else
+        result.directory = ScreenshotImageFileService::saveDialogDirectory(
+            {}, settings.imageSaveDirectory(), timestamp, names);
+    result.filename = ScreenshotImageFileService::suggestedBaseName(
+        settings.manualSaveFilenameFormat(), timestamp, names);
+    result.output.pdfPageSize = screenshot_pdf::pageSizeForKey(settings.pdfPageSize());
+    result.sourceSize = size;
+    result.output.size = size;
+    result.output.format =
+        ScreenshotImageFileService::formatForKey(settings.lastManualSaveFormat());
+    const QJsonObject rememberedOptions =
+        settings.manualSaveFormatOptions()
+            .value(ScreenshotImageFileService::formatKey(result.output.format))
+            .toObject();
+    result.output.quality = rememberedOptions.value(QStringLiteral("quality")).toInt(100);
+    result.output.compressionLevel = ScreenshotImageFileService::compressionLevelForKey(
+        rememberedOptions.value(QStringLiteral("compression_level")).toString());
+    return result;
+}
+void ScreenshotSaveDialogState::setDimension(bool width, int value) {
+    if (width)
+        output.size.setWidth(value);
+    else
+        output.size.setHeight(value);
+    if (!lockAspectRatio || sourceSize.isEmpty() || value <= 0)
+        return;
+    const double other = width ? double(value) * sourceSize.height() / sourceSize.width()
+                               : double(value) * sourceSize.width() / sourceSize.height();
+    const int dimension = qRound(std::clamp(other, 1.0, 1000000.0));
+    if (width)
+        output.size.setHeight(dimension);
+    else
+        output.size.setWidth(dimension);
+}
+QString ScreenshotSaveDialogState::validationError() const {
+    if (directory.trimmed().isEmpty() || !QDir::isAbsolutePath(directory.trimmed()))
+        return QCoreApplication::translate("ScreenshotSaveAsFileDialog",
+                                           "Please enter an absolute directory path");
+    static const QRegularExpression invalid(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]"));
+    static const QRegularExpression reserved(
+        QStringLiteral("^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\\.|$)"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QString name = filename.trimmed();
+    if (name.isEmpty() || invalid.match(name).hasMatch() || reserved.match(name).hasMatch() ||
+        name == QStringLiteral(".") || name == QStringLiteral("..") ||
+        name.endsWith(QLatin1Char('.')))
+        return QCoreApplication::translate("ScreenshotSaveAsFileDialog",
+                                           "Please enter a valid file name");
+    return imageValidationError();
+}
+QString ScreenshotSaveDialogState::imageValidationError() const {
+    const QSize limits = pipeline::encoderLimits(output.format);
+    if (output.size.isEmpty() || output.size.width() > limits.width() ||
+        output.size.height() > limits.height() ||
+        qint64(output.size.width()) * output.size.height() > qint64{2} * 1024 * 1024 * 1024)
+        return QCoreApplication::translate("ScreenshotSaveAsFileDialog",
+                                           "The dimensions are not supported by this image format");
+    return {};
+}
+QString ScreenshotSaveDialogState::outputPath() const {
+    return QDir(directory.trimmed())
+        .filePath(snow_shot::storage::composeExportFileName(
+            filename.trimmed(),
+            QLatin1Char('.') + ScreenshotImageFileService::extension(output.format)));
+}
+bool ScreenshotSaveDialogState::lossless() const {
+    return output.quality == 100 && formatSupportsLossless(output.format);
+}
+
+bool ScreenshotSaveAsFileDialog::open(QObject* lifetime, QWidget* owner,
+                                      std::shared_ptr<ScreenshotExportArtifact> source, Saved saved,
+                                      Finished finished, QWidget* stackingOwner,
+                                      Qt::WindowModality modality) {
+    if (!lifetime || !owner || !source || !source->isValid())
+        return false;
+    const QPointer<QWidget> stackingWindow(
+        stackingOwner && stackingOwner->isVisible() ? stackingOwner : nullptr);
+    auto* modal = new AdModal(lifetime);
+    modal->setObjectName(QStringLiteral("screenshotSaveAsFileModal"));
+    modal->setOwnerWindow(owner);
+    modal->setMode(AdModal::Mode::Window);
+    if (stackingWindow) {
+        QObject::connect(stackingWindow, &QObject::destroyed, modal, &AdModal::reject);
+    }
+    modal->setWindowModality(modality);
+    modal->setCentered(true);
+    modal->setMaskVisible(false);
+    modal->setCloseOnMaskClick(false);
+    modal->setClosePolicy(AdModal::ClosePolicy::Manual);
+    const QRect available = owner->screen()->availableGeometry();
+    modal->setPreferredWidth(std::min(1080, available.width() - 40));
+    auto* content = new SaveContent(modal, std::move(source), std::move(saved));
+    modal->setContentWidget(content);
+    QObject::connect(modal, &AdModal::closeRequested, content,
+                     [modal, content](AdModal::CloseReason reason) {
+                         if (content->saving())
+                             return;
+                         if (reason == AdModal::CloseReason::OkAction)
+                             content->acceptAction();
+                         else
+                             modal->reject();
+                     });
+    QObject::connect(modal, &AdModal::finished, content,
+                     [content, finished = std::move(finished)](AdModal::DialogCode) {
+                         content->finish(finished);
+                     });
+    QObject::connect(modal, &AdModal::finished, modal, &QObject::deleteLater);
+    if (lifetime != owner)
+        QObject::connect(owner, &QObject::destroyed, modal, &AdModal::reject);
+    modal->open();
+    // Preserve the display owner for centering and lifetime, while making the native dialog
+    // an owned window of the toolbar. Raising an owner cannot cover its owned dialog.
+    if (stackingWindow) {
+        QWidget* surface = content->window();
+        surface->windowHandle()->setTransientParent(stackingWindow->windowHandle());
+#if defined(Q_OS_WIN)
+        // QWidget keeps its original parent; synchronize the HWND owner as well as QWindow.
+        if (QApplication::platformName() == QStringLiteral("windows")) {
+            const auto dialogHwnd = reinterpret_cast<HWND>(surface->winId());
+            const auto toolbarHwnd = reinterpret_cast<HWND>(stackingWindow->winId());
+            SetWindowLongPtr(dialogHwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(toolbarHwnd));
+        }
+#endif
+        surface->raise();
+    }
+    content->installFooter();
+    modal->acceptButton()->setEnabled(false);
+    return true;
+}
+bool ScreenshotSaveAsFileDialog::open(QObject* lifetime, QWidget* owner, const QImage& image,
+                                      Saved saved, Finished finished, QWidget* stackingOwner,
+                                      Qt::WindowModality modality) {
+    if (image.isNull())
+        return false;
+    return open(
+        lifetime, owner,
+        std::make_shared<ScreenshotExportArtifact>(ScreenshotExportSource::fromImage(image)),
+        std::move(saved), std::move(finished), stackingOwner, modality);
+}

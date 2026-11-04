@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Verify OCR notice selection follows the shipped worker's dependency closure."""
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKER_MANIFEST = ROOT / 'snow-crates/crates/snow-ocr-process/Cargo.toml'
+LEGACY_DEPENDENCIES = {'clap', 'kamadak-exif', 'reqwest', 'rustls', 'serde_yaml', 'sha2', 'rapid-ocr-rs', 'ort', 'ort-sys'}
+
+
+def packages(target, features):
+    result = subprocess.run(
+        ['cargo', '+nightly-2026-09-08', 'tree', '--locked', '--offline', '--manifest-path', str(WORKER_MANIFEST),
+         '--package', 'snow-ocr-process', '--target', target, '--no-default-features',
+         '--features', features, '--edges', 'normal,build', '--prefix', 'none',
+         '--format', '{p}'],
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    return {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
+
+
+@unittest.skipUnless(shutil.which('cargo'), 'Cargo is required to inspect release dependencies')
+class OcrLicenseFeatures(unittest.TestCase):
+    def test_pinned_windows_worker_omits_unused_convenience_notices(self):
+        packaging = (ROOT / 'scripts/package-snow-shot.ps1').read_text()
+        selection = re.search(
+            r"\$ocrCargoManifest\s*=\s*@\('--no-default-features',\s*'--features',\s*'([^']+)'\)",
+            packaging,
+        )
+        self.assertIsNotNone(selection, 'Windows packaging must select the OCR notice features')
+        selected = packages('x86_64-pc-windows-msvc', selection.group(1))
+        self.assertTrue(LEGACY_DEPENDENCIES.isdisjoint(selected),
+                        f'Unused worker notices were retained: {LEGACY_DEPENDENCIES & selected}')
+        self.assertTrue({'png', 'zune-jpeg', 'turbojpeg', 'ravif', 'image-webp'}.isdisjoint(selected))
+        self.assertIn('simd-paddle-ocr-rs', selected)
+        self.assertTrue({'ash', 'gpu-allocator', 'shaderc'}.issubset(selected))
+
+    def test_local_macos_worker_omits_unused_convenience_notices(self):
+        selected = packages('aarch64-apple-darwin', 'crash-diagnostics,gpu')
+        self.assertTrue(LEGACY_DEPENDENCIES.isdisjoint(selected),
+                        f'Unused local worker notices were retained: {LEGACY_DEPENDENCIES & selected}')
+        self.assertTrue({'png', 'zune-jpeg', 'turbojpeg', 'ravif'}.isdisjoint(selected))
+        self.assertIn('simd-paddle-ocr-rs', selected)
+        self.assertIn('objc2-metal', selected)
+        # Cross-target cargo tree still includes the host's shader build dependencies.
+        self.assertNotIn('ash', selected)
+
+    def test_intel_macos_worker_keeps_cpu_only_dependency_closure(self):
+        selected = packages('x86_64-apple-darwin', 'crash-diagnostics')
+        self.assertTrue({'ash', 'gpu-allocator', 'shaderc', 'objc2-metal'}.isdisjoint(selected))
+
+
+if __name__ == '__main__':
+    unittest.main()

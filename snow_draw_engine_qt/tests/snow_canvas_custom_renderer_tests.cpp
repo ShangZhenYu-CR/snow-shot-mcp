@@ -1,0 +1,1674 @@
+#include "snow_draw_engine_qt/snow_canvas_custom_renderer.h"
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+#include "snow_canvas_display_item.h"
+#include "snow_canvas_input_adapter.h"
+#include "snow_canvas_cursor_controller.h"
+#include "snow_canvas_render_geometry.h"
+#include "snow_canvas_renderer.h"
+#include "snow_canvas_fill_render.h"
+#include "snow_canvas_watermark_renderer.h"
+#include "snow_canvas_compositor.h"
+#include "snow_canvas_runtime_access.h"
+#include "snow_canvas_runtime_cleanup.h"
+#include "snow_canvas_viewport.h"
+#include "icons/draw_engine_icons.h"
+#include "icon_renderer.h"
+
+#include <QApplication>
+#include <QByteArray>
+#include <QColor>
+#include <QCursor>
+#include <QFontDatabase>
+#include <QImage>
+#include <QEvent>
+#include <QEventLoop>
+#include <QTimer>
+#include <QThread>
+#include <QMouseEvent>
+#include <QKeyEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <thread>
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+void requireNear(qreal actual, qreal expected, const char* message) {
+    if (std::abs(actual - expected) > 0.0001) {
+        std::cerr << message << ": expected " << expected << ", got " << actual << '\n';
+        std::exit(1);
+    }
+}
+
+QCursor factoryTestCursor(qreal devicePixelRatio, const QColor& color) {
+    const int physicalSize = static_cast<int>(std::ceil(9.0 * devicePixelRatio));
+    QPixmap pixmap(physicalSize, physicalSize);
+    pixmap.setDevicePixelRatio(devicePixelRatio);
+    pixmap.fill(color);
+    return QCursor(pixmap, 4, 4);
+}
+
+class CursorChangeWidget final : public QWidget {
+  public:
+    explicit CursorChangeWidget(QWidget* parent = nullptr) : QWidget(parent) {}
+    int cursorChanges = 0;
+
+  protected:
+    bool event(QEvent* event) override {
+        if (event->type() == QEvent::CursorChange) {
+            ++cursorChanges;
+        }
+        return QWidget::event(event);
+    }
+};
+
+void customCrosshairFactoryPreservesLayersAndLifecycle() {
+    SnowCanvasWidget canvas;
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate the default crosshair tool");
+    require(canvas.cursor().shape() == Qt::CrossCursor,
+            "standalone canvases must retain the platform crosshair");
+
+    int factoryCalls = 0;
+    canvas.setCrosshairCursorFactory([&](qreal dpr) {
+        ++factoryCalls;
+        requireNear(dpr, canvas.devicePixelRatioF(), "factory must receive the canvas scale");
+        return factoryTestCursor(dpr, Qt::white);
+    });
+    const QCursor crosshair = canvas.cursor();
+    require(factoryCalls == 1 && crosshair.shape() == Qt::BitmapCursor &&
+                crosshair.hotSpot() == QPoint(4, 4),
+            "installing a factory must immediately replace an active engine crosshair");
+
+    canvas.setCursorForLayer(SnowCanvasCursorLayer::Host, QCursor(Qt::CrossCursor));
+    canvas.setCursorForLayer(SnowCanvasCursorLayer::CanvasTool, QCursor(Qt::IBeamCursor));
+    require(canvas.cursor() == crosshair && factoryCalls == 1,
+            "host crosshairs must override tool updates using the cached custom cursor");
+    canvas.clearCursorForLayer(SnowCanvasCursorLayer::Host);
+    require(canvas.cursor().shape() == Qt::IBeamCursor && factoryCalls == 1,
+            "clearing the host layer must restore the tool cursor without consulting the factory");
+    canvas.setCursorForLayer(SnowCanvasCursorLayer::Host, QCursor(Qt::ArrowCursor));
+    canvas.setCursorForLayer(SnowCanvasCursorLayer::CanvasTool, QCursor(Qt::CrossCursor));
+    require(canvas.cursor().shape() == Qt::ArrowCursor && factoryCalls == 1,
+            "non-crosshair host cursors must retain priority and their platform shape");
+    canvas.clearCursorForLayer(SnowCanvasCursorLayer::Host);
+    require(canvas.cursor() == crosshair && factoryCalls == 1,
+            "revealing a tool crosshair must reuse the same custom cursor");
+
+    int replacementCalls = 0;
+    canvas.setCrosshairCursorFactory([&](qreal dpr) {
+        ++replacementCalls;
+        return factoryTestCursor(dpr, Qt::black);
+    });
+    require(replacementCalls == 1 && canvas.cursor().shape() == Qt::BitmapCursor &&
+                canvas.cursor().pixmap().toImage().pixelColor(0, 0) == QColor(Qt::black),
+            "replacing the factory must invalidate the old pixels and refresh immediately");
+    canvas.setCrosshairCursorFactory({});
+    require(canvas.cursor().shape() == Qt::CrossCursor,
+            "clearing the factory must restore the semantic platform crosshair");
+}
+
+void customCrosshairFactoryRefreshesHostDisplayScaleWithoutCursorChurn() {
+    QWidget parent;
+    parent.setCursor(Qt::IBeamCursor);
+    CursorChangeWidget widget(&parent);
+    require(widget.cursor().shape() == Qt::IBeamCursor && !widget.testAttribute(Qt::WA_SetCursor),
+            "the child fixture must initially inherit its parent's non-arrow cursor");
+    SnowCanvasCursorController controller(widget);
+    int factoryCalls = 0;
+    qreal lastScale = 0.0;
+    controller.setCrosshairCursorFactory([&](qreal dpr) {
+        ++factoryCalls;
+        lastScale = dpr;
+        return factoryTestCursor(dpr, Qt::white);
+    });
+    require(factoryCalls == 0, "installing a factory without a crosshair must remain lazy");
+    controller.setCursor(SnowCanvasCursorLayer::Host, QCursor(Qt::CrossCursor));
+    const QCursor initial = widget.cursor();
+    const int initialChanges = widget.cursorChanges;
+    controller.setCursor(SnowCanvasCursorLayer::Host, QCursor(Qt::CrossCursor));
+    controller.setCursor(SnowCanvasCursorLayer::CanvasTool, QCursor(Qt::ArrowCursor));
+    controller.refreshDevicePixelRatio(widget.devicePixelRatioF());
+    require(factoryCalls == 1 && widget.cursor() == initial &&
+                widget.cursorChanges == initialChanges,
+            "repeated layer and scale updates must not recreate or reapply the custom cursor");
+
+    for (const qreal dpr : {1.0, 1.5, 2.0}) {
+        const int previousCalls = factoryCalls;
+        const int expectedCalls = previousCalls + (lastScale != dpr ? 1 : 0);
+        controller.refreshDevicePixelRatio(dpr);
+        require(factoryCalls == expectedCalls && lastScale == dpr,
+                "a host-only crosshair must regenerate at the new display scale");
+        requireNear(widget.cursor().pixmap().devicePixelRatio(), dpr,
+                    "custom crosshair pixels must retain the new scale");
+        const int physicalSize = static_cast<int>(std::ceil(9.0 * dpr));
+        require(widget.cursor().pixmap().size() == QSize(physicalSize, physicalSize) &&
+                    widget.cursor().hotSpot() == QPoint(4, 4),
+                "DPI refresh must update physical dimensions and preserve the logical hotspot");
+        const int changes = widget.cursorChanges;
+        controller.refreshDevicePixelRatio(dpr);
+        require(factoryCalls == expectedCalls && widget.cursorChanges == changes,
+                "refreshing an unchanged DPI must not switch native cursor sprites");
+    }
+
+    controller.clearCursor(SnowCanvasCursorLayer::Host);
+    require(widget.cursor().shape() == Qt::ArrowCursor,
+            "clearing a scaled host crosshair must restore its non-crosshair tool cursor");
+    const int previousCalls = factoryCalls;
+    controller.refreshDevicePixelRatio(2.0);
+    require(factoryCalls == previousCalls && widget.cursor().shape() == Qt::ArrowCursor,
+            "DPI refresh must preserve non-crosshair cursors without consulting the factory");
+    controller.clearCursor(SnowCanvasCursorLayer::CanvasTool);
+    // QWidget::unsetCursor clears WA_SetCursor only for children; top-level windows retain it.
+    require(widget.cursor().shape() == Qt::IBeamCursor && !widget.testAttribute(Qt::WA_SetCursor),
+            "clearing both layers must release the child's cursor and restore inheritance");
+    parent.setCursor(Qt::WaitCursor);
+    require(widget.cursor().shape() == Qt::WaitCursor,
+            "a released child must follow later changes to its parent's cursor");
+    controller.setEngineCursor(SNOW_CURSOR_STYLE_CROSSHAIR);
+    controller.refreshDevicePixelRatio(2.0);
+    require(widget.cursor().shape() == Qt::BitmapCursor,
+            "engine crosshairs must still use the custom factory during DPI refresh");
+    requireNear(widget.cursor().pixmap().devicePixelRatio(), 2.0,
+                "engine crosshair refresh must use the requested display scale");
+}
+
+class RecordingRenderer final : public SnowCanvasCustomRenderer {
+  public:
+    void clearRenderState() override {
+        ++clearCalls;
+    }
+    void renderBeforeCanvas(QPainter& painter, const SnowCanvasRenderContext& context) override {
+        ++beforeCalls;
+        beforeContext = context;
+        painter.fillRect(context.viewportRect, QColor(220, 30, 30));
+        painter.setOpacity(0.0);
+        painter.setTransform(QTransform::fromTranslate(500.0, 500.0));
+    }
+
+    void renderAfterCanvas(QPainter& painter, const SnowCanvasRenderContext& context) override {
+        ++afterCalls;
+        afterContext = context;
+        painterStateRestored =
+            qFuzzyCompare(painter.opacity(), 1.0) && painter.transform().isIdentity();
+        painter.fillRect(QRect(0, 0, 8, 8), QColor(20, 190, 70));
+    }
+
+    int beforeCalls = 0;
+    int clearCalls = 0;
+    int afterCalls = 0;
+    bool painterStateRestored = false;
+    SnowCanvasRenderContext beforeContext;
+    SnowCanvasRenderContext afterContext;
+};
+
+QImage renderCanvas(SnowCanvasWidget& canvas) {
+    QImage image(canvas.size(), QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    canvas.render(&painter);
+    painter.end();
+    return image;
+}
+
+void opaqueCustomBackgroundSkipsOnlyRedundantCanvasClearing() {
+    class CoverageRenderer final : public SnowCanvasCustomRenderer {
+      public:
+        bool covered = false;
+        bool coversWidgetRect(const QRect&) const override {
+            return covered;
+        }
+    } renderer;
+    QWidget widget;
+    widget.resize(24, 16);
+    SceneDisplayInfo sceneInfo{};
+    sceneInfo.clear_color = SnowColorRgba8{12, 34, 56, 255};
+    snow_canvas_compositor::Frame frame;
+    frame.widget = &widget;
+    frame.sceneInfo = &sceneInfo;
+    frame.backgroundRenderer = &renderer;
+    QImage image(widget.size(), QImage::Format_ARGB32_Premultiplied);
+    const QColor previous(210, 90, 180);
+    const auto clear = [&]() {
+        image.fill(previous);
+        QPainter painter(&image);
+        painter.setClipRegion(QRegion(widget.rect()));
+        snow_canvas_compositor::clearSurface(painter, frame);
+    };
+    clear();
+    require(image.pixelColor(8, 8) == QColor(12, 34, 56),
+            "the default custom renderer contract must retain canvas clearing");
+    renderer.covered = true;
+    clear();
+    require(image.pixelColor(8, 8) == previous,
+            "a proven replacement background makes canvas clearing redundant");
+    renderer.covered = false;
+    clear();
+    require(image.pixelColor(8, 8) == QColor(12, 34, 56),
+            "losing background coverage must restore canvas clearing immediately");
+    frame.backgroundRenderer = nullptr;
+    clear();
+    require(image.pixelColor(8, 8) == QColor(12, 34, 56),
+            "ordinary canvases must preserve their clear behavior");
+}
+
+struct StrokeRunStats {
+    int inkedColumns = 0;
+    int gapColumns = 0;
+    int longestInkRun = 0;
+};
+
+StrokeRunStats renderRectangleTopEdge(SnowStrokeStyle strokeStyle,
+                                      SnowCornerRadii cornerRadii = {}) {
+    constexpr QSize imageSize(160, 100);
+    constexpr int sampleStartX = 45;
+    constexpr int sampleEndX = 115;
+    constexpr int sampleStartY = 27;
+    constexpr int sampleEndY = 33;
+
+    SceneDisplayInfo sceneInfo{};
+    sceneInfo.item_count = 1;
+    sceneInfo.surface_width = imageSize.width();
+    sceneInfo.surface_height = imageSize.height();
+    sceneInfo.camera_zoom = 1.0;
+
+    SnowCanvasSceneItem item;
+    item.kind = SNOW_SCENE_DISPLAY_ITEM_DRAW_RECT;
+    item.center_x = 0.0;
+    item.center_y = 0.0;
+    item.width = 100.0;
+    item.height = 40.0;
+    item.fill = SnowColorRgba8{0, 0, 0, 0};
+    item.fill_style = SNOW_FILL_STYLE_SOLID;
+    item.stroke = SnowColorRgba8{0, 0, 0, 255};
+    item.stroke_width = 4.0;
+    item.stroke_style = strokeStyle;
+    item.corner_radii = cornerRadii;
+    item.rebuildLocalRectangleGeometry();
+
+    QImage image(imageSize, QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    snow_canvas_renderer::renderSceneItems(snow_canvas_renderer::SceneRenderRequest{
+        &painter, &sceneInfo, &item, 1, QRegion(image.rect())});
+    painter.end();
+
+    StrokeRunStats stats;
+    int currentInkRun = 0;
+    for (int x = sampleStartX; x <= sampleEndX; ++x) {
+        bool hasInk = false;
+        for (int y = sampleStartY; y <= sampleEndY; ++y) {
+            if (image.pixelColor(x, y).alpha() > 127) {
+                hasInk = true;
+                break;
+            }
+        }
+        if (hasInk) {
+            ++stats.inkedColumns;
+            ++currentInkRun;
+            stats.longestInkRun = std::max(stats.longestInkRun, currentInkRun);
+        } else {
+            ++stats.gapColumns;
+            currentInkRun = 0;
+        }
+    }
+    return stats;
+}
+
+QColor renderMultiplyItemAtCenter(SnowCanvasSceneItem& item) {
+    constexpr QSize imageSize(100, 100);
+    SceneDisplayInfo sceneInfo{};
+    sceneInfo.item_count = 1;
+    sceneInfo.surface_width = imageSize.width();
+    sceneInfo.surface_height = imageSize.height();
+    sceneInfo.camera_zoom = 1.0;
+    sceneInfo.clear_color = SnowColorRgba8{100, 150, 200, 255};
+
+    QImage image(imageSize, QImage::Format_RGBA8888);
+    image.fill(QColor(100, 150, 200));
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    snow_canvas_renderer::renderSceneItems(snow_canvas_renderer::SceneRenderRequest{
+        &painter, &sceneInfo, &item, 1, QRegion(image.rect())});
+    painter.end();
+    return image.pixelColor(imageSize.width() / 2, imageSize.height() / 2);
+}
+
+void highlightItemsRenderWithMultiplyBlendMode() {
+    SnowCanvasSceneItem rectangle;
+    rectangle.kind = SNOW_SCENE_DISPLAY_ITEM_DRAW_RECT;
+    rectangle.blend_mode = SNOW_BLEND_MODE_MULTIPLY;
+    rectangle.width = 40.0;
+    rectangle.height = 40.0;
+    rectangle.fill = SnowColorRgba8{200, 100, 50, 255};
+    rectangle.fill_style = SNOW_FILL_STYLE_SOLID;
+    rectangle.opacity = 1.0;
+    rectangle.rebuildLocalRectangleGeometry();
+    const QColor rectanglePixel = renderMultiplyItemAtCenter(rectangle);
+    require(rectanglePixel.red() < 100 && rectanglePixel.green() < 100 &&
+                rectanglePixel.blue() < 100,
+            "rectangle highlight should multiply its color with the canvas");
+
+    // The sampled center lies seven pixels beyond the endpoint, inside a
+    // 15-pixel round cap but outside a flat cap.
+    SnowArrowPoint points[] = {{-30.0, 0.0}, {-7.0, 0.0}};
+    SnowArrowPathCommand commands[2]{};
+    commands[0].kind = SNOW_ARROW_PATH_COMMAND_MOVE_TO;
+    commands[0].point = points[0];
+    commands[1].kind = SNOW_ARROW_PATH_COMMAND_LINE_TO;
+    commands[1].point = points[1];
+    SnowCanvasSceneItem pen;
+    pen.kind = SNOW_SCENE_DISPLAY_ITEM_ARROW;
+    pen.blend_mode = SNOW_BLEND_MODE_MULTIPLY;
+    pen.stroke = SnowColorRgba8{200, 100, 50, 255};
+    pen.stroke_width = 30.0;
+    pen.opacity = 1.0;
+    pen.arrow_type = SNOW_ARROW_TYPE_STRAIGHT;
+    pen.arrow_stroke_style = SNOW_STROKE_STYLE_SOLID;
+    pen.setArrowPoints(points, 2);
+    pen.arrow_path_commands = commands;
+    pen.arrow_path_command_count = 2;
+    const QColor penPixel = renderMultiplyItemAtCenter(pen);
+    require(penPixel.red() < 100 && penPixel.green() < 100 && penPixel.blue() < 100,
+            "pen highlight should use multiply blending and rounded endpoints");
+}
+
+void ownedAxisAlignedFreeDrawChunksRenderWithoutRawGeometry() {
+    constexpr QSize imageSize(120, 120);
+
+    SnowArrowPathCommand commands[3]{};
+    commands[0].kind = SNOW_ARROW_PATH_COMMAND_MOVE_TO;
+    commands[0].point = SnowArrowPoint{-40.0, 0.0};
+    commands[1].kind = SNOW_ARROW_PATH_COMMAND_LINE_TO;
+    commands[1].point = SnowArrowPoint{0.0, 0.0};
+    commands[2].kind = SNOW_ARROW_PATH_COMMAND_LINE_TO;
+    commands[2].point = SnowArrowPoint{0.0, 35.0};
+
+    SnowPathChunk chunks[2]{};
+    chunks[0].stable_id = 1;
+    chunks[0].command_start = 0;
+    chunks[0].command_offset = 0;
+    chunks[0].command_count = 2;
+    chunks[0].start_x = -40.0;
+    chunks[0].start_y = 0.0;
+    chunks[0].min_x = -40.0;
+    chunks[0].min_y = 0.0;
+    chunks[0].max_x = 0.0;
+    chunks[0].max_y = 0.0;
+    chunks[1].stable_id = 2;
+    chunks[1].command_start = 2;
+    chunks[1].command_offset = 2;
+    chunks[1].command_count = 1;
+    chunks[1].start_x = 0.0;
+    chunks[1].start_y = 0.0;
+    chunks[1].min_x = 0.0;
+    chunks[1].min_y = 0.0;
+    chunks[1].max_x = 0.0;
+    chunks[1].max_y = 35.0;
+
+    SnowPathChunkRange range{};
+    range.insert_chunk_count = 2;
+
+    SnowCanvasSceneItem item;
+    item.kind = SNOW_SCENE_DISPLAY_ITEM_ARROW;
+    item.is_free_draw = 1;
+    item.stroke = SnowColorRgba8{0, 0, 0, 255};
+    item.stroke_width = 6.0;
+    item.arrow_stroke_style = SNOW_STROKE_STYLE_SOLID;
+    item.opacity = 1.0;
+    require(item.applyPathGeometryPatch(0, 1, &range, 1, chunks, 2, commands, 3, false, true),
+            "free-draw path geometry should be accepted");
+
+    std::vector<std::uint32_t> visibleChunks;
+    item.queryPathChunks(QRectF(-50.0, -10.0, 100.0, 60.0), &visibleChunks);
+    require(visibleChunks == std::vector<std::uint32_t>({0, 1}),
+            "axis-aligned free-draw chunks must survive spatial culling");
+    item.queryPathChunks(QRectF(-30.0, -1.0, 10.0, 2.0), &visibleChunks);
+    require(visibleChunks == std::vector<std::uint32_t>({0}),
+            "short paths cull unrelated chunks with thin axis-aligned bounds");
+    item.queryPathChunks(QRectF(0.0, 0.0, 0.0, 0.0), &visibleChunks);
+    require(visibleChunks == std::vector<std::uint32_t>({0, 1}),
+            "short path culling retains shared boundary points");
+    item.queryPathChunks(QRectF(90.0, 90.0, 1.0, 1.0), &visibleChunks);
+    require(visibleChunks.empty(), "short path culling clears previous results on a miss");
+
+    item.arrow_text_bounds[0] = 12.0;
+    item.arrow_text_bounds[1] = 12.0;
+    item.arrow_text_bounds[2] = 24.0;
+    item.arrow_text_bounds[3] = 24.0;
+    require(!item.needsArrowTextClip(2.0) && !item.needsArrowTextClip(2.0),
+            "separated labels reuse a no-clip decision");
+    require(item.needsArrowTextClip(8.0),
+            "zoom-dependent antialias guard invalidates a no-clip decision");
+    item.arrow_text_bounds[0] = -24.0;
+    item.arrow_text_bounds[1] = -4.0;
+    item.arrow_text_bounds[2] = -12.0;
+    item.arrow_text_bounds[3] = 4.0;
+    require(item.needsArrowTextClip(2.0), "labels crossing rays keep clipping");
+    item.arrow_text_bounds[0] = 12.0;
+    item.arrow_text_bounds[1] = 12.0;
+    item.arrow_text_bounds[2] = 24.0;
+    item.arrow_text_bounds[3] = 24.0;
+    require(!item.needsArrowTextClip(2.0), "moving the label invalidates clip bounds");
+    item.stroke_width = 24.0;
+    require(item.needsArrowTextClip(2.0), "wider strokes invalidate clip decisions");
+    item.stroke_width = 6.0;
+    item.arrow_end_head = SNOW_ARROWHEAD_ARROW;
+    require(item.needsArrowTextClip(2.0), "fallback arrowheads retain conservative clipping");
+    item.arrow_end_head = SNOW_ARROWHEAD_NONE;
+    SnowCanvasSceneItem copied(item);
+    require(!copied.needsArrowTextClip(2.0), "copied geometry recomputes its clip decision");
+    commands[2].point.x = 18.0;
+    chunks[1].max_x = 18.0;
+    require(copied.applyPathGeometryPatch(0, 1, &range, 1, chunks, 2, commands, 3, false, true) &&
+                copied.needsArrowTextClip(2.0),
+            "full resets invalidate clipping even when geometry revisions are reused");
+
+    SceneDisplayInfo sceneInfo{};
+    sceneInfo.item_count = 1;
+    sceneInfo.surface_width = imageSize.width();
+    sceneInfo.surface_height = imageSize.height();
+    sceneInfo.camera_zoom = 1.0;
+
+    const QRectF bounds = snow_canvas_render_geometry::sceneItemBounds(sceneInfo, item);
+    require(bounds.contains(QPointF(20.0, 60.0)) && bounds.contains(QPointF(60.0, 95.0)),
+            "owned free-draw geometry must contribute to scene bounds");
+
+    QImage image(imageSize, QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    snow_canvas_renderer::renderSceneItems(snow_canvas_renderer::SceneRenderRequest{
+        &painter, &sceneInfo, &item, 1, QRegion(image.rect())});
+    painter.end();
+
+    require(image.pixelColor(30, 60).alpha() > 127,
+            "the horizontal free-draw chunk should be rendered");
+    require(image.pixelColor(60, 80).alpha() > 127,
+            "the vertical free-draw chunk should be rendered");
+}
+
+void closedPathCachesRespectBorderFillAndSpeechBubbleOutlines() {
+    const SnowArrowPoint points[] = {
+        {-40.0, -40.0}, {40.0, -40.0}, {40.0, 40.0}, {-40.0, 40.0}, {-40.0, -40.0}};
+    SnowArrowPathCommand commands[5]{};
+    for (int index = 0; index < 5; ++index) {
+        commands[index].kind =
+            index == 0 ? SNOW_ARROW_PATH_COMMAND_MOVE_TO : SNOW_ARROW_PATH_COMMAND_LINE_TO;
+        commands[index].point = points[index];
+    }
+    SnowPathChunk chunk{};
+    chunk.stable_id = 1;
+    chunk.command_count = 5;
+    chunk.min_x = chunk.min_y = -40.0;
+    chunk.max_x = chunk.max_y = 40.0;
+    SnowPathChunkRange range{};
+    range.insert_chunk_count = 1;
+
+    for (const auto kind : {SNOW_SCENE_DISPLAY_ITEM_ARROW, SNOW_SCENE_DISPLAY_ITEM_SPEECH_BUBBLE}) {
+        SnowCanvasSceneItem item;
+        item.kind = kind;
+        item.stroke = {0, 0, 0, 255};
+        item.stroke_width = 2.0;
+        item.arrow_text_bounds[0] = item.arrow_text_bounds[1] = -5.0;
+        item.arrow_text_bounds[2] = item.arrow_text_bounds[3] = 5.0;
+        for (const auto style :
+             {SNOW_FILL_STYLE_BORDER, SNOW_FILL_STYLE_SOLID, SNOW_FILL_STYLE_LINE,
+              SNOW_FILL_STYLE_CROSS_LINE, SNOW_FILL_STYLE_BORDER}) {
+            for (const auto alpha : {std::uint8_t{255}, std::uint8_t{0}}) {
+                item.fill = {255, 204, 199, alpha};
+                item.fill_style = style;
+                // Style changes reset path geometry even when its revision is unchanged.
+                require(item.applyPathGeometryPatch(0, 1, &range, 1, &chunk, 1, commands, 5, true,
+                                                    true),
+                        "closed paths accept style changes without changing their geometry");
+                const bool filled = style != SNOW_FILL_STYLE_BORDER && alpha != 0;
+                const bool needsOutline = kind == SNOW_SCENE_DISPLAY_ITEM_SPEECH_BUBBLE;
+                require(item.aggregateClosedPath().isEmpty() == (!filled && !needsOutline),
+                        "only visible fills and speech bubble outlines retain aggregate paths");
+                require(item.pathChunks().size() == 1,
+                        "Border preserves stroke geometry when omitting the fill path");
+                require(item.needsArrowTextClip(2.0) == filled &&
+                            item.needsArrowTextClip(2.0) == filled,
+                        "only visible fills need clipping around a label clear of the stroke");
+            }
+        }
+        item.arrow_text_bounds[0] = -42.0;
+        item.arrow_text_bounds[2] = -38.0;
+        require(item.needsArrowTextClip(2.0),
+                "Border strokes crossing a label still need clipping");
+    }
+}
+
+void rectangleFastPathHonorsOpacity() {
+    constexpr QSize imageSize(100, 100);
+    SceneDisplayInfo sceneInfo{};
+    sceneInfo.item_count = 1;
+    sceneInfo.surface_width = imageSize.width();
+    sceneInfo.surface_height = imageSize.height();
+    sceneInfo.camera_zoom = 1.0;
+
+    SnowCanvasSceneItem rectangle;
+    rectangle.kind = SNOW_SCENE_DISPLAY_ITEM_DRAW_RECT;
+    rectangle.blend_mode = SNOW_BLEND_MODE_MULTIPLY;
+    rectangle.width = 40.0;
+    rectangle.height = 40.0;
+    rectangle.fill = SnowColorRgba8{200, 100, 50, 255};
+    rectangle.fill_style = SNOW_FILL_STYLE_SOLID;
+    rectangle.opacity = 0.5;
+    rectangle.rebuildLocalRectangleGeometry();
+
+    QImage image(imageSize, QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    snow_canvas_renderer::renderSceneItems(snow_canvas_renderer::SceneRenderRequest{
+        &painter, &sceneInfo, &rectangle, 1, QRegion(image.rect())});
+    painter.end();
+
+    const QColor center = image.pixelColor(imageSize.width() / 2, imageSize.height() / 2);
+    require(center.alpha() >= 127 && center.alpha() <= 128,
+            "rectangle fast path should apply item opacity");
+}
+
+void sendMouseEvent(SnowCanvasWidget& canvas, QEvent::Type type, const QPointF& position,
+                    Qt::MouseButton button, Qt::MouseButtons buttons) {
+    QMouseEvent event(type, position, position, position, button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(&canvas, &event);
+}
+
+void runtimeExportUsesTheRequestedCanvasOrigin() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(200, 120);
+    canvas.show();
+    QApplication::processEvents();
+
+    const QRectF selection(640.0, 360.0, 200.0, 120.0);
+    require(canvas.setViewportCamera(selection.center().x(), selection.center().y(), 1.0),
+            "non-zero export should configure the source canvas camera");
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape),
+            "non-zero export should activate the shape tool");
+    SnowCanvasShapeStyle style;
+    style.stroke = QColor(240, 24, 24);
+    style.strokeWidth = 4.0;
+    require(canvas.setCanvasShapeStylePatch(style,
+                                            SnowCanvasShapeStylePropertyStrokeColor |
+                                                SnowCanvasShapeStylePropertyStrokeWidth,
+                                            SnowCanvasShapeKind::Rectangle),
+            "non-zero export should configure a detectable rectangle stroke");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(35.0, 30.0), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(165.0, 90.0), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(165.0, 90.0), Qt::LeftButton,
+                   Qt::NoButton);
+
+    QImage background(selection.size().toSize(), QImage::Format_ARGB32_Premultiplied);
+    background.fill(QColor(242, 244, 247));
+    const QImage output = runtime.renderToImage(selection, background.size(),
+                                                {CanvasExportSource{background, selection}});
+    bool containsRectangle = false;
+    for (int y = 0; y < output.height() && !containsRectangle; ++y) {
+        for (int x = 0; x < output.width(); ++x) {
+            const QColor pixel = output.pixelColor(x, y);
+            if (pixel.alpha() > 0 && pixel.red() > 180 && pixel.red() > pixel.green() * 2 &&
+                pixel.red() > pixel.blue() * 2) {
+                containsRectangle = true;
+                break;
+            }
+        }
+    }
+    require(containsRectangle,
+            "runtime export should include scene items at a non-zero canvas origin");
+}
+
+void customRendererContractIsOrderedAndIsolated() {
+    SnowCanvasWidget canvas;
+    canvas.resize(64, 64);
+    require(canvas.setViewportCamera(10.0, 20.0, 2.0), "camera should update");
+
+    RecordingRenderer renderer;
+    canvas.setCustomRenderer(&renderer);
+    require(canvas.customRenderer() == &renderer, "renderer should be retained non-owningly");
+
+    QImage image(canvas.size(), QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    canvas.render(&painter);
+    painter.end();
+
+    require(renderer.beforeCalls == 1, "before renderer should run once");
+    require(renderer.afterCalls == 1, "after renderer should run once");
+    require(renderer.painterStateRestored, "painter state should be isolated between passes");
+    require(renderer.beforeContext.viewportRect == canvas.rect(), "viewport should match canvas");
+    require(renderer.beforeContext.exposedRegion.contains(canvas.rect()),
+            "render context should expose the canvas");
+    require(renderer.beforeContext.canvasToViewTransform ==
+                renderer.afterContext.canvasToViewTransform,
+            "both passes should receive the same transform");
+
+    const QPointF mappedCenter =
+        renderer.beforeContext.canvasToViewTransform.map(QPointF(10.0, 20.0));
+    requireNear(mappedCenter.x(), 32.0, "camera center x should map to view center");
+    requireNear(mappedCenter.y(), 32.0, "camera center y should map to view center");
+    require(image.pixelColor(20, 20) == QColor(220, 30, 30),
+            "before-canvas content should survive the engine surface clear");
+    require(image.pixelColor(2, 2) == QColor(20, 190, 70),
+            "after-canvas content should be the final rendered layer");
+
+    require(canvas.viewRectForCanvasRect(QRectF(10.0, 20.0, 1.0, 1.0), 3) == QRect(29, 29, 8, 8),
+            "canvas invalidation should honor camera scale and padding");
+
+    canvas.setCustomRenderer(nullptr);
+    require(canvas.customRenderer() == nullptr, "renderer should detach explicitly");
+}
+
+void canvasContentVisibilityPreservesCustomRenderingAndState() {
+    SnowCanvasWidget canvas;
+    canvas.resize(80, 80);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.canvasContentVisible(), "canvas content should be visible by default");
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "shape tool should activate");
+
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(16.0, 16.0), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(56.0, 48.0), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(56.0, 48.0), Qt::LeftButton,
+                   Qt::NoButton);
+    require(canvas.canvasHistoryState().canUndo,
+            "rectangle input should create engine-owned content");
+
+    RecordingRenderer renderer;
+    canvas.setCustomRenderer(&renderer);
+    const QImage visible = renderCanvas(canvas);
+
+    const bool clearBackgroundEnabled = canvas.clearBackgroundEnabled();
+    canvas.setCanvasContentVisible(false);
+    canvas.setCanvasContentVisible(false);
+    require(!canvas.canvasContentVisible(), "canvas content should be suppressible");
+    require(canvas.clearBackgroundEnabled() == clearBackgroundEnabled,
+            "content visibility should not change background clearing");
+    const QImage hidden = renderCanvas(canvas);
+    require(renderer.beforeCalls == 2 && renderer.afterCalls == 2,
+            "custom renderer passes should run while canvas content is hidden");
+    require(visible != hidden, "engine-owned scene and overlay content should be hidden");
+    require(hidden.pixelColor(20, 20) == QColor(220, 30, 30),
+            "before-canvas custom content should remain visible");
+    require(hidden.pixelColor(2, 2) == QColor(20, 190, 70),
+            "after-canvas custom content should remain visible");
+
+    canvas.setCanvasContentVisible(true);
+    require(canvas.canvasContentVisible(), "canvas content should restore");
+    require(renderCanvas(canvas) == visible,
+            "restoring visibility should render the retained canvas state");
+    canvas.setCustomRenderer(nullptr);
+}
+
+QImage populateDrawingCaches() {
+    QImage image(320, 180, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    WatermarkDisplayInfo info{};
+    info.surface_width = image.width();
+    info.surface_height = image.height();
+    info.watermark_color = SnowColorRgba8{20, 40, 60, 255};
+    const QByteArray payload("session watermark");
+    std::copy(payload.begin(), payload.end(), info.watermark_text.begin());
+    info.watermark_text_len = static_cast<std::uint16_t>(payload.size());
+    info.watermark_font_size = 21;
+    info.watermark_gap = 40;
+    info.watermark_opacity = 0.5;
+    snow_canvas_renderer::renderWatermark(painter, info);
+    QPainterPath path;
+    path.addRect(QRectF(10, 10, 100, 80));
+    snow_canvas_fill_render::drawStyledFill(painter, path, SnowColorRgba8{40, 80, 120, 255},
+                                            SNOW_FILL_STYLE_CROSS_LINE, 3.0);
+    painter.end();
+    require(snow_canvas_renderer::watermarkPatternCacheEntryCountForCurrentThread() > 0 &&
+                snow_canvas_renderer::watermarkPatternCacheBytesForCurrentThread() > 0 &&
+                snow_canvas_renderer::watermarkPlacementWorkspaceBytesForCurrentThread() > 0 &&
+                snow_canvas_fill_render::hatchTextureCacheEntryCountForCurrentThread() > 0,
+            "rendering must populate watermark and hatch caches before document cleanup");
+    return image;
+}
+
+void requireDrawingCachesReleased() {
+    require(snow_canvas_renderer::watermarkPatternCacheEntryCountForCurrentThread() == 0 &&
+                snow_canvas_renderer::watermarkPatternCacheBytesForCurrentThread() == 0 &&
+                snow_canvas_renderer::watermarkPlacementWorkspaceBytesForCurrentThread() == 0 &&
+                snow_canvas_fill_render::hatchTextureCacheEntryCountForCurrentThread() == 0,
+            "document cleanup must release shared and owning-thread drawing caches");
+}
+
+void documentResetReleasesDrawingCaches() {
+    const auto exercise = [](bool attachCanvas) {
+        SnowCanvasRuntime runtime;
+        std::unique_ptr<SnowCanvasWidget> canvas;
+        if (attachCanvas)
+            canvas = std::make_unique<SnowCanvasWidget>(runtime);
+        for (const bool resetRuntime : {false, true}) {
+            const QImage before = populateDrawingCaches();
+            require(resetRuntime ? runtime.reset() : runtime.clearDocumentPreservingViewports(),
+                    "document cleanup must succeed with and without canvas clients");
+            requireDrawingCachesReleased();
+            require(populateDrawingCaches() == before,
+                    "rebuilding released caches must preserve drawing output");
+        }
+        runtime.destroyAsync();
+        requireDrawingCachesReleased();
+        {
+            SnowCanvasRuntime scopedRuntime;
+            populateDrawingCaches();
+        }
+        requireDrawingCachesReleased();
+    };
+    exercise(true);
+    std::atomic<bool> completed{false};
+    std::thread exportWorker([&] {
+        exercise(false);
+        completed.store(true, std::memory_order_release);
+    });
+    while (!completed.load(std::memory_order_acquire)) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    exportWorker.join();
+}
+
+void runtimeOwnersDoNotWaitForPendingCleanup() {
+    std::promise<void> workerStarted;
+    std::promise<void> releaseWorker;
+    const std::shared_future<void> release = releaseWorker.get_future().share();
+    std::thread::id cleanupThread;
+    snow_canvas_runtime::enqueueRuntimeCleanup([&] {
+        cleanupThread = std::this_thread::get_id();
+        workerStarted.set_value();
+        release.wait();
+    });
+    workerStarted.get_future().wait();
+
+    std::promise<void> ownersDestroyed;
+    std::future<void> destroyed = ownersDestroyed.get_future();
+    bool ownerOperationsSucceeded = true;
+    std::thread owners([&] {
+        for (int cycle = 0; cycle < 16; ++cycle) {
+            SnowCanvasRuntime runtime;
+            ownerOperationsSucceeded = runtime.isValid() && ownerOperationsSucceeded;
+            if (cycle % 2 == 0) {
+                runtime.destroyAsync();
+                runtime.destroyAsync();
+                ownerOperationsSucceeded = !runtime.isValid() && ownerOperationsSucceeded;
+                ownerOperationsSucceeded = runtime.reset() && ownerOperationsSucceeded;
+            }
+        }
+        ownersDestroyed.set_value();
+    });
+    const bool returnedBeforeCleanup =
+        destroyed.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    bool stayedOnCleanupThread = false;
+    snow_canvas_runtime::enqueueRuntimeCleanup(
+        [&] { stayedOnCleanupThread = std::this_thread::get_id() == cleanupThread; });
+    releaseWorker.set_value();
+    owners.join();
+    snow_canvas_runtime::waitForRuntimeCleanup();
+    require(returnedBeforeCleanup,
+            "runtime reset and owner destruction must return while detached cleanup is blocked");
+    require(ownerOperationsSucceeded,
+            "asynchronous destruction must detach valid runtimes and permit immediate reset");
+    require(stayedOnCleanupThread,
+            "rapid runtime cleanup must reuse the process worker instead of spawning per owner");
+
+    auto owner = std::make_unique<SnowCanvasRuntime>();
+    SnowCanvasWidget view(*owner);
+    owner.reset();
+    require(!view.setCanvasTool(SnowCanvasTool::Select),
+            "owner destruction must detach surviving canvas clients before background cleanup");
+    snow_canvas_runtime::waitForRuntimeCleanup();
+}
+
+void documentResetReleasesRetainedDisplayStorage() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(320, 180);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.setViewportCamera(160, 90, 1), "set the document-storage fixture camera");
+    SnowCanvasViewport viewport;
+    const SnowRuntime handle = snow_canvas_runtime::Access::handle(runtime);
+    require(viewport.create(handle, snow_canvas_viewport::defaultEngineConfig()) &&
+                snow_viewport_set_surface_size(handle, viewport.get(), 320, 180) == SNOW_OK &&
+                snow_viewport_set_camera(handle, viewport.get(), 160, 90, 1) == SNOW_OK,
+            "create an independently synchronized viewport for retained-storage checks");
+    SnowCanvasDisplayCache cache;
+    require(cache.sync(handle, viewport.get()), "synchronize the empty display cache");
+    const auto emptyStorageBytes = cache.retainedStorageBytes();
+    const QImage empty = renderCanvas(canvas);
+    for (const int count : {64, 1}) {
+        require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate the storage fixture tool");
+        for (int index = 0; index < count; ++index) {
+            const QPointF start(10 + (index % 8) * 36, 10 + (index / 8) * 18);
+            const QPointF end = start + QPointF(12, 10);
+            sendMouseEvent(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+            sendMouseEvent(canvas, QEvent::MouseMove, end, Qt::NoButton, Qt::LeftButton);
+            sendMouseEvent(canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+            require(cache.sync(handle, viewport.get()), "synchronize each committed shape");
+        }
+        require(cache.sceneItemCount() == static_cast<std::uint32_t>(count) &&
+                    cache.retainedStorageBytes() > emptyStorageBytes,
+                "annotation must populate retained scene, render-plan and spatial storage");
+        const QImage annotated = renderCanvas(canvas);
+        const auto annotatedBytes = cache.retainedStorageBytes();
+        runtime.clearRenderState();
+        cache.clearRenderState();
+        require(
+            cache.retainedStorageBytes() == annotatedBytes && renderCanvas(canvas) == annotated &&
+                annotated != empty,
+            "ordinary render cleanup must retain the document and its reusable display storage");
+        const auto cursor = cache.patchCursor();
+        require(runtime.clearDocumentPreservingViewports() && cache.sync(handle, viewport.get()),
+                "document cleanup must synchronize an independent display-cache client");
+        require(cache.sceneItemCount() == 0 && cache.overlayItemCount() == 0 &&
+                    cache.retainedStorageBytes() == emptyStorageBytes &&
+                    cache.patchCursor().scene_revision > cursor.scene_revision,
+                "document cleanup must reclaim high-water storage and advance the patch sequence");
+        require(renderCanvas(canvas) == empty && !runtime.canUndo(),
+                "a reused canvas must render the empty document without old history");
+    }
+    require(canvas.setCanvasTool(SnowCanvasTool::RectangleFilter),
+            "activate the render-plan fixture");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(20, 20), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(60, 60), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(60, 60), Qt::LeftButton,
+                   Qt::NoButton);
+    require(cache.sync(handle, viewport.get()) && !cache.renderPlan().empty(),
+            "filter annotations must populate retained render-plan storage");
+    cache.reset(SnowColorRgba8{255, 255, 255, 255});
+    require(cache.renderPlan().capacity() == 0,
+            "explicit retained-state reset must release a populated render-plan allocation");
+    require(cache.sync(handle, viewport.get()) && !cache.renderPlan().empty(),
+            "a reset display cache must rebuild the current document when needed");
+    require(runtime.clearDocumentPreservingViewports() && cache.sync(handle, viewport.get()) &&
+                cache.renderPlan().capacity() == 0 &&
+                cache.retainedStorageBytes() == emptyStorageBytes,
+            "the document reset patch must release render-plan high-water storage too");
+}
+
+void renderStateCleanupPreservesDocument() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(320, 180);
+    canvas.show();
+    QApplication::processEvents();
+    RecordingRenderer renderer;
+    canvas.setCustomRenderer(&renderer);
+    require(canvas.setViewportCamera(160, 90, 1), "set the cache-release fixture camera");
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate the cache-release shape tool");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(40, 40), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(140, 100), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(140, 100), Qt::LeftButton,
+                   Qt::NoButton);
+    const QImage before = renderCanvas(canvas);
+    const QByteArray document = runtime.serializeDocumentSession();
+    const QByteArray history = runtime.serializeDocumentHistory();
+    const QTransform camera = canvas.canvasToViewTransform();
+    const auto viewport = canvas.viewportId();
+    require(runtime.canUndo(), "the drawing must have undo history before cache cleanup");
+    const QImage patterns = populateDrawingCaches();
+    const int clearedBefore = renderer.clearCalls;
+    runtime.clearRenderState();
+    requireDrawingCachesReleased();
+    require(renderer.clearCalls == clearedBefore + 1,
+            "runtime cleanup must release borrowed custom renderer caches");
+    require(runtime.serializeDocumentSession() == document &&
+                runtime.serializeDocumentHistory() == history && canvas.viewportId() == viewport &&
+                canvas.canvasToViewTransform() == camera,
+            "cache cleanup must preserve document, history, viewport identity, and camera");
+    require(renderCanvas(canvas) == before && populateDrawingCaches() == patterns,
+            "rebuilding released drawing caches must preserve all rendered pixels");
+    require(runtime.undo() && runtime.canRedo(), "undo must remain available after cache cleanup");
+    require(renderCanvas(canvas) != before, "undo must still remove the committed shape");
+    require(runtime.redo() && renderCanvas(canvas) == before,
+            "redo must restore the exact drawing after cache cleanup");
+    canvas.setCustomRenderer(nullptr);
+}
+
+void documentResetClearsElementsAndPreservesViews() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    SnowCanvasWidget secondView(runtime);
+    canvas.resize(100, 100);
+    secondView.resize(100, 100);
+    canvas.show();
+    secondView.show();
+    QApplication::processEvents();
+    RecordingRenderer renderer;
+    canvas.setCustomRenderer(&renderer);
+    const QImage empty = renderCanvas(canvas);
+    const QImage secondEmpty = renderCanvas(secondView);
+    const auto viewport = canvas.viewportId();
+    const auto secondViewport = secondView.viewportId();
+    const auto transform = canvas.canvasToViewTransform();
+    const bool clearBackground = canvas.clearBackgroundEnabled();
+    for (const bool selected : {false, true}) {
+        require(canvas.setCanvasTool(SnowCanvasTool::Shape), "shape tool should activate");
+        for (const QPointF start : {QPointF(10, 10), QPointF(60, 60)}) {
+            const QPointF end = start + QPointF(25, 25);
+            sendMouseEvent(canvas, QEvent::MouseButtonPress, start, Qt::LeftButton, Qt::LeftButton);
+            sendMouseEvent(canvas, QEvent::MouseMove, end, Qt::NoButton, Qt::LeftButton);
+            sendMouseEvent(canvas, QEvent::MouseButtonRelease, end, Qt::LeftButton, Qt::NoButton);
+        }
+        require(canvas.setCanvasTool(SnowCanvasTool::Select), "Select should activate");
+        if (selected) {
+            sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(10, 20), Qt::LeftButton,
+                           Qt::LeftButton);
+            sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(10, 20), Qt::LeftButton,
+                           Qt::NoButton);
+            require(canvas.canvasStyleToolbarState().source ==
+                        SnowCanvasStyleToolbarSource::SelectedRectangle,
+                    "reset fixture should select one of its elements");
+        } else {
+            require(canvas.resetEditingState(), "selection should clear");
+        }
+        require(renderCanvas(canvas) != empty && renderCanvas(secondView) != secondEmpty,
+                "both viewports should display document elements before reset");
+        require(canvas.clearDocument(), "document reset should succeed");
+        require(renderCanvas(canvas) == empty && renderCanvas(secondView) == secondEmpty,
+                "reset should clear all elements and refresh every viewport");
+        require(!canvas.canvasHistoryState().canUndo && !canvas.canvasHistoryState().canRedo,
+                "reset should clear undo and redo history");
+        require(canvas.viewportId() == viewport && secondView.viewportId() == secondViewport &&
+                    canvas.canvasToViewTransform() == transform &&
+                    canvas.clearBackgroundEnabled() == clearBackground,
+                "reset should preserve viewport identity, camera and background settings");
+        require(canvas.clearDocument() && renderCanvas(canvas) == empty,
+                "resetting an empty document should be harmless");
+    }
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "shape tool should activate");
+    SnowCanvasShapeStyle style = canvas.canvasStyleToolbarState().shapeStyle;
+    style.strokeWidth = 9.0;
+    require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyStrokeWidth,
+                                            SnowCanvasShapeKind::Rectangle),
+            "creation style should update");
+    require(canvas.clearDocument() && canvas.canvasTool() == SnowCanvasTool::Shape &&
+                canvas.canvasStyleToolbarState().shapeStyle.strokeWidth == 9.0,
+            "reset should preserve the active tool and creation styles");
+    require(canvas.setCanvasTool(SnowCanvasTool::Text), "text tool should activate");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(30, 30), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(30, 30), Qt::LeftButton,
+                   Qt::NoButton);
+    QKeyEvent text(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
+    QApplication::sendEvent(&canvas, &text);
+    require(canvas.hasActiveTextEditing(), "reset fixture should have a pending text draft");
+    require(canvas.clearDocument() && !canvas.hasActiveTextEditing(),
+            "reset should finish and remove pending text editing");
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "Select should activate");
+    QApplication::processEvents();
+    require(renderCanvas(canvas) == empty && !canvas.canvasHistoryState().canUndo,
+            "a pending text draft must not reappear after reset");
+    require(secondView.setCanvasTool(SnowCanvasTool::Text), "second view should activate Text");
+    sendMouseEvent(secondView, QEvent::MouseButtonPress, QPointF(30, 30), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(secondView, QEvent::MouseButtonRelease, QPointF(30, 30), Qt::LeftButton,
+                   Qt::NoButton);
+    QApplication::sendEvent(&secondView, &text);
+    require(secondView.hasActiveTextEditing(), "second view should have a pending text draft");
+    require(canvas.clearDocument() && !secondView.hasActiveTextEditing(),
+            "reset should close pending text editors in every attached view");
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "Select should activate");
+    QApplication::processEvents();
+    require(renderCanvas(canvas) == empty && renderCanvas(secondView) == secondEmpty &&
+                !canvas.canvasHistoryState().canUndo,
+            "another viewport's pending draft must not survive document reset");
+    canvas.setCustomRenderer(nullptr);
+}
+
+void coalescedSceneRevisionsInvalidateEveryDirtyRegion() {
+    SnowCanvasWidget canvas;
+    canvas.resize(240, 120);
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape),
+            "shape tool should activate for scene invalidation regression setup");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(20.0, 30.0), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(60.0, 70.0), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(60.0, 70.0), Qt::LeftButton,
+                   Qt::NoButton);
+
+    renderCanvas(canvas);
+    require(canvas.duplicateSelected(QPointF(55.0, 0.0)),
+            "first duplicate should advance the scene without painting");
+    require(canvas.duplicateSelected(QPointF(55.0, 0.0)),
+            "second duplicate should advance the scene without painting");
+
+    const QImage cached = renderCanvas(canvas);
+    canvas.setCanvasContentVisible(false);
+    canvas.setCanvasContentVisible(true);
+    const QImage uncached = renderCanvas(canvas);
+    require(cached == uncached,
+            "coalesced scene revisions must not leave earlier dirty regions valid");
+}
+
+void rectangleStrokeStylesRenderDistinctPatterns() {
+    const StrokeRunStats solid = renderRectangleTopEdge(SNOW_STROKE_STYLE_SOLID);
+    const StrokeRunStats dashed = renderRectangleTopEdge(SNOW_STROKE_STYLE_DASHED);
+    const StrokeRunStats dotted = renderRectangleTopEdge(SNOW_STROKE_STYLE_DOTTED);
+    const StrokeRunStats roundedDashed =
+        renderRectangleTopEdge(SNOW_STROKE_STYLE_DASHED, SnowCornerRadii{8.0, 8.0, 8.0, 8.0});
+
+    require(solid.gapColumns == 0,
+            "solid rectangle stroke should not contain gaps along its top edge");
+    require(dashed.inkedColumns > 0 && dashed.gapColumns > 0,
+            "dashed rectangle stroke should contain both ink and gaps");
+    require(dotted.inkedColumns > 0 && dotted.gapColumns > 0,
+            "dotted rectangle stroke should contain both ink and gaps");
+    require(dotted.longestInkRun < dashed.longestInkRun,
+            "dotted rectangle stroke should have shorter ink runs than dashed");
+    require(roundedDashed.inkedColumns > 0 && roundedDashed.gapColumns > 0,
+            "rounded dashed rectangle stroke should contain both ink and gaps");
+}
+
+void strokeCursorsUseNativeBitmapsAndRefreshWithStyle() {
+    const QColor color(230, 20, 40);
+    for (qreal dpr : {1.0, 1.5, 2.0}) {
+        const QCursor cursor = snow_canvas_input::strokeCursor(20.0, color, true, dpr);
+        require(cursor.shape() == Qt::BitmapCursor, "brush cursor must be a native bitmap");
+        require(cursor.hotSpot() == QPoint(22, 22), "brush hotspot must be centered");
+        requireNear(cursor.pixmap().devicePixelRatio(), dpr, "cursor must preserve display scale");
+        const QImage pixels = cursor.pixmap().toImage();
+        require(pixels.pixelColor(qRound(22 * dpr), qRound(22 * dpr)) == color,
+                "brush cursor fill must use the active color");
+        require(pixels.pixelColor(qRound(2 * dpr), qRound(2 * dpr)).alpha() == 0,
+                "cursor corners must remain transparent");
+        require(pixels.pixelColor(qRound(38 * dpr), qRound(22 * dpr)).alpha() > 0,
+                "brush cursor must retain its crosshair arms");
+    }
+
+    SnowCanvasWidget canvas;
+    canvas.resize(200, 200);
+    for (const auto tool :
+         {SnowCanvasTool::FreeDraw, SnowCanvasTool::PenHighlight, SnowCanvasTool::PenFilter}) {
+        require(canvas.setCanvasTool(tool), "brush tool must activate");
+        if (tool == SnowCanvasTool::PenFilter) {
+            auto style = canvas.canvasStyleToolbarState().filterStyle;
+            style.strokeWidth = 20.0;
+            require(canvas.setCanvasFilterStyle(style, SnowCanvasFilterStylePropertyStrokeWidth),
+                    "filter cursor width must update");
+        } else {
+            auto style = canvas.canvasStyleToolbarState().shapeStyle;
+            style.strokeWidth = 20.0;
+            style.stroke = color;
+            require(canvas.setCanvasShapeStylePatch(style,
+                                                    SnowCanvasShapeStylePropertyStrokeWidth |
+                                                        SnowCanvasShapeStylePropertyStrokeColor,
+                                                    tool == SnowCanvasTool::FreeDraw
+                                                        ? SnowCanvasShapeKind::FreeDraw
+                                                        : SnowCanvasShapeKind::PenHighlight),
+                    "brush cursor style must update");
+        }
+        require(canvas.setViewportCamera(0, 0, 1.0), "cursor camera must reset");
+        require(canvas.cursor().shape() == Qt::BitmapCursor &&
+                    canvas.cursor().hotSpot() == QPoint(22, 22),
+                "tool must expose the updated native brush cursor without pointer movement");
+        if (tool != SnowCanvasTool::PenFilter) {
+            const QPixmap pixmap = canvas.cursor().pixmap();
+            const int center = qRound(22 * pixmap.devicePixelRatio());
+            const QColor cursorColor = pixmap.toImage().pixelColor(center, center);
+            if (tool == SnowCanvasTool::PenHighlight) {
+                require(cursorColor.alpha() == 128,
+                        "highlighter cursor fill must be half transparent");
+                require(std::abs(cursorColor.red() - color.red()) <= 1 &&
+                            std::abs(cursorColor.green() - color.green()) <= 1 &&
+                            std::abs(cursorColor.blue() - color.blue()) <= 1,
+                        "highlighter cursor must retain the selected color");
+            } else {
+                require(cursorColor == color,
+                        "style changes must immediately refresh the native cursor color");
+            }
+        }
+        const QCursor previous = canvas.cursor();
+        QMouseEvent move(QEvent::MouseMove, QPointF(170, 170), QPointF(170, 170), Qt::NoButton,
+                         Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(&canvas, &move);
+        require(canvas.cursor() == previous, "pointer motion must reuse the cached cursor");
+        canvas.setCursorForLayer(SnowCanvasCursorLayer::Host, QCursor(Qt::WaitCursor));
+        require(canvas.setViewportCamera(0, 0, 2.0), "cursor zoom must update");
+        require(canvas.cursor().shape() == Qt::WaitCursor, "host cursor must retain priority");
+        canvas.clearCursorForLayer(SnowCanvasCursorLayer::Host);
+        require(canvas.cursor().hotSpot() == QPoint(32, 32),
+                "clearing host override must reveal the latest zoomed cursor");
+    }
+    require(canvas.setCanvasTool(SnowCanvasTool::Eraser), "eraser must activate");
+    require(canvas.cursor().shape() == Qt::BitmapCursor &&
+                canvas.cursor().hotSpot() == QPoint(10, 10),
+            "eraser must use a fixed sixteen-pixel native cursor at any zoom");
+    require(canvas.setCanvasTool(SnowCanvasTool::Text), "text must activate");
+    require(canvas.cursor().shape() == Qt::IBeamCursor,
+            "switching tools must release the native brush cursor");
+}
+
+void brushEraserCreationStylesPreserveInteractionAndPeers() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    SnowCanvasWidget peer(runtime);
+    canvas.resize(200, 200);
+    canvas.show();
+    QApplication::processEvents();
+    require(peer.setCanvasTool(SnowCanvasTool::BrushEraser), "activate peer brush eraser");
+    require(canvas.setCanvasTool(SnowCanvasTool::PenFilter), "activate independent pen defaults");
+    const auto penStyle = canvas.canvasStyleToolbarState().filterStyle;
+    const auto history = runtime.serializeDocumentHistory();
+    const auto cursor = canvas.cursor();
+    require(canvas.setCanvasBrushEraserCreationStyle({20.0}), "set independent eraser width");
+    require(canvas.canvasTool() == SnowCanvasTool::PenFilter && canvas.cursor() == cursor &&
+                canvas.canvasStyleToolbarState().filterStyle == penStyle &&
+                runtime.serializeDocumentHistory() == history,
+            "eraser defaults must preserve the current tool, pen style and history");
+    require(peer.canvasStyleToolbarState().brushEraserStyle.strokeWidth == 20.0,
+            "shared defaults must immediately refresh peer eraser state");
+    require(canvas.setCanvasTool(SnowCanvasTool::BrushEraser) &&
+                canvas.canvasStyleToolbarState().source ==
+                    SnowCanvasStyleToolbarSource::DefaultBrushEraser &&
+                canvas.cursor().hotSpot() == QPoint(22, 22) &&
+                peer.cursor().hotSpot() == QPoint(22, 22),
+            "brush eraser activation must expose its independent width and native cursor");
+    require(canvas.commitStyleEdit(SnowCanvasBrushEraserEdit{{24.0}}) &&
+                peer.canvasStyleToolbarState().brushEraserStyle.strokeWidth == 24.0,
+            "committed width edits must share only creation preferences");
+    require(!canvas.setCanvasBrushEraserCreationStyle({0.0}) &&
+                !canvas.setCanvasBrushEraserCreationStyle({73.0}) &&
+                !canvas.setCanvasBrushEraserCreationStyle({std::nan("")}) &&
+                canvas.canvasStyleToolbarState().brushEraserStyle.strokeWidth == 24.0,
+            "invalid brush widths must fail without changing defaults");
+    require(canvas.setViewportCamera(0, 0, 2.0) && canvas.cursor().hotSpot() == QPoint(36, 36),
+            "brush eraser cursor must follow canvas zoom");
+    require(canvas.setCanvasTool(SnowCanvasTool::RectangleEraser) &&
+                canvas.canvasStyleToolbarState().source ==
+                    SnowCanvasStyleToolbarSource::DefaultRectangleEraser &&
+                canvas.cursor().shape() == Qt::CrossCursor,
+            "rectangle eraser must expose its source and crosshair");
+    require(canvas.setCanvasTool(SnowCanvasTool::Eraser) &&
+                canvas.cursor().hotSpot() == QPoint(10, 10),
+            "whole-element eraser must retain its fixed cursor width");
+}
+
+void backgroundEraserGesturesRestorePixelsAndHistory() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(200, 200);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.setViewportCamera(100, 100, 1.0), "set eraser fixture camera");
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate fixture rectangle");
+    auto shape = canvas.canvasStyleToolbarState().shapeStyle;
+    shape.fill = QColor(Qt::red);
+    shape.stroke = QColor(Qt::transparent);
+    shape.strokeWidth = 1.0;
+    require(canvas.setCanvasShapeStylePatch(shape,
+                                            SnowCanvasShapeStylePropertyFillColor |
+                                                SnowCanvasShapeStylePropertyStrokeColor |
+                                                SnowCanvasShapeStylePropertyStrokeWidth,
+                                            SnowCanvasShapeKind::Rectangle),
+            "set opaque fixture rectangle");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, {10, 10}, Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, {190, 190}, Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, {190, 190}, Qt::LeftButton, Qt::NoButton);
+    QImage background(200, 200, QImage::Format_ARGB32_Premultiplied);
+    background.fill(QColor(30, 90, 160));
+    const auto render = [&] {
+        return runtime.renderToImage(QRectF(0, 0, 200, 200), background.size(),
+                                     {CanvasExportSource{background, QRectF(0, 0, 200, 200)}});
+    };
+    require(render().pixelColor(60, 60) == QColor(Qt::red), "fixture must cover original pixels");
+    require(canvas.setCanvasBrushEraserCreationStyle({20.0}) &&
+                canvas.setCanvasTool(SnowCanvasTool::BrushEraser),
+            "activate twenty-pixel brush eraser");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, {60, 60}, Qt::LeftButton, Qt::LeftButton);
+    require(canvas.setCanvasBrushEraserCreationStyle({40.0}), "change future width during draft");
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, {60, 60}, Qt::LeftButton, Qt::NoButton);
+    require(runtime.selectedElementIds().isEmpty(), "created erasers must never be selected");
+    auto output = render();
+    require(output.pixel(60, 60) == background.pixel(60, 60) &&
+                output.pixelColor(75, 60) == QColor(Qt::red),
+            "click dots must restore the background with width captured at gesture start");
+    require(canvas.undo() && render().pixelColor(60, 60) == QColor(Qt::red),
+            "one undo must remove the entire eraser gesture");
+    require(canvas.redo() && render().pixel(60, 60) == background.pixel(60, 60),
+            "redo must restore immutable eraser output");
+    require(canvas.setCanvasTool(SnowCanvasTool::RectangleEraser), "activate rectangle eraser");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, {130, 130}, Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, {90, 100}, Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, {90, 100}, Qt::LeftButton, Qt::NoButton);
+    output = render();
+    require(output.pixel(110, 110) == background.pixel(110, 110) &&
+                output.pixelColor(85, 110) == QColor(Qt::red),
+            "reverse rectangle gestures must restore only their normalized bounds");
+    const auto session = runtime.serializeDocumentSession();
+    SnowCanvasRuntime restored;
+    require(restored.restoreDocumentSession(session), "restore immutable eraser session");
+    const auto restoredOutput =
+        restored.renderToImage(QRectF(0, 0, 200, 200), background.size(),
+                               {CanvasExportSource{background, QRectF(0, 0, 200, 200)}});
+    require(restoredOutput == output, "restored eraser sessions must preserve exact output");
+    require(canvas.deleteAllElements() && render() == background && canvas.undo() &&
+                render() == output,
+            "Delete All and its undo must include immutable erasers");
+    require(canvas.setCanvasTool(SnowCanvasTool::BrushEraser), "activate cancelled eraser draft");
+    const auto previousHistory = runtime.serializeDocumentHistory();
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, {150, 50}, Qt::LeftButton, Qt::LeftButton);
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "cancel eraser by changing tools");
+    require(runtime.serializeDocumentHistory() == previousHistory && render() == output,
+            "tool changes must discard eraser drafts without history");
+}
+
+void filterCreationStylesPreserveWidgetInteraction() {
+    constexpr quint32 properties =
+        SnowCanvasFilterStylePropertyType | SnowCanvasFilterStylePropertyStrength |
+        SnowCanvasFilterStylePropertyOpacity | SnowCanvasFilterStylePropertyStrokeWidth;
+    const SnowCanvasFilterStyle rectangleStyle{SnowCanvasFilterType::GaussianBlur, 0.3, 0.6, 7.0};
+    const SnowCanvasFilterStyle penStyle{SnowCanvasFilterType::Mosaic, 0.3, 0.8, 20.0};
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(200, 200);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.setViewportCamera(100, 100, 1.0), "set the filter creation fixture camera");
+    require(canvas.setCanvasTool(SnowCanvasTool::RectangleFilter),
+            "activate the selected filter fixture tool");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(30, 30), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseMove, QPointF(100, 100), Qt::NoButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(100, 100), Qt::LeftButton,
+                   Qt::NoButton);
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "activate the selected filter fixture");
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, QPointF(60, 60), Qt::LeftButton,
+                   Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, QPointF(60, 60), Qt::LeftButton,
+                   Qt::NoButton);
+    require(canvas.canvasStyleToolbarState().source ==
+                SnowCanvasStyleToolbarSource::SelectedRectangleFilter,
+            "filter creation fixture must select an existing filter");
+    const auto selectedStyle = canvas.canvasStyleToolbarState().filterStyle;
+    const auto selectedIds = runtime.selectedElementIds();
+    const QByteArray selectedElements = runtime.serializeSelectedDrawTemplate();
+    const QByteArray history = runtime.serializeDocumentHistory();
+    const QCursor selectedCursor = canvas.cursor();
+    int toolChanges = 0;
+    QObject::connect(&canvas, &SnowCanvasWidget::activeToolChanged, &canvas,
+                     [&toolChanges]() { ++toolChanges; });
+    require(
+        canvas.setCanvasFilterCreationStyle(rectangleStyle, properties,
+                                            SnowCanvasTool::RectangleFilter) &&
+            canvas.setCanvasFilterCreationStyle(penStyle, properties, SnowCanvasTool::PenFilter),
+        "both filter creation families must update without activating a visible tool");
+    require(canvas.canvasTool() == SnowCanvasTool::Select && toolChanges == 0 &&
+                canvas.cursor() == selectedCursor && runtime.selectedElementIds() == selectedIds &&
+                runtime.serializeSelectedDrawTemplate() == selectedElements &&
+                runtime.serializeDocumentHistory() == history &&
+                canvas.canvasStyleToolbarState().source ==
+                    SnowCanvasStyleToolbarSource::SelectedRectangleFilter &&
+                canvas.canvasStyleToolbarState().filterStyle == selectedStyle,
+            "creation defaults must preserve the selected filter, history, tool, and cursor");
+    require(canvas.resetEditingState() && canvas.setCanvasTool(SnowCanvasTool::RectangleFilter) &&
+                canvas.canvasStyleToolbarState().filterStyle == rectangleStyle &&
+                canvas.setCanvasTool(SnowCanvasTool::PenFilter) &&
+                canvas.canvasStyleToolbarState().filterStyle == penStyle,
+            "rectangle and pen filter creation styles must retain their targeted properties");
+    for (const auto tool : {SnowCanvasTool::Select, SnowCanvasTool::FreeDraw}) {
+        require(canvas.resetEditingState() && canvas.setCanvasTool(tool),
+                "prepare the repeated filter-default fixture");
+        const QCursor cursor = canvas.cursor();
+        toolChanges = 0;
+        for (int cycle = 0; cycle < 128; ++cycle) {
+            require(canvas.setCanvasFilterCreationStyle(rectangleStyle, properties,
+                                                        SnowCanvasTool::RectangleFilter) &&
+                        canvas.setCanvasFilterCreationStyle(penStyle, properties,
+                                                            SnowCanvasTool::PenFilter),
+                    "repeated filter-default refresh must succeed");
+            require(canvas.canvasTool() == tool && toolChanges == 0 && canvas.cursor() == cursor,
+                    "repeated defaults must not activate brush tools or recreate the cursor");
+        }
+    }
+    require(!canvas.setCanvasFilterCreationStyle(rectangleStyle, properties, SnowCanvasTool::Shape),
+            "a non-filter creation target must be rejected");
+    require(canvas.setCanvasTool(SnowCanvasTool::RectangleFilter) &&
+                canvas.canvasStyleToolbarState().filterStyle == rectangleStyle &&
+                canvas.setCanvasTool(SnowCanvasTool::PenFilter) &&
+                canvas.canvasStyleToolbarState().filterStyle == penStyle,
+            "rejected filter targets must leave creation defaults unchanged");
+    SnowCanvasWidget secondView(runtime);
+    require(secondView.setCanvasTool(SnowCanvasTool::PenFilter),
+            "activate the peer cursor synchronization fixture");
+    auto widerPen = penStyle;
+    widerPen.strokeWidth = 24.0;
+    toolChanges = 0;
+    require(canvas.setCanvasFilterCreationStyle(widerPen, SnowCanvasFilterStylePropertyStrokeWidth,
+                                                SnowCanvasTool::PenFilter) &&
+                toolChanges == 0 && canvas.canvasStyleToolbarState().filterStyle == widerPen &&
+                secondView.canvasStyleToolbarState().filterStyle == widerPen &&
+                canvas.cursor().hotSpot() == QPoint(24, 24) &&
+                secondView.cursor().hotSpot() == QPoint(24, 24),
+            "creation style changes must refresh shared viewport metadata and active cursors");
+    SnowCanvasWidget ownedCanvas;
+    require(
+        ownedCanvas.setCanvasFilterCreationStyle(penStyle, properties, SnowCanvasTool::PenFilter) &&
+            ownedCanvas.setCanvasTool(SnowCanvasTool::PenFilter) &&
+            ownedCanvas.canvasStyleToolbarState().filterStyle == penStyle,
+        "filter creation defaults must also work with a widget-owned runtime");
+    auto detachedRuntime = std::make_unique<SnowCanvasRuntime>();
+    SnowCanvasWidget detachedCanvas(*detachedRuntime);
+    detachedRuntime.reset();
+    require(!detachedCanvas.setCanvasFilterCreationStyle(penStyle, properties,
+                                                         SnowCanvasTool::PenFilter),
+            "a detached runtime must reject filter creation updates safely");
+}
+
+void filterCreationStylesPreservePeerTextDraft() {
+    SnowCanvasRuntime runtime;
+    QWidget host;
+    SnowCanvasWidget canvas(runtime, &host);
+    SnowCanvasWidget peer(runtime, &host);
+    host.resize(400, 200);
+    canvas.setGeometry(0, 0, 200, 200);
+    peer.setGeometry(200, 0, 200, 200);
+    host.show();
+    host.activateWindow();
+    QApplication::processEvents();
+    require(peer.setCanvasTool(SnowCanvasTool::Text), "activate the peer text draft fixture");
+    sendMouseEvent(peer, QEvent::MouseButtonPress, QPointF(50, 50), Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(peer, QEvent::MouseButtonRelease, QPointF(50, 50), Qt::LeftButton, Qt::NoButton);
+    QKeyEvent text(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, QStringLiteral("draft"));
+    QApplication::sendEvent(&peer, &text);
+    require(peer.hasActiveTextEditing() && QApplication::focusWidget() != nullptr,
+            "the peer fixture must own a focused uncommitted text draft");
+    QWidget* focus = QApplication::focusWidget();
+    const auto history = runtime.serializeDocumentHistory();
+    const SnowCanvasFilterStyle style{SnowCanvasFilterType::Mosaic, 0.5, 1.0, 20.0};
+    require(canvas.setCanvasFilterCreationStyle(style, SnowCanvasFilterStylePropertyStrokeWidth,
+                                                SnowCanvasTool::PenFilter),
+            "creation style must update while another viewport edits text");
+    require(peer.hasActiveTextEditing() && QApplication::focusWidget() == focus &&
+                canvas.canvasTool() == SnowCanvasTool::Text &&
+                runtime.serializeDocumentHistory() == history,
+            "creation style must preserve the peer draft, focus, shared tool, and history");
+}
+
+void freeDrawContinuationRendersOneStrokeAndActivatedEndpoint() {
+    SnowCanvasWidget canvas;
+    canvas.resize(240, 200);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.setCanvasTool(SnowCanvasTool::FreeDraw), "free draw must activate");
+    auto style = canvas.canvasStyleToolbarState().shapeStyle;
+    style.stroke = QColor(220, 30, 50);
+    style.strokeWidth = 8.0;
+    style.opacity = 0.5;
+    const quint32 properties = SnowCanvasShapeStylePropertyStrokeColor |
+                               SnowCanvasShapeStylePropertyStrokeWidth |
+                               SnowCanvasShapeStylePropertyOpacity;
+    require(canvas.setCanvasShapeStylePatch(style, properties, SnowCanvasShapeKind::FreeDraw),
+            "free draw fixture style must apply");
+    auto pointer = [&](QEvent::Type type, QPointF position, bool pressed) {
+        const auto button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
+        QMouseEvent event(type, position, position, button, pressed ? Qt::LeftButton : Qt::NoButton,
+                          Qt::ShiftModifier);
+        QEventLoop loop;
+        bool batchProcessed = false;
+        QObject::connect(&canvas, &SnowCanvasWidget::freeDrawMoveBatchProcessed, &loop, [&]() {
+            batchProcessed = true;
+            loop.quit();
+        });
+        QApplication::sendEvent(&canvas, &event);
+        if (type == QEvent::MouseMove && pressed && !batchProcessed) {
+            QTimer::singleShot(1000, &loop, &QEventLoop::quit);
+            loop.exec();
+            require(batchProcessed, "live stroke move batch must finish before rendering");
+        }
+        QApplication::processEvents();
+    };
+    pointer(QEvent::MouseButtonPress, QPointF(40, 80), true);
+    pointer(QEvent::MouseMove, QPointF(120, 80), true);
+    pointer(QEvent::MouseButtonRelease, QPointF(120, 80), false);
+    const QImage original = renderCanvas(canvas);
+    pointer(QEvent::MouseMove, QPointF(124, 82), false);
+    const QImage snapped = renderCanvas(canvas);
+    require(snapped.pixelColor(120, 80) == QColor(106, 189, 252),
+            "hover must render the activated blue marker at the exact endpoint");
+    pointer(QEvent::MouseMove, QPointF(145, 105), false);
+    require(renderCanvas(canvas) == original, "moving away must clear endpoint feedback");
+    style.stroke = QColor(30, 220, 50);
+    style.opacity = 1.0;
+    require(canvas.setCanvasShapeStylePatch(style, properties, SnowCanvasShapeKind::FreeDraw),
+            "different creation defaults must apply");
+    pointer(QEvent::MouseButtonPress, QPointF(124, 82), true);
+    pointer(QEvent::MouseMove, QPointF(190, 80), true);
+    const QImage preview = renderCanvas(canvas);
+    require(preview.pixelColor(70, 80) == original.pixelColor(70, 80),
+            "replacement preview must not double the original stroke opacity");
+    require(preview.pixelColor(160, 80) == original.pixelColor(70, 80),
+            "extension must use the original stroke style and render new geometry");
+    pointer(QEvent::MouseButtonRelease, QPointF(190, 80), false);
+    require(renderCanvas(canvas) == preview, "commit must match the replacement preview");
+    require(canvas.undo(), "continuation must undo");
+    require(renderCanvas(canvas) == original, "undo must restore the original rendered stroke");
+    require(canvas.redo(), "continuation must redo");
+    require(renderCanvas(canvas) == preview, "redo must restore the extended rendered stroke");
+    pointer(QEvent::MouseButtonPress, QPointF(40, 80), true);
+    pointer(QEvent::MouseMove, QPointF(20, 130), true);
+    const QImage prepended = renderCanvas(canvas);
+    pointer(QEvent::MouseButtonRelease, QPointF(20, 130), false);
+    require(renderCanvas(canvas) == prepended, "start-endpoint preview must match commit");
+}
+
+void cornerRadiusCursorMatchesTheApprovedSvg() {
+    constexpr int kCursorLogicalSize = 32;
+    constexpr QPoint kCursorHotSpot(3, 3);
+
+    const QCursor cursor = snow_canvas_input::cursorForSnowCursor(SNOW_CURSOR_STYLE_CORNER_RADIUS);
+
+    const auto ref = snow::draw_engine::icons::cursor::CornerRadius();
+    const auto metadata = adqt::icons::describeIcon(ref);
+    require(metadata.key.pack == QStringLiteral("snow-draw-engine-qt") &&
+                metadata.key.variant == QStringLiteral("cursor") &&
+                metadata.key.name == QStringLiteral("corner-radius") &&
+                metadata.colorModel == adqt::icons::IconColorModel::FullColor &&
+                metadata.sourceHash ==
+                    QByteArrayLiteral(
+                        "5cef6b53d66e14f777a031bdceb885b51a56ef0d6fdfb8077d7ec69030d9f3df"),
+            "corner radius cursor should retain its generated pack metadata");
+
+    const QPixmap pixmap = cursor.pixmap();
+    require(cursor.shape() == Qt::BitmapCursor, "corner radius cursor should use a custom pixmap");
+    require(!pixmap.isNull(), "corner radius cursor pixmap should be available");
+    require(cursor.hotSpot() == kCursorHotSpot,
+            "corner radius cursor hotspot should match the scaled arrow tip");
+
+    adqt::icons::IconRenderRequest request;
+    request.logicalSize = QSize(kCursorLogicalSize, kCursorLogicalSize);
+    request.devicePixelRatio = 1.0;
+    const QPixmap expectedPixmap = adqt::icons::renderIconPixmap(ref, request);
+    const QImage expectedPixmapImage =
+        expectedPixmap.toImage().convertToFormat(QImage::Format_RGBA8888);
+    const QImage image = pixmap.toImage().convertToFormat(QImage::Format_RGBA8888);
+    require(image.size() == expectedPixmapImage.size(),
+            "corner radius cursor pixmap size should match reference");
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            require(image.pixelColor(x, y) == expectedPixmapImage.pixelColor(x, y),
+                    "corner radius cursor pixmap should match the reference pixel-for-pixel");
+        }
+    }
+}
+
+void cornerRadiusCursorUsesItsTargetDevicePixelRatio() {
+    constexpr int kCursorLogicalSize = 32;
+    constexpr qreal kDevicePixelRatio = 2.0;
+    constexpr QPoint kCursorHotSpot(3, 3);
+
+    const QCursor cursor =
+        snow_canvas_input::cursorForSnowCursor(SNOW_CURSOR_STYLE_CORNER_RADIUS, kDevicePixelRatio);
+    const QPixmap pixmap = cursor.pixmap();
+    require(pixmap.size() == QSize(64, 64),
+            "corner radius cursor should use physical pixels for its target device pixel ratio");
+    require(qFuzzyCompare(pixmap.devicePixelRatio(), kDevicePixelRatio),
+            "corner radius cursor should retain its target device pixel ratio");
+    require(cursor.hotSpot() == kCursorHotSpot,
+            "corner radius cursor hotspot should remain in logical pixels");
+
+    adqt::icons::IconRenderRequest request;
+    request.logicalSize = QSize(kCursorLogicalSize, kCursorLogicalSize);
+    request.devicePixelRatio = kDevicePixelRatio;
+    const QPixmap expectedPixmap =
+        adqt::icons::renderIconPixmap(snow::draw_engine::icons::cursor::CornerRadius(), request);
+    require(pixmap.toImage().convertToFormat(QImage::Format_RGBA8888) ==
+                expectedPixmap.toImage().convertToFormat(QImage::Format_RGBA8888),
+            "corner radius cursor should render at its physical pixel resolution");
+}
+
+QImage renderSerialToolbarIcon(const adqt::icons::IconRef& ref, const QColor& color) {
+    adqt::icons::IconRenderRequest request;
+    request.logicalSize = QSize(14, 14);
+    request.devicePixelRatio = 1.0;
+    return adqt::icons::renderIconPixmap(ref.withColors(adqt::icons::IconColors::primary(color)),
+                                         request)
+        .toImage();
+}
+
+void serialToolbarGlyphsMatchTheirApprovedGeometry() {
+    const QColor color(29, 27, 32);
+    const QImage decrease =
+        renderSerialToolbarIcon(snow::draw_engine::icons::toolbar::SerialDecrease(), color);
+    const QImage increase =
+        renderSerialToolbarIcon(snow::draw_engine::icons::toolbar::SerialIncrease(), color);
+    const QImage textFields =
+        renderSerialToolbarIcon(snow::draw_engine::icons::toolbar::SerialTextFields(), color);
+
+    require(!decrease.isNull() && decrease.pixelColor(4, 7).rgb() == color.rgb() &&
+                decrease.pixelColor(7, 4).alpha() == 0,
+            "serial decrease should retain the approved horizontal-minus geometry");
+    require(!increase.isNull() && increase.pixelColor(4, 7).rgb() == color.rgb() &&
+                increase.pixelColor(7, 4).rgb() == color.rgb(),
+            "serial increase should retain the approved plus geometry");
+    require(!textFields.isNull() && textFields.pixelColor(2, 3).rgb() == color.rgb() &&
+                textFields.pixelColor(5, 10).rgb() == color.rgb() &&
+                textFields.pixelColor(11, 7).rgb() == color.rgb() &&
+                textFields.pixelColor(11, 10).rgb() == color.rgb(),
+            "serial text-fields should retain the approved paired-letter geometry");
+
+    const adqt::icons::IconPack* staticPack = snow::draw_engine::icons::pack().staticPack();
+    require(staticPack != nullptr && staticPack->packName == "snow-draw-engine-qt" &&
+                staticPack->entryCount == 4,
+            "draw-engine pack should contain its cursor and three toolbar glyphs");
+}
+
+void rotationHandleCursorMatchesTheReferencePlatformBehavior() {
+    const QCursor hoverCursor = snow_canvas_input::cursorForSnowCursor(SNOW_CURSOR_STYLE_GRAB);
+    const QCursor draggingCursor =
+        snow_canvas_input::cursorForSnowCursor(SNOW_CURSOR_STYLE_GRABBING);
+
+#ifdef Q_OS_WIN
+    require(hoverCursor.shape() == Qt::PointingHandCursor,
+            "hovering the rotation handle should use the Windows pointing-hand cursor");
+    require(draggingCursor.shape() == Qt::PointingHandCursor,
+            "dragging the rotation handle should retain the Windows pointing-hand cursor");
+#else
+    require(hoverCursor.shape() == Qt::OpenHandCursor,
+            "hovering the rotation handle should use the platform grab cursor");
+    require(draggingCursor.shape() == Qt::ClosedHandCursor,
+            "dragging the rotation handle should use the platform grabbing cursor");
+#endif
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication application(argc, argv);
+    if (application.arguments().contains(QStringLiteral("--crosshair-factory-only"))) {
+        customCrosshairFactoryPreservesLayersAndLifecycle();
+        customCrosshairFactoryRefreshesHostDisplayScaleWithoutCursorChurn();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--background-coverage-only"))) {
+        opaqueCustomBackgroundSkipsOnlyRedundantCanvasClearing();
+        return 0;
+    }
+#ifdef Q_OS_WIN
+    require(QFontDatabase::addApplicationFont(QStringLiteral("C:/Windows/Fonts/segoeui.ttf")) >= 0,
+            "load Segoe UI for offscreen drawing cache checks");
+    application.setFont(QFont(QStringLiteral("Segoe UI")));
+#endif
+    if (application.arguments().contains(QStringLiteral("--path-culling-only"))) {
+        ownedAxisAlignedFreeDrawChunksRenderWithoutRawGeometry();
+        closedPathCachesRespectBorderFillAndSpeechBubbleOutlines();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--stroke-cursor-only"))) {
+        strokeCursorsUseNativeBitmapsAndRefreshWithStyle();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--eraser-only"))) {
+        brushEraserCreationStylesPreserveInteractionAndPeers();
+        backgroundEraserGesturesRestorePixelsAndHistory();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--filter-creation-only"))) {
+        filterCreationStylesPreserveWidgetInteraction();
+        filterCreationStylesPreservePeerTextDraft();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--document-reset-only"))) {
+        runtimeOwnersDoNotWaitForPendingCleanup();
+        documentResetClearsElementsAndPreservesViews();
+        documentResetReleasesDrawingCaches();
+        documentResetReleasesRetainedDisplayStorage();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--render-state-only"))) {
+        renderStateCleanupPreservesDocument();
+        return 0;
+    }
+    freeDrawContinuationRendersOneStrokeAndActivatedEndpoint();
+    brushEraserCreationStylesPreserveInteractionAndPeers();
+    backgroundEraserGesturesRestorePixelsAndHistory();
+    strokeCursorsUseNativeBitmapsAndRefreshWithStyle();
+    customCrosshairFactoryPreservesLayersAndLifecycle();
+    customCrosshairFactoryRefreshesHostDisplayScaleWithoutCursorChurn();
+    filterCreationStylesPreserveWidgetInteraction();
+    filterCreationStylesPreservePeerTextDraft();
+    rotationHandleCursorMatchesTheReferencePlatformBehavior();
+    customRendererContractIsOrderedAndIsolated();
+    runtimeExportUsesTheRequestedCanvasOrigin();
+    canvasContentVisibilityPreservesCustomRenderingAndState();
+    documentResetClearsElementsAndPreservesViews();
+    runtimeOwnersDoNotWaitForPendingCleanup();
+    documentResetReleasesDrawingCaches();
+    documentResetReleasesRetainedDisplayStorage();
+    renderStateCleanupPreservesDocument();
+    coalescedSceneRevisionsInvalidateEveryDirtyRegion();
+    rectangleStrokeStylesRenderDistinctPatterns();
+    highlightItemsRenderWithMultiplyBlendMode();
+    ownedAxisAlignedFreeDrawChunksRenderWithoutRawGeometry();
+    closedPathCachesRespectBorderFillAndSpeechBubbleOutlines();
+    rectangleFastPathHonorsOpacity();
+    cornerRadiusCursorMatchesTheApprovedSvg();
+    cornerRadiusCursorUsesItsTargetDevicePixelRatio();
+    serialToolbarGlyphsMatchTheirApprovedGeometry();
+    return 0;
+}

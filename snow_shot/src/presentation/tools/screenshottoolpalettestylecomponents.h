@@ -1,0 +1,547 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLPALETTESTYLECOMPONENTS_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLPALETTESTYLECOMPONENTS_H
+
+#include "screenshottoolpalettebuttons.h"
+#include "snow_draw_engine_qt/snow_canvas_types.h"
+
+#include <QColor>
+#include <QMetaObject>
+#include <QPointer>
+#include <QString>
+#include <QStringList>
+#include <QVector>
+
+#include <functional>
+#include <memory>
+
+class QBoxLayout;
+class QObject;
+class QWidget;
+
+namespace adqt::widgets {
+class AdButton;
+class AdColorPicker;
+class AdPopover;
+class AdSelect;
+} // namespace adqt::widgets
+
+namespace snow_shot::presentation {
+
+void setScreenshotToolPaletteStyleButtonActive(adqt::widgets::AdButton* button, bool active);
+
+ColorPickerTrigger* createScreenshotToolPaletteColorPickerTrigger(
+    adqt::widgets::AdColorPicker* picker, const QString& accessibleName, const QColor& color,
+    const ScreenshotToolPaletteButtonMetrics& metrics,
+    ColorPickerTrigger::Preview preview = ColorPickerTrigger::Preview::Swatch);
+
+void refreshScreenshotToolPaletteColorPickerMetrics(
+    adqt::widgets::AdColorPicker* picker, const ScreenshotToolPaletteButtonMetrics& metrics);
+
+// Cross-editor services injected by the style-controls owner. Components stay
+// palette-agnostic: canvas sampling and popup-lifecycle bookkeeping are
+// forwarded through these callbacks instead of reaching into the palette.
+struct ScreenshotToolPaletteEditorServices {
+    std::function<void(adqt::widgets::AdColorPicker*)> canvasColorSamplingRequested;
+    std::function<void(QObject*)> popupInteractionBegan;
+    std::function<void(QObject*)> popupInteractionEnded;
+};
+
+// Shared picker shell; sampling is optional for consumers without a canvas.
+adqt::widgets::AdColorPicker* createScreenshotToolPaletteColorPicker(
+    QWidget* parent, const QString& accessibleName, const QColor& initialColor, bool alphaEnabled,
+    bool observePopup, const ScreenshotToolPaletteEditorServices& services,
+    QObject* callbackContext = nullptr);
+
+// Non-owning group of identical color preset buttons, whether in a toolbar or popup.
+// Widget ownership remains with the supplied parent; clear() releases the bindings.
+enum class ScreenshotToolPaletteColorPresetSource { Fixed, Stroke, Fill };
+
+class ScreenshotToolPaletteColorPresets final {
+  public:
+    using Tooltip = std::function<ScreenshotToolPaletteTranslationText(const QColor&)>;
+    ~ScreenshotToolPaletteColorPresets();
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const QVector<QColor>& colors, const Tooltip& tooltip, const QColor& initialColor,
+               const std::function<void(const QColor&)>& commit,
+               const ScreenshotToolPaletteButtonMetrics& metrics,
+               ScreenshotToolPaletteColorPresetSource source =
+                   ScreenshotToolPaletteColorPresetSource::Fixed);
+    void rebind(const QVector<QColor>& colors, const Tooltip& tooltip,
+                ScreenshotToolPaletteColorPresetSource source);
+    void update(const QColor& color, bool mixed);
+    void retranslate(const Tooltip& tooltip);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics);
+    void clear();
+    const QVector<ColorSwatchButton*>& buttons() const {
+        return m_buttons;
+    }
+
+  private:
+    void replaceColors(const QVector<QColor>& colors);
+    QVector<ColorSwatchButton*> m_buttons;
+    QVector<QColor> m_colors;
+    Tooltip m_tooltip;
+    QColor m_currentColor;
+    bool m_mixed = false;
+    QPointer<QObject> m_receiver;
+    QMetaObject::Connection m_settingsConnection;
+};
+
+// Base protocol shared by every reusable sub-toolbar editor component. A
+// component owns the widgets of one logical editor (built lazily into a row
+// layout), applies inbound style state through update(), and refreshes its
+// own metrics. Widget lifetimes stay owned by the row widget; release()
+// drops non-owning pointers when the row is evicted.
+class ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    virtual ~ScreenshotToolPaletteStyleEditorComponent();
+
+    [[nodiscard]] QWidget* rootWidget() const {
+        return m_rootWidget;
+    }
+
+    virtual void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) = 0;
+    // Popup content owns its window DPR and is intentionally excluded from
+    // toolbar scaling; this pass resets popup buttons after a DPI commit.
+    virtual void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) {
+        static_cast<void>(metrics);
+    }
+    // True while the user is actively editing through this component (for
+    // example dragging a color); inbound state sync queries it to keep the
+    // in-flight value authoritative.
+    [[nodiscard]] virtual bool isInteracting() const {
+        return false;
+    }
+    virtual void release() = 0;
+
+  protected:
+    ScreenshotToolPaletteStyleEditorComponent() = default;
+
+    [[nodiscard]] QBoxLayout* createRoot(QBoxLayout* layout, QWidget* parent);
+    [[nodiscard]] QObject* callbackContext() const {
+        return m_callbackContext.data();
+    }
+    void finalizeRoot();
+    void refreshRootMetrics(const ScreenshotToolPaletteButtonMetrics& metrics);
+    void releaseRoot();
+
+  private:
+    QWidget* m_rootWidget = nullptr;
+    // Rows may outlive their editor until deferred deletion. Context destruction
+    // retires signal callbacks independently of the row's widget lifetime.
+    QPointer<QObject> m_callbackContext;
+};
+
+class ScreenshotToolPaletteTextEmphasisEditor final
+    : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    using Commit = std::function<void(quint32, bool)>;
+    ~ScreenshotToolPaletteTextEmphasisEditor() override {
+        release();
+    }
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver, const Commit& commit,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const Commit& commit);
+    void update(const SnowCanvasTextStyle& style, quint32 mixed);
+    void retranslate();
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    adqt::widgets::AdButton* m_boldButton = nullptr;
+    adqt::widgets::AdButton* m_italicButton = nullptr;
+    quint32 m_mixed = 0;
+    std::shared_ptr<Commit> m_commit;
+};
+
+struct ScreenshotToolPaletteColorEditorConfig {
+    QString accessibleName;
+    QString pickerObjectName;
+    QString triggerObjectName;
+    QVector<QColor> presetValues;
+    ScreenshotToolPaletteColorPresetSource presetSource =
+        ScreenshotToolPaletteColorPresetSource::Fixed;
+    std::function<ScreenshotToolPaletteTranslationText(const QColor& color)> presetTooltip;
+    bool alphaEnabled = true;
+    bool observePopup = false;
+    std::function<void(SnowCanvasStrokeRenderingStyle)> setRenderingStyle;
+};
+
+// Color picker trigger plus preset swatches. Shared by the highlight,
+// pen-highlight, text, serial number, watermark and spotlight editors.
+class ScreenshotToolPaletteColorEditor final : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteColorEditorConfig& config, const QColor& initialColor,
+               const std::function<void(const QColor&)>& commitColor,
+               const std::function<void(const QColor&)>& previewColor,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteColorEditorConfig& config,
+                const std::function<void(const QColor&)>& commitColor,
+                const std::function<void(const QColor&)>& previewColor);
+    void update(const QColor& color, bool mixed);
+    void updateRenderingStyle(SnowCanvasStrokeRenderingStyle style, bool mixed, bool enabled);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] bool isInteracting() const override {
+        return m_handlingChange != nullptr && *m_handlingChange;
+    }
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    void ensureRenderingStyleContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+    adqt::widgets::AdColorPicker* m_picker = nullptr;
+    ColorPickerTrigger* m_trigger = nullptr;
+    ScreenshotToolPaletteColorPresets m_presets;
+    std::function<void(SnowCanvasStrokeRenderingStyle)> m_setRenderingStyle;
+    QWidget* m_renderingStyleRow = nullptr;
+    QVector<StrokeRenderingStylePreviewButton*> m_renderingStyleButtons;
+    SnowCanvasStrokeRenderingStyle m_renderingStyle = SnowCanvasStrokeRenderingStyle::Architect;
+    bool m_renderingStyleMixed = false;
+    bool m_renderingStyleEnabled = false;
+    std::shared_ptr<std::function<void(const QColor&)>> m_commitColor;
+    std::shared_ptr<std::function<void(const QColor&)>> m_previewColor;
+    std::shared_ptr<bool> m_handlingChange;
+};
+
+struct ScreenshotToolPaletteStrokeEditorConfig {
+    QString accessibleName;
+    QString popupObjectName;
+    QString styleRowObjectName;
+    QVector<QColor> colorValues;
+    ScreenshotToolPaletteColorPresetSource presetSource =
+        ScreenshotToolPaletteColorPresetSource::Fixed;
+    std::function<ScreenshotToolPaletteTranslationText(const QColor& color)> colorTooltip;
+    std::function<ScreenshotToolPaletteTranslationText(SnowCanvasStrokeStyle style)> styleTooltip;
+    bool renderingStylesEnabled = false;
+    SnowCanvasStrokeRenderingStyle initialRenderingStyle =
+        SnowCanvasStrokeRenderingStyle::Architect;
+    std::function<void(SnowCanvasStrokeRenderingStyle)> setRenderingStyle;
+};
+
+// Shared stroke color and pattern editor, with optional rendering styles for
+// shape, line, and arrow tools.
+class ScreenshotToolPaletteStrokeEditor final : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteStrokeEditorConfig& config, const QColor& initialColor,
+               SnowCanvasStrokeStyle initialStyle,
+               const std::function<void(const QColor&)>& setColor,
+               const std::function<void(SnowCanvasStrokeStyle)>& setStyle,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteStrokeEditorConfig& config,
+                const std::function<void(const QColor&)>& setColor,
+                const std::function<void(SnowCanvasStrokeStyle)>& setStyle);
+    void update(const QColor& color, SnowCanvasStrokeStyle style, bool colorMixed, bool styleMixed);
+    void updateRenderingStyle(SnowCanvasStrokeRenderingStyle style, bool mixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] bool isInteracting() const override {
+        return m_handlingChange != nullptr && *m_handlingChange;
+    }
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    void ensurePopupContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+    void updateRenderingStyleRow();
+
+    adqt::widgets::AdColorPicker* m_picker = nullptr;
+    ColorPickerTrigger* m_trigger = nullptr;
+    ScreenshotToolPaletteColorPresets m_colorPresets;
+    QVector<StrokeStylePreviewButton*> m_styleButtons;
+    QVector<SnowCanvasStrokeStyle> m_styleValues;
+    QWidget* m_renderingStyleRow = nullptr;
+    QVector<StrokeRenderingStylePreviewButton*> m_renderingStyleButtons;
+    SnowCanvasStrokeRenderingStyle m_currentRenderingStyle =
+        SnowCanvasStrokeRenderingStyle::Architect;
+    bool m_renderingStyleMixed = false;
+    ScreenshotToolPaletteStrokeEditorConfig m_config;
+    SnowCanvasStrokeStyle m_currentStyle = SnowCanvasStrokeStyle::Solid;
+    bool m_colorMixed = false;
+    bool m_styleMixed = false;
+    std::shared_ptr<std::function<void(const QColor&)>> m_setColor;
+    std::shared_ptr<std::function<void(SnowCanvasStrokeStyle)>> m_setStyle;
+    std::shared_ptr<bool> m_handlingChange;
+};
+
+struct ScreenshotToolPaletteFillEditorConfig {
+    QString accessibleName;
+    QString popupObjectName;
+    QString presetRowObjectName;
+    QVector<QColor> colorValues;
+    ScreenshotToolPaletteColorPresetSource presetSource =
+        ScreenshotToolPaletteColorPresetSource::Fixed;
+    std::function<ScreenshotToolPaletteTranslationText(const QColor& color)> colorTooltip;
+    std::function<ScreenshotToolPaletteTranslationText(SnowCanvasFillStyle style)> styleTooltip;
+    bool observePopup = false;
+};
+
+// Fill color plus fill style (solid/line/cross-line). Shared by the shape,
+// text and serial number fill editors.
+class ScreenshotToolPaletteFillEditor final : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteFillEditorConfig& config, const QColor& initialColor,
+               SnowCanvasFillStyle initialStyle, const std::function<void(const QColor&)>& setColor,
+               const std::function<void(SnowCanvasFillStyle)>& setStyle,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteFillEditorConfig& config,
+                const std::function<void(const QColor&)>& setColor,
+                const std::function<void(SnowCanvasFillStyle)>& setStyle);
+    void update(const QColor& color, SnowCanvasFillStyle style, bool colorMixed, bool styleMixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] bool isInteracting() const override {
+        return m_handlingChange != nullptr && *m_handlingChange;
+    }
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    void ensurePopupContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+
+    adqt::widgets::AdColorPicker* m_picker = nullptr;
+    ColorPickerTrigger* m_trigger = nullptr;
+    ScreenshotToolPaletteColorPresets m_colorPresets;
+    QVector<FillStylePreviewButton*> m_styleButtons;
+    QVector<SnowCanvasFillStyle> m_styleValues;
+    ScreenshotToolPaletteFillEditorConfig m_config;
+    QColor m_currentColor;
+    bool m_colorMixed = false;
+    std::shared_ptr<std::function<void(const QColor&)>> m_setColor;
+    std::shared_ptr<std::function<void(SnowCanvasFillStyle)>> m_setStyle;
+    std::shared_ptr<bool> m_handlingChange;
+};
+
+struct ScreenshotToolPaletteWidthColorEditorConfig {
+    QString accessibleName;
+    QString triggerTooltip;
+    QString popupObjectName;
+    QString widthRowObjectName;
+    QString colorRowObjectName;
+    QVector<double> widthValues;
+    QVector<QColor> colorValues;
+    ScreenshotToolPaletteColorPresetSource presetSource =
+        ScreenshotToolPaletteColorPresetSource::Fixed;
+    std::function<ScreenshotToolPaletteTranslationText(double value)> widthTooltip;
+    std::function<ScreenshotToolPaletteTranslationText(const QColor& color)> colorTooltip;
+    bool observePopup = false;
+};
+
+// Combined width and color editor: a stroke-width preview trigger whose
+// picker popup carries a width preset row and a color preset row. Shared by
+// the rectangle-highlight and text stroke editors.
+class ScreenshotToolPaletteWidthColorEditor final
+    : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteWidthColorEditorConfig& config, double initialWidth,
+               const QColor& initialColor, const std::function<void(double)>& setWidth,
+               const std::function<void(const QColor&)>& setColor,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteWidthColorEditorConfig& config,
+                const std::function<void(double)>& setWidth,
+                const std::function<void(const QColor&)>& setColor);
+    void update(double width, const QColor& color, bool widthMixed, bool colorMixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] bool isInteracting() const override {
+        return m_handlingChange != nullptr && *m_handlingChange;
+    }
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] adqt::widgets::AdColorPicker* picker() const {
+        return m_picker;
+    }
+    void release() override;
+
+  private:
+    void ensurePopupContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+
+    adqt::widgets::AdColorPicker* m_picker = nullptr;
+    ColorPickerTrigger* m_trigger = nullptr;
+    QVector<adqt::widgets::AdButton*> m_widthButtons;
+    QVector<double> m_widthValues;
+    ScreenshotToolPaletteColorPresets m_colorButtons;
+    ScreenshotToolPaletteWidthColorEditorConfig m_config;
+    double m_currentWidth = 0.0;
+    QColor m_currentColor;
+    bool m_widthMixed = false;
+    bool m_colorMixed = false;
+    std::shared_ptr<std::function<void(double)>> m_setWidth;
+    std::shared_ptr<std::function<void(const QColor&)>> m_setColor;
+    std::shared_ptr<bool> m_handlingChange;
+};
+
+struct ScreenshotToolPaletteNumericPresetEditorConfig {
+    QString summaryTooltip;
+    QString summaryObjectName;
+    QString suffix;
+    QVector<double> values;
+    std::function<ScreenshotToolPaletteTranslationText(int index, double value)> presetTooltip;
+    std::function<QString(double value)> presetObjectName;
+    std::function<adqt::icons::IconRef(int index)> presetIcon;
+    bool strokePreview = false;
+};
+
+// The shared size editor: a summary button plus value presets. Renders as a
+// stroke-width preview row or an S/M/L/XL icon row depending on the config.
+// Shared by the shape/arrow stroke widths and the pen-highlight/pen-filter
+// widths.
+class ScreenshotToolPaletteNumericPresetEditor final
+    : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteNumericPresetEditorConfig& config, double initialValue,
+               const std::function<void()>& cycleValue, const std::function<void(double)>& setValue,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteNumericPresetEditorConfig& config,
+                const std::function<void()>& cycleValue,
+                const std::function<void(double)>& setValue);
+    void update(double value, bool mixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    adqt::widgets::AdButton* m_summary = nullptr;
+    QVector<adqt::widgets::AdButton*> m_presets;
+    QVector<double> m_values;
+    std::shared_ptr<std::function<void()>> m_cycleValue;
+    std::shared_ptr<std::function<void(double)>> m_setValue;
+    bool m_strokePreview = false;
+};
+
+struct ScreenshotToolPaletteFontEditorConfig {
+    QString accessibleName;
+    QString summaryTooltip;
+    QString summaryObjectName;
+    QVector<double> sizeValues;
+    std::function<ScreenshotToolPaletteTranslationText(int index, double value)> presetTooltip;
+    bool observePopup = false;
+};
+
+// Font editor: size summary button, S/M/L/XL size presets and a searchable
+// family select. Shared by the text, watermark and serial number editors.
+class ScreenshotToolPaletteFontEditor final : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteFontEditorConfig& config, double initialSize,
+               const QString& initialFamily, const std::function<void()>& cycleSize,
+               const std::function<void(double)>& setSize,
+               const std::function<void(const QString&)>& setFamily,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteFontEditorConfig& config,
+                const std::function<void()>& cycleSize, const std::function<void(double)>& setSize,
+                const std::function<void(const QString&)>& setFamily);
+    void update(double size, const QString& family, bool sizeMixed, bool familyMixed,
+                quint32 groups, quint32 sizeGroup, quint32 familyGroup);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    [[nodiscard]] NumericValuePreviewButton* sizeSummary() const {
+        return m_sizeSummary;
+    }
+    [[nodiscard]] adqt::widgets::AdSelect* familySelect() const {
+        return m_familySelect;
+    }
+    void release() override;
+
+  private:
+    NumericValuePreviewButton* m_sizeSummary = nullptr;
+    QVector<adqt::widgets::AdButton*> m_sizePresets;
+    QVector<double> m_sizeValues;
+    adqt::widgets::AdSelect* m_familySelect = nullptr;
+    std::shared_ptr<std::function<void()>> m_cycleSize;
+    std::shared_ptr<std::function<void(double)>> m_setSize;
+    std::shared_ptr<std::function<void(const QString&)>> m_setFamily;
+    std::shared_ptr<bool> m_fontFamiliesLoaded;
+};
+
+struct ScreenshotToolPaletteIconOption {
+    int value = 0;
+    ScreenshotToolPaletteTranslationText tooltip;
+    adqt::icons::IconRef icon;
+};
+
+class ScreenshotToolPaletteDistanceUnitEditor final
+    : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    using Commit = std::function<void(SnowCanvasDistanceUnit)>;
+    ~ScreenshotToolPaletteDistanceUnitEditor() override {
+        release();
+    }
+    void build(QBoxLayout* layout, QWidget* parent, const Commit& commit,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const Commit& commit);
+    void update(SnowCanvasDistanceUnit unit, bool mixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    QWidget* createPopupContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+
+    adqt::widgets::AdRadioButtonGroup* m_group = nullptr;
+    adqt::widgets::AdPopover* m_popover = nullptr;
+    QVector<ScreenshotToolPaletteIconOption> m_options;
+    QVector<adqt::widgets::AdButton*> m_buttons;
+    SnowCanvasDistanceUnit m_unit = SnowCanvasDistanceUnit::Cm;
+    bool m_mixed = false;
+    Commit m_commit;
+};
+
+struct ScreenshotToolPaletteIconOptionEditorConfig {
+    QString accessibleName;
+    QString triggerTooltip;
+    QVector<ScreenshotToolPaletteIconOption> options;
+    int gridColumnCount = 0;
+    bool minimizeTitleWidth = false;
+    bool observePopup = false;
+};
+
+// Icon-valued option editor: preview trigger plus popover grid. Shared by the
+// arrowhead editors and the text alignment editor.
+class ScreenshotToolPaletteIconOptionEditor final
+    : public ScreenshotToolPaletteStyleEditorComponent {
+  public:
+    void build(QBoxLayout* layout, QWidget* parent, QObject* receiver,
+               const ScreenshotToolPaletteIconOptionEditorConfig& config, int initialValue,
+               const std::function<void(int)>& setValue,
+               const ScreenshotToolPaletteEditorServices& services,
+               const ScreenshotToolPaletteButtonMetrics& metrics);
+    void rebind(const ScreenshotToolPaletteIconOptionEditorConfig& config,
+                const std::function<void(int)>& setValue);
+    void update(int value, bool mixed);
+    void refreshMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void resetPopupMetrics(const ScreenshotToolPaletteButtonMetrics& metrics) override;
+    void release() override;
+
+  private:
+    QWidget* createPopupContent(const ScreenshotToolPaletteButtonMetrics& metrics);
+
+    IconValuePreviewTrigger* m_trigger = nullptr;
+    adqt::widgets::AdPopover* m_popover = nullptr;
+    QVector<adqt::widgets::AdButton*> m_buttons;
+    QVector<ScreenshotToolPaletteIconOption> m_options;
+    ScreenshotToolPaletteIconOptionEditorConfig m_config;
+    int m_currentValue = 0;
+    bool m_mixed = false;
+    std::shared_ptr<std::function<void(int)>> m_setValue;
+};
+
+// Assembles the shared S/M/L/XL numeric preset config used by the
+// pen-highlight and pen-filter width editors.
+[[nodiscard]] ScreenshotToolPaletteNumericPresetEditorConfig
+screenshotToolPaletteSizePresetEditorConfig(const QString& summaryTooltip,
+                                            const QString& summaryObjectName,
+                                            const char* presetTooltipPattern);
+
+// System font families offered by the font family editors: trimmed,
+// de-duplicated, sorted. Lazily enumerated once per process; fonts installed
+// while the app is running appear after a restart.
+[[nodiscard]] const QStringList& screenshotToolPaletteFontFamilies();
+
+} // namespace snow_shot::presentation
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLPALETTESTYLECOMPONENTS_H

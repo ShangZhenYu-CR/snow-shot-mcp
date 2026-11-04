@@ -1,0 +1,80 @@
+#!/bin/bash
+set -euo pipefail
+source "$(dirname "$0")/snow-build-environment.sh"
+if [[ "${1:-}" == --help ]]; then
+    echo 'Usage: build.sh [macOS-preset] [--target TARGET] [--parallel JOBS] [--clean] [--skip-bootstrap] [-- CMAKE_OPTIONS...]'
+    exit 0
+fi
+snow_require_macos
+preset=''
+if [[ $# -gt 0 && "$1" != --* ]]; then preset="$1"; shift; fi
+snow_select_preset "$preset"
+targets=()
+parallelism=''
+clean=0
+skip_bootstrap=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target) [[ $# -ge 2 ]] || snow_die '--target needs a target'; targets+=("$2"); shift 2 ;;
+        --parallel) [[ $# -ge 2 ]] || snow_die '--parallel needs a positive integer'; parallelism="$2"; shift 2 ;;
+        --clean) clean=1; shift ;;
+        --skip-bootstrap) skip_bootstrap=1; shift ;;
+        --) shift; break ;;
+        *) snow_die "Unknown argument: $1" ;;
+    esac
+done
+if [[ -n "$parallelism" && ! "$parallelism" =~ ^[1-9][0-9]*$ ]]; then
+    snow_die '--parallel needs a positive integer'
+fi
+snow_setup_tools
+cd "$snow_repo_root"
+[[ -x .tools/vcpkg/vcpkg ]] || snow_die 'Run scripts/bootstrap-macos.sh first.'
+if [[ "$skip_bootstrap" == 0 ]]; then
+    "$snow_repo_root/scripts/bootstrap-macos.sh" "$snow_preset" --skip-dependency-install
+fi
+if [[ "$clean" == 1 && -e "$snow_build_dir" ]]; then
+    case "$snow_build_dir" in
+        "$snow_repo_root"/build/snow-shot-macos-*) rm -rf -- "$snow_build_dir" ;;
+        *) snow_die "Refusing to remove an unexpected build directory: $snow_build_dir" ;;
+    esac
+fi
+configure=(--preset "$snow_preset" -D "Qt6_DIR=$snow_qt_dir")
+compiler_stamp="$snow_build_dir/.snow-compiler-signature"
+existing_build=0
+if [[ -f "$snow_build_dir/build.ninja" ]]; then existing_build=1; fi
+if [[ -f "$snow_build_dir/CMakeCache.txt" ]]; then
+    if snow_cache_aligned "$snow_build_dir/CMakeCache.txt"; then
+        compiler_signature="$(snow_compiler_signature "$snow_build_dir/CMakeCache.txt")" ||
+            snow_die 'Unable to determine the configured compiler versions.'
+        if [[ -f "$compiler_stamp" && "$(cat "$compiler_stamp")" == "$compiler_signature" ]]; then
+            printf 'Reusing the existing CMake cache for preset %s.\n' "$snow_preset"
+        else
+            printf 'Compiler versions changed or were not recorded; configuring from a fresh cache.\n'
+            configure=(--fresh "${configure[@]}")
+        fi
+    else
+        printf 'The existing CMake cache does not match preset %s; configuring from a fresh cache.\n' "$snow_preset"
+        configure=(--fresh "${configure[@]}")
+    fi
+fi
+cmake "${configure[@]}" "$@"
+compiler_signature="$(snow_compiler_signature "$snow_build_dir/CMakeCache.txt")" ||
+    snow_die 'Unable to determine the configured compiler versions.'
+if [[ "$existing_build" == 1 ]] &&
+    [[ ! -f "$compiler_stamp" || "$(cat "$compiler_stamp")" != "$compiler_signature" ]]; then
+    # --fresh refreshes compiler detection, but leaves incompatible PCH/object
+    # files intact. Clean all targets before accepting the new compiler stamp.
+    printf 'Removing build outputs from the previous compiler.\n'
+    cmake --build "$snow_build_dir" --target clean
+fi
+printf '%s\n' "$compiler_signature" > "$compiler_stamp.tmp"
+mv -f "$compiler_stamp.tmp" "$compiler_stamp"
+if [[ ${#targets[@]} == 0 ]]; then
+    targets=(snow_shot)
+    if grep -Eq '^SNOW_APPS_BUILD_SNOW_SHOT_MINI:BOOL=(ON|TRUE|1)$' "$snow_build_dir/CMakeCache.txt"; then
+        targets+=(snow_shot_mini)
+    fi
+fi
+build=(--build --preset "build-$snow_preset" --target "${targets[@]}" --parallel)
+if [[ -n "$parallelism" ]]; then build+=("$parallelism"); fi
+cmake "${build[@]}"

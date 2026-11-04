@@ -1,0 +1,412 @@
+#include "snow_shot/presentation/components/sidebarwidget.h"
+#include "snow_shot/presentation/settings/settingsregistry.h"
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/settingsadapters.h"
+
+#include "widgets/button.h"
+#include "widgets/navigation_menu.h"
+#include "widgets/scroll_area.h"
+
+#include <QAbstractItemModel>
+#include <QApplication>
+#include <QCoreApplication>
+#include <QEvent>
+#include <QFrame>
+#include <QImage>
+#include <QPalette>
+#include <QSize>
+#include <QSizePolicy>
+#include <QTreeView>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QTemporaryDir>
+
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+constexpr int SIDEBAR_EXPANDED_WIDTH = 220;
+constexpr int COLLAPSE_TRIGGER_HEIGHT = 48;
+constexpr int COLLAPSE_TRIGGER_ICON_SIZE = 18;
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+void flushEvents() {
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QCoreApplication::processEvents();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::PolishRequest);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+    QCoreApplication::processEvents();
+}
+
+QModelIndex findByStableId(const QAbstractItemModel* model, const QString& stableId,
+                           const QModelIndex& parent = {}) {
+    if (model == nullptr) {
+        return {};
+    }
+    for (int row = 0; row < model->rowCount(parent); ++row) {
+        const QModelIndex candidate = model->index(row, 0, parent);
+        if (candidate.data(adqt::widgets::AdNavigationMenu::StableIdRole).toString() == stableId) {
+            return candidate;
+        }
+        const QModelIndex descendant = findByStableId(model, stableId, candidate);
+        if (descendant.isValid()) {
+            return descendant;
+        }
+    }
+    return {};
+}
+
+int settingsNavigationPageCount() {
+    const auto& navigation =
+        snow_shot::presentation::settings::builtInSettingsRegistry().navigation();
+    for (const auto& node : navigation) {
+        const auto* group =
+            std::get_if<snow_shot::presentation::settings::SettingsNavigationGroupDefinition>(
+                &node);
+        if (group != nullptr && group->id == QStringLiteral("nav.settings")) {
+            return static_cast<int>(group->pages.size());
+        }
+    }
+    return 0;
+}
+
+void navigationUsesAntDesignDefaultsAndCollapseTriggerStyle() {
+    SidebarWidget sidebar(snow_shot::presentation::settings::builtInSettingsRegistry());
+    flushEvents();
+
+    auto* menu = sidebar.findChild<adqt::widgets::AdNavigationMenu*>();
+    require(menu != nullptr, "sidebar should expose its navigation menu");
+    require(menu->colorScheme() == adqt::widgets::AdNavigationMenu::ColorScheme::Inherit,
+            "sidebar should inherit ant_design_qt navigation colors");
+    require(menu->submenuTrigger() == adqt::widgets::AdNavigationMenu::TriggerSubMenuAction::Hover,
+            "sidebar should retain ant_design_qt hover submenu behavior");
+    const QModelIndex history = findByStableId(menu->model(), QStringLiteral("/history"));
+    const QModelIndex settings = findByStableId(menu->model(), QStringLiteral("nav.settings"));
+    const QModelIndex storageAndPrivacy =
+        findByStableId(menu->model(), QStringLiteral("/settings/files-history"));
+    const QModelIndex capture =
+        findByStableId(menu->model(), QStringLiteral("/settings/screenshots"));
+    const auto* capturePage =
+        snow_shot::presentation::settings::builtInSettingsRegistry().catalog().page(
+            QStringLiteral("screenshots"));
+    require(capture.isValid() && capturePage != nullptr &&
+                capture.data(Qt::ToolTipRole).toString() == capturePage->title.translated() &&
+                capture.data(Qt::DisplayRole).toString() == capturePage->title.translated() &&
+                capture.data(Qt::AccessibleDescriptionRole).toString() ==
+                    capturePage->description.translated(),
+            "sidebar labels match page titles and retain accessible descriptions");
+    require(history.isValid() && history.data(Qt::DecorationRole).isValid() &&
+                history.data(adqt::widgets::AdNavigationMenu::StableIdRole).toString() ==
+                    QStringLiteral("/history") &&
+                settings.isValid() && settings.data(Qt::DecorationRole).isValid() &&
+                menu->model()->rowCount(settings) == settingsNavigationPageCount() &&
+                menu->isExpanded(settings) &&
+                !storageAndPrivacy.data(Qt::DecorationRole).isValid() &&
+                storageAndPrivacy.data(adqt::widgets::AdNavigationMenu::StableIdRole).toString() ==
+                    QStringLiteral("/settings/files-history"),
+            "top-level items should keep icons while expanded submenu items omit them");
+    sidebar.setCurrentRoute(QStringLiteral("/settings/files-history"));
+    require(sidebar.currentRoute() == QStringLiteral("/settings/files-history"),
+            "storage and privacy route should be selectable");
+
+    require(!findByStableId(menu->model(), QStringLiteral("/tools/translation")).isValid(),
+            "optional translation navigation defaults hidden");
+    sidebar.setCurrentRoute(QStringLiteral("/settings/files-history"));
+    menu->setExpanded(findByStableId(menu->model(), QStringLiteral("nav.settings")), false);
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(true),
+            "enable optional page");
+    require(findByStableId(menu->model(), QStringLiteral("/tools/translation")).isValid() &&
+                sidebar.currentRoute() == QStringLiteral("/settings/files-history") &&
+                !menu->isExpanded(findByStableId(menu->model(), QStringLiteral("nav.settings"))),
+            "live enable preserves unrelated selection and collapsed settings group");
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(false),
+            "disable optional page");
+    require(!findByStableId(menu->model(), QStringLiteral("/tools/translation")).isValid(),
+            "live disable hides navigation again");
+    const auto menuTokens = menu->componentTokens();
+    require(!menuTokens.metrics.itemHeight.has_value() &&
+                !menuTokens.metrics.itemPaddingInline.has_value() &&
+                !menuTokens.metrics.indentation.has_value() &&
+                menuTokens.metrics.rootPaddingBlockStart == 0 &&
+                !menuTokens.colors.shared.itemBackground.has_value() &&
+                !menuTokens.colors.shared.itemSelectedBackground.has_value(),
+            "sidebar should only override the root content top padding token");
+
+    const auto menuStyles = menu->semanticStyles();
+    require(!menuStyles.root.backgroundColor.has_value() &&
+                !menuStyles.item.backgroundColor.has_value() &&
+                !menuStyles.popup.backgroundColor.has_value(),
+            "sidebar should not override ant_design_qt navigation semantic styles");
+
+    auto* button =
+        sidebar.findChild<adqt::widgets::AdButton*>(QStringLiteral("sidebarCollapseButton"));
+    require(button != nullptr, "sidebar should expose a bottom collapse button");
+    require(button->buttonStyle() == adqt::widgets::AdButton::ButtonStyle::Text &&
+                button->accentRole() == adqt::widgets::AdButton::AccentRole::Neutral &&
+                button->shape() == adqt::widgets::AdButton::Shape::Rectangle &&
+                button->sizePolicy().horizontalPolicy() == QSizePolicy::Expanding &&
+                button->sizePolicy().verticalPolicy() == QSizePolicy::Fixed &&
+                button->height() == COLLAPSE_TRIGGER_HEIGHT &&
+                button->iconSize() == QSize(COLLAPSE_TRIGGER_ICON_SIZE, COLLAPSE_TRIGGER_ICON_SIZE),
+            "sidebar collapse button should use the configured trigger style");
+}
+
+void sidebarBaseLayersUseTopLevelMenuBackground() {
+    snow_shot::storage::InterfaceSettings settings;
+    settings.setSidebarCollapsed(false);
+
+    using snow_shot::presentation::styles::ThemeAppearance;
+    using snow_shot::presentation::styles::ThemeManager;
+    auto& themeManager = ThemeManager::instance();
+    themeManager.setThemeAppearance(ThemeAppearance::Light);
+
+    SidebarWidget sidebar(snow_shot::presentation::settings::builtInSettingsRegistry());
+    sidebar.resize(256, 480);
+    sidebar.show();
+    flushEvents();
+
+    auto* menu = sidebar.findChild<adqt::widgets::AdNavigationMenu*>();
+    require(menu != nullptr, "sidebar should expose its navigation menu");
+    const auto menuColors = menu->resolvedColorTokens();
+    require(menuColors.itemBackground == themeManager.themeColorScheme().map.colorBgContainer,
+            "the light menu root should resolve to the container token");
+    require(sidebar.autoFillBackground() &&
+                sidebar.palette().color(QPalette::Window) == menuColors.itemBackground &&
+                sidebar.palette().color(QPalette::Base) == menuColors.itemBackground,
+            "sidebar background should match top-level menu items");
+
+    require(menu->geometry().top() == 0, "sidebar navigation should start at the top edge");
+    require(menu->contentsMargins().top() == 0,
+            "sidebar root geometry should not be inset to space its menu items");
+    require(menu->autoFillBackground() &&
+                menu->palette().color(QPalette::Window) == menuColors.itemBackground,
+            "sidebar navigation background should match top-level menu items");
+    require(!menu->componentTokens().colors.shared.itemBackground.has_value(),
+            "sidebar should keep the ant_design_qt menu root and submenu colors untouched");
+
+    auto* inlineView = menu->findChild<QTreeView*>(QStringLiteral("AdNavigationMenu-inline-view"));
+    require(inlineView != nullptr, "sidebar should expose its inline navigation view");
+    require(inlineView->palette().color(QPalette::Base) == menuColors.itemBackground,
+            "the menu root should keep the resolved ant_design_qt item background");
+    require(inlineView->geometry().top() == 0,
+            "the inline view and its root border should begin at the navigation top edge");
+    const QModelIndex firstItemIndex = inlineView->model()->index(0, 0, inlineView->rootIndex());
+    const QRect firstItemRect = inlineView->visualRect(firstItemIndex);
+    require(firstItemIndex.isValid() && firstItemRect.isValid(),
+            "global hotkeys should be visible");
+    require(inlineView->viewport()->mapTo(menu, firstItemRect.topLeft()).y() == 0,
+            "menu items should start immediately because the fixed search container owns the gap");
+
+    auto* trigger = sidebar.findChild<QFrame*>(QStringLiteral("sidebarCollapseTrigger"));
+    require(trigger != nullptr, "sidebar should expose a collapse trigger background");
+    require(trigger->autoFillBackground() &&
+                trigger->palette().color(QPalette::Window) == menuColors.itemBackground &&
+                trigger->height() == COLLAPSE_TRIGGER_HEIGHT &&
+                trigger->geometry().bottom() == sidebar.contentsRect().bottom(),
+            "sidebar collapse trigger should match top-level menu items and be flush with "
+            "the bottom edge");
+
+    menu->collapseAll();
+    flushEvents();
+    const auto lightSidebarImage = sidebar.grab().toImage();
+    const int backgroundSampleX = 12;
+    const int emptyAreaSampleY = sidebar.height() - COLLAPSE_TRIGGER_HEIGHT - 12;
+    const int triggerSampleY = sidebar.height() - 12;
+    require(lightSidebarImage.pixelColor(backgroundSampleX, emptyAreaSampleY) ==
+                    menuColors.itemBackground &&
+                lightSidebarImage.pixelColor(backgroundSampleX, triggerSampleY) ==
+                    menuColors.itemBackground,
+            "rendered empty sidebar and collapse trigger should match top-level menu items");
+
+    themeManager.setThemeAppearance(ThemeAppearance::Dark);
+    flushEvents();
+    const auto darkMenuColors = menu->resolvedColorTokens();
+    require(sidebar.palette().color(QPalette::Window) == darkMenuColors.itemBackground &&
+                sidebar.palette().color(QPalette::Base) == darkMenuColors.itemBackground &&
+                menu->palette().color(QPalette::Window) == darkMenuColors.itemBackground &&
+                trigger->autoFillBackground() &&
+                trigger->palette().color(QPalette::Window) == darkMenuColors.itemBackground,
+            "sidebar base layers should match dark top-level menu items");
+    require(inlineView->palette().color(QPalette::Base) == darkMenuColors.itemBackground,
+            "the dark menu root should keep the resolved ant_design_qt item background");
+    const auto darkSidebarImage = sidebar.grab().toImage();
+    require(darkSidebarImage.pixelColor(backgroundSampleX, emptyAreaSampleY) ==
+                    darkMenuColors.itemBackground &&
+                darkSidebarImage.pixelColor(backgroundSampleX, triggerSampleY) ==
+                    darkMenuColors.itemBackground,
+            "rendered dark sidebar base layers should match top-level menu items");
+
+    sidebar.hide();
+    themeManager.setThemeAppearance(ThemeAppearance::Light);
+    settings.setSidebarCollapsed(false);
+}
+
+void collapseButtonSwitchesNavigationMode() {
+    snow_shot::storage::InterfaceSettings settings;
+    settings.setSidebarCollapsed(false);
+
+    SidebarWidget sidebar(snow_shot::presentation::settings::builtInSettingsRegistry());
+    flushEvents();
+
+    require(!sidebar.isCollapsed(), "sidebar should be expanded by default");
+    const int expandedWidth = sidebar.width();
+    require(expandedWidth == SIDEBAR_EXPANDED_WIDTH,
+            "expanded sidebar should use the configured width");
+
+    auto* button =
+        sidebar.findChild<adqt::widgets::AdButton*>(QStringLiteral("sidebarCollapseButton"));
+    require(button != nullptr, "sidebar should expose a bottom collapse button");
+
+    auto* menu = sidebar.findChild<adqt::widgets::AdNavigationMenu*>();
+    require(menu != nullptr, "sidebar should expose its navigation menu");
+    require(!menu->collapsed(), "navigation menu should begin expanded");
+
+    button->click();
+    flushEvents();
+
+    require(sidebar.isCollapsed(), "collapse button should collapse the sidebar");
+    require(menu->collapsed(), "collapse button should collapse the navigation menu");
+    require(sidebar.width() < expandedWidth, "collapsed sidebar should be narrower");
+    require(settings.sidebarCollapsed(), "collapsed sidebar state should be persisted");
+
+    QEvent languageChange(QEvent::LanguageChange);
+    QCoreApplication::sendEvent(&sidebar, &languageChange);
+    flushEvents();
+
+    button->click();
+    flushEvents();
+
+    require(!sidebar.isCollapsed(), "collapse button should expand the sidebar on a second click");
+    require(!menu->collapsed(), "navigation menu should expand on a second click");
+    require(menu->isExpanded(findByStableId(menu->model(), QStringLiteral("nav.settings"))),
+            "submenus should remain expanded after a collapsed navigation model rebuild");
+    require(sidebar.width() == expandedWidth, "expanded sidebar should restore its width");
+
+    settings.setSidebarCollapsed(false);
+}
+
+void overflowingNavigationRemainsScrollable() {
+    snow_shot::storage::InterfaceSettings settings;
+    settings.setSidebarCollapsed(false);
+
+    SidebarWidget sidebar(snow_shot::presentation::settings::builtInSettingsRegistry());
+    sidebar.resize(SIDEBAR_EXPANDED_WIDTH, 240);
+    sidebar.show();
+    flushEvents();
+
+    bool hasVisibleScrollBar = false;
+    for (auto* bar : sidebar.findChildren<QScrollBar*>()) {
+        hasVisibleScrollBar |= bar->orientation() == Qt::Vertical && bar->isVisible() &&
+                               bar->maximum() > bar->minimum();
+    }
+    require(hasVisibleScrollBar, "overflowing sidebar navigation must expose a vertical scrollbar");
+
+    auto* scroll = sidebar.findChild<adqt::widgets::AdScrollArea*>();
+    auto* menu = sidebar.findChild<adqt::widgets::AdNavigationMenu*>();
+    auto* trigger = sidebar.findChild<QFrame*>(QStringLiteral("sidebarCollapseTrigger"));
+    require(scroll != nullptr && menu != nullptr && trigger != nullptr,
+            "sidebar should provide scrollable navigation and a fixed collapse trigger");
+    const QRect triggerGeometry = trigger->geometry();
+    scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum());
+    flushEvents();
+    require(menu->mapTo(scroll->viewport(), menu->rect().bottomLeft()).y() <
+                scroll->viewport()->height(),
+            "scrolling to the bottom must reveal the end of the navigation content");
+    require(trigger->geometry() == triggerGeometry && trigger->isVisible() &&
+                triggerGeometry.bottom() == sidebar.contentsRect().bottom(),
+            "scrolling navigation must keep the collapse trigger at the sidebar bottom");
+    require(scroll->horizontalScrollBar()->maximum() == 0,
+            "navigation must fit the sidebar width without horizontal scrolling");
+
+    sidebar.resize(SIDEBAR_EXPANDED_WIDTH,
+                   menu->sizeHint().height() + COLLAPSE_TRIGGER_HEIGHT + 100);
+    flushEvents();
+    require(scroll->verticalScrollBar()->maximum() == 0 &&
+                !scroll->overlayVerticalScrollBar()->isVisible(),
+            "the scrollbar must disappear when the navigation fits");
+    sidebar.resize(SIDEBAR_EXPANDED_WIDTH, 240);
+    flushEvents();
+    require(scroll->verticalScrollBar()->maximum() > 0 &&
+                scroll->overlayVerticalScrollBar()->isVisible(),
+            "shrinking the sidebar must restore scrolling");
+    sidebar.setCollapsed(true);
+    flushEvents();
+    require(scroll->horizontalScrollBar()->maximum() == 0 &&
+                trigger->geometry().bottom() == sidebar.contentsRect().bottom(),
+            "collapsed navigation must fit its width and retain the bottom trigger");
+    sidebar.setCollapsed(false);
+}
+
+void collapsedSubmenuUsesNaturalPopupHeight() {
+    snow_shot::storage::InterfaceSettings settings;
+    settings.setSidebarCollapsed(false);
+
+    QWidget window;
+    auto* layout = new QVBoxLayout(&window);
+    layout->setContentsMargins(0, 0, 0, 0);
+
+    auto* sidebar =
+        new SidebarWidget(snow_shot::presentation::settings::builtInSettingsRegistry(), &window);
+    layout->addWidget(sidebar);
+    window.resize(640, 480);
+    window.show();
+    flushEvents();
+
+    auto* menu = sidebar->findChild<adqt::widgets::AdNavigationMenu*>();
+    require(menu != nullptr, "sidebar should expose its navigation menu");
+    const QModelIndex settingsIndex = findByStableId(menu->model(), QStringLiteral("nav.settings"));
+    require(settingsIndex.isValid(), "settings should be represented by a menu node");
+
+    sidebar->setCollapsed(true);
+    menu->setCurrentIndex(settingsIndex);
+    menu->setExpanded(settingsIndex, true);
+    flushEvents();
+
+    auto* popup = window.findChild<QWidget*>(QStringLiteral("AdNavigationMenu-popup-window"));
+    require(popup != nullptr && popup->isVisible(), "collapsed submenu should open its popup");
+
+    auto* popupView = popup->findChild<QTreeView*>();
+    require(popupView != nullptr, "submenu popup should contain the navigation tree view");
+    const int submenuRows = popupView->model()->rowCount(popupView->rootIndex());
+    const QModelIndex firstChild = popupView->model()->index(0, 0, popupView->rootIndex());
+    const QModelIndex lastChild =
+        popupView->model()->index(submenuRows - 1, 0, popupView->rootIndex());
+    const QRect firstChildRect = popupView->visualRect(firstChild);
+    const QRect lastChildRect = popupView->visualRect(lastChild);
+    require(submenuRows == settingsNavigationPageCount() && firstChildRect.isValid() &&
+                lastChildRect.isValid() && firstChildRect.bottom() < lastChildRect.top(),
+            "the popup should render every registry settings page on a distinct row");
+
+    const int bottomInset = popupView->viewport()->height() - lastChildRect.bottom() - 1;
+    require(bottomInset <= firstChildRect.top() + 2,
+            "settings submenu popup should not reserve an empty row below its content");
+
+    window.hide();
+    settings.setSidebarCollapsed(false);
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication application(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("SnowShotTests"));
+    QCoreApplication::setApplicationName(QStringLiteral("sidebar_widget_tests"));
+    QTemporaryDir storageDirectory;
+    require(storageDirectory.isValid(), "temporary storage directory should be available");
+    static_cast<void>(snow_shot::storage::ApplicationStorage::instance().initialize(
+        {storageDirectory.path(), storageDirectory.path(), 8000}));
+
+    navigationUsesAntDesignDefaultsAndCollapseTriggerStyle();
+    overflowingNavigationRemainsScrollable();
+    sidebarBaseLayersUseTopLevelMenuBackground();
+    collapseButtonSwitchesNavigationMode();
+    collapsedSubmenuUsesNaturalPopupHeight();
+    snow_shot::storage::ApplicationStorage::instance().shutdown();
+    return 0;
+}

@@ -1,0 +1,1076 @@
+#include "snow_shot/runtime/runtimeactivitytracker.h"
+#include "snow_shot/platform/applicationqos.h"
+#include "snow_shot/presentation/screenshothistoryservice.h"
+#include "snow_shot/presentation/screenshotdefaultstyles.h"
+#include "snow_shot/presentation/screenshotimagefileservice.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/settingsadapters.h"
+
+#include "snow_shot/presentation/screenshotdisplaysession.h"
+#include "snow_shot/presentation/screenshotgeometry.h"
+#include "snow_shot/presentation/screenshotintelligentselectionmodel.h"
+#include "snow_shot/presentation/screenshotinteractionstate.h"
+#include "snow_shot/presentation/screenshotselectionlimits.h"
+#include "snow_shot/presentation/screenshotselectionmodel.h"
+
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+
+#include <QUuid>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <exception>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <utility>
+
+namespace {
+bool restoreCanvasPayload(SnowCanvasRuntime& runtime, const QByteArray& payload) {
+    // Earlier releases wrote full document sessions. Current entries contain
+    // only elements and undo/redo history because creation styles are shared.
+    return runtime.restoreDocumentSession(payload) || runtime.restoreDocumentHistory(payload);
+}
+
+} // namespace
+
+ScreenshotHistoryService::ScreenshotHistoryService(ScreenshotHistoryServiceContext context,
+                                                   QString storageRoot, Clock clock)
+    : m_context(std::move(context)),
+      m_clock(clock ? std::move(clock) : []() { return QDateTime::currentDateTimeUtc(); }) {
+    if (storageRoot.isEmpty()) {
+        auto& storage = snow_shot::storage::ApplicationStorage::instance();
+        if (!storage.isInitialized()) {
+            static_cast<void>(storage.initialize());
+        }
+        m_repository = &storage.captureHistory();
+        connect(&storage, &snow_shot::storage::ApplicationStorage::captureHistoryChanged, this,
+                &ScreenshotHistoryService::refreshMetadata);
+    } else {
+        snow_shot::storage::CaptureHistoryRepositoryOptions options;
+        options.writeAvailable = true;
+        options.clock = m_clock;
+        m_ownedRepository = snow_shot::storage::makeCaptureHistoryRepository(std::move(storageRoot),
+                                                                             std::move(options));
+        m_repository = m_ownedRepository.get();
+    }
+    initializeRepository();
+}
+
+namespace {
+bool validateCanvasPayload(const QByteArray& payload) {
+    if (payload.isEmpty() || payload.size() > 16 * 1024 * 1024) {
+        return false;
+    }
+    SnowCanvasRuntime runtime(
+        SnowCanvasRuntimeConfig{snow_shot::presentation::screenshotCanvasStyleDefaults()});
+    return restoreCanvasPayload(runtime, payload);
+}
+
+bool structurallyValidCanvasPayload(const QByteArray& payload) {
+    return !payload.isEmpty() && payload.size() <= 16 * 1024 * 1024;
+}
+
+snow_shot::storage::PersistedSelection
+persistedSelection(const ScreenshotSelectionParams& selection) {
+    return {
+        selection.selection,   selection.radius,           selection.shadowWidth,
+        selection.shadowColor, selection.lockAspectRatio,  selection.lockDragAspectRatio,
+        selection.region,      selection.layoutCompaction, selection.backgroundOpacityPercent,
+        selection.borderType,  selection.borderWidth,      selection.borderColor,
+    };
+}
+
+ScreenshotSelectionParams
+presentationSelection(const snow_shot::storage::PersistedSelection& selection) {
+    ScreenshotSelectionParams result;
+    result.selection = selection.rectangle;
+    result.region = selection.region;
+    result.layoutCompaction = selection.layoutCompaction;
+    result.backgroundOpacityPercent = selection.backgroundOpacityPercent;
+    result.radius = selection.cornerRadius;
+    result.borderType = selection.borderType;
+    result.borderWidth = selection.borderWidth;
+    result.borderColor = selection.borderColor;
+    result.shadowWidth = selection.shadowWidth;
+    result.shadowColor = selection.shadowColor;
+    result.lockAspectRatio = selection.lockAspectRatio;
+    result.lockDragAspectRatio = selection.lockDragAspectRatio;
+    return result;
+}
+
+std::optional<ScreenshotSelectionParams>
+selectionForRestore(const snow_shot::storage::CaptureHistoryRecord& record,
+                    const ScreenshotSelectionRestoreTarget& target) {
+    using snow_shot::storage::CaptureHistoryContentKind;
+    using snow_shot::storage::CaptureHistorySource;
+    if (record.contentKind != CaptureHistoryContentKind::ScreenshotSession ||
+        target.bounds.isEmpty()) {
+        return std::nullopt;
+    }
+    auto params = presentationSelection(record.selection);
+    // Pending drafts have not passed through the persisted-selection normalizer yet.
+    // Their authoritative region must also supply the bounds used for overflow checks.
+    if (params.region) {
+        params.selection = params.region->boundingRect();
+        if (params.selection.isEmpty())
+            return std::nullopt;
+    }
+    qint64 dx = 0;
+    qint64 dy = 0;
+    if (record.desktopGeometry) {
+        if (record.desktopGeometry->canvasUsesPoints != target.canvasUsesPoints)
+            return std::nullopt;
+        dx = qint64(record.desktopGeometry->canvasOrigin.x()) - target.canvasOrigin.x();
+        dy = qint64(record.desktopGeometry->canvasOrigin.y()) - target.canvasOrigin.y();
+    } else {
+        if (std::any_of(record.displays.cbegin(), record.displays.cend(),
+                        [&target](const auto& display) {
+                            return display.canvasUsesPoints != target.canvasUsesPoints;
+                        })) {
+            return std::nullopt;
+        }
+        // Early direct captures used absolute desktop coordinates instead of canvas ones.
+        if (record.source == CaptureHistorySource::CurrentMonitor ||
+            record.source == CaptureHistorySource::FocusedWindow) {
+            dx = -qint64(record.canvasBounds.x());
+            dy = -qint64(record.canvasBounds.y());
+        }
+    }
+    const qint64 x = qint64(params.selection.x()) + dx;
+    const qint64 y = qint64(params.selection.y()) + dy;
+    constexpr qint64 minimum = std::numeric_limits<int>::min();
+    constexpr qint64 maximum = std::numeric_limits<int>::max();
+    if (dx < minimum || dx > maximum || dy < minimum || dy > maximum || x < minimum ||
+        y < minimum || x > maximum - params.selection.width() + 1 ||
+        y > maximum - params.selection.height() + 1) {
+        return std::nullopt;
+    }
+    params.selection.moveTopLeft(QPoint(static_cast<int>(x), static_cast<int>(y)));
+    if (params.region)
+        params.region->translate(QPoint(static_cast<int>(dx), static_cast<int>(dy)));
+    return clampScreenshotSelectionParamsForRestore(params, target.bounds);
+}
+
+snow_shot::storage::CaptureHistoryDraft storageDraft(const ScreenshotHistoryEntry& entry) {
+    snow_shot::storage::CaptureHistoryDraft draft;
+    draft.contentKind = entry.contentKind;
+    draft.id = entry.id;
+    draft.createdUtc = entry.createdUtc.toUTC();
+    draft.canvasBounds = entry.recordedCanvasBounds;
+    draft.selection = persistedSelection(entry.selection);
+    draft.canvasHistory = entry.canvasHistory;
+    draft.cursorVisible = entry.cursorVisible;
+    draft.cursorAvailable = entry.cursorAvailable;
+    draft.source = entry.source;
+    for (const ScreenshotHistoryDisplay& display : entry.displays) {
+        draft.displays.push_back(
+            {display.stableId, display.name, display.image, display.sourceCanvasOrigin,
+             display.sourceCanvasRect, display.canvasUsesPoints, display.backingScale,
+             display.nativeDisplayId, display.cursorPatch, display.cursorPixelRect});
+    }
+    draft.resultImage = entry.resultImage;
+    draft.preparedResultImage = entry.preparedResultImage;
+    const snow_shot::storage::ScreenshotSettings settings;
+    draft.pngCompressionLevel =
+        ScreenshotImageFileService::encodeOptions(
+            ScreenshotImageFileFormat::Png,
+            ScreenshotImageEncodingOptions{100, ScreenshotImageFileService::compressionLevelForKey(
+                                                    settings.compressionLevel())})
+            .compression_level;
+    draft.displayPngCompressionLevel =
+        ScreenshotImageFileService::encodeOptions(
+            ScreenshotImageFileFormat::Png,
+            ScreenshotImageEncodingOptions{
+                100, ScreenshotImageFileService::compressionLevelForKey(
+                         snow_shot::storage::ApplicationStorage::instance()
+                             .configuration()
+                             .value(QStringLiteral("capture_history/compression_level"))
+                             .toString())})
+            .compression_level;
+    draft.scrolling = entry.scrolling;
+    draft.desktopGeometry = entry.desktopGeometry;
+    return draft;
+}
+
+snow_shot::storage::CaptureHistoryRecord
+placeholderRecord(const snow_shot::storage::CaptureHistoryDraft& draft) {
+    snow_shot::storage::CaptureHistoryRecord record;
+    record.contentKind = draft.contentKind;
+    record.id = draft.id;
+    record.createdUtc = draft.createdUtc;
+    record.canvasBounds = draft.canvasBounds;
+    record.selection = draft.selection;
+    record.source = draft.source;
+    record.scrolling = draft.scrolling;
+    record.desktopGeometry = draft.desktopGeometry;
+    record.cursorVisible = draft.cursorVisible;
+    record.cursorAvailable = draft.cursorAvailable;
+    record.canvasBytes = draft.canvasHistory.size();
+    if (draft.resultImage.has_value() || draft.preparedResultImage.has_value()) {
+        const QSize resultSize = draft.preparedResultImage.has_value()
+                                     ? draft.preparedResultImage->pixelSize()
+                                     : draft.resultImage->size();
+        record.result = snow_shot::storage::CaptureHistoryResultRecord{resultSize, 0};
+    }
+    for (const snow_shot::storage::CaptureHistoryDisplayDraft& display : draft.displays) {
+        record.displays.push_back(
+            {display.stableId, display.name, display.image.size(), 0, display.sourceCanvasOrigin,
+             display.sourceCanvasRect, display.canvasUsesPoints, display.backingScale,
+             display.nativeDisplayId,
+             display.cursorPatch.isNull()
+                 ? std::nullopt
+                 : std::optional<snow_shot::storage::CaptureHistoryCursorRecord>(
+                       {display.cursorPixelRect, 0})});
+    }
+    return record;
+}
+
+std::optional<ScreenshotHistoryEntry>
+presentationEntry(const snow_shot::storage::CaptureHistoryRecord& record,
+                  const snow_shot::storage::CaptureHistoryPayload& payload) {
+    if (payload.displayImages.size() != record.displays.size() ||
+        !validateCanvasPayload(payload.canvasHistory)) {
+        return std::nullopt;
+    }
+    ScreenshotHistoryEntry entry;
+    entry.contentKind = record.contentKind;
+    entry.id = record.id;
+    entry.createdUtc = record.createdUtc;
+    entry.recordedCanvasBounds = record.canvasBounds;
+    entry.selection = presentationSelection(record.selection);
+    entry.canvasHistory = payload.canvasHistory;
+    entry.source = record.source;
+    entry.scrolling = record.scrolling;
+    entry.desktopGeometry = record.desktopGeometry;
+    entry.persistent = true;
+    entry.cursorVisible = record.cursorVisible;
+    entry.cursorAvailable = record.cursorAvailable;
+    for (qsizetype index = 0; index < record.displays.size(); ++index) {
+        entry.displays.push_back(
+            {record.displays[index].stableId, record.displays[index].name,
+             payload.displayImages[index], record.displays[index].sourceCanvasOrigin,
+             record.displays[index].sourceCanvasRect, record.displays[index].canvasUsesPoints,
+             record.displays[index].backingScale, record.displays[index].nativeDisplayId,
+             payload.cursorPatches.value(index),
+             record.displays[index].cursor ? record.displays[index].cursor->pixelRect : QRect{}});
+    }
+    // Early direct-capture sessions stored absolute desktop coordinates instead of canvas ones.
+    const bool directCapture =
+        record.source == snow_shot::storage::CaptureHistorySource::FocusedWindow ||
+        record.source == snow_shot::storage::CaptureHistorySource::CurrentMonitor;
+    if (directCapture &&
+        record.contentKind == snow_shot::storage::CaptureHistoryContentKind::ScreenshotSession &&
+        !record.canvasBounds.topLeft().isNull()) {
+        const QPoint canvasOffset = -record.canvasBounds.topLeft();
+        entry.recordedCanvasBounds.translate(canvasOffset);
+        entry.selection.selection.translate(canvasOffset);
+        for (auto& display : entry.displays) {
+            if (display.sourceCanvasOrigin.has_value())
+                *display.sourceCanvasOrigin += canvasOffset;
+            if (display.sourceCanvasRect)
+                display.sourceCanvasRect->translate(canvasOffset);
+        }
+    }
+    return entry;
+}
+} // namespace
+
+class ScreenshotHistoryValidationQueue final {
+  public:
+    explicit ScreenshotHistoryValidationQueue(
+        snow_shot::storage::CaptureHistoryRepository& repository, ScreenshotHistoryService& service)
+        : m_repository(repository), m_service(service) {}
+
+    ~ScreenshotHistoryValidationQueue() {
+        {
+            const std::lock_guard lock(m_mutex);
+            m_stopping = true;
+        }
+        m_condition.notify_all();
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
+    }
+
+    std::shared_future<snow_shot::storage::CaptureHistoryPublishResult>
+    submit(snow_shot::storage::CaptureHistoryDraft draft) {
+        auto promise =
+            std::make_shared<std::promise<snow_shot::storage::CaptureHistoryPublishResult>>();
+        std::shared_future<snow_shot::storage::CaptureHistoryPublishResult> result =
+            promise->get_future().share();
+        {
+            const std::lock_guard lock(m_mutex);
+            if (m_stopping) {
+                complete(promise, {snow_shot::storage::StorageResult::failure(
+                                       QStringLiteral("History validation is shutting down")),
+                                   {}});
+                return result;
+            }
+            if (m_jobs.size() >= kMaximumPendingJobs) {
+                complete(promise, {snow_shot::storage::StorageResult::failure(
+                                       QStringLiteral("History validation queue is full")),
+                                   {}});
+                return result;
+            }
+            if (!m_running) {
+                if (m_thread.joinable()) {
+                    m_thread.join();
+                }
+                try {
+                    m_running = true;
+                    m_thread = std::thread([this]() {
+                        snow_shot::platform::applyApplicationQoSToCurrentThread();
+                        run();
+                    });
+                } catch (...) {
+                    m_running = false;
+                    complete(promise, {snow_shot::storage::StorageResult::failure(
+                                           QStringLiteral("Unable to start history validation")),
+                                       {}});
+                    return result;
+                }
+            }
+            m_jobs.push_back(Job{std::move(draft), std::move(promise),
+                                 snow_shot::runtime::RuntimeActivityTracker::shared().acquire()});
+        }
+        m_condition.notify_one();
+        return result;
+    }
+
+  private:
+    using PublishResult = snow_shot::storage::CaptureHistoryPublishResult;
+    using PublishPromise = std::promise<PublishResult>;
+
+    static constexpr std::size_t kMaximumPendingJobs = 2;
+    static constexpr auto kIdleTimeout = std::chrono::seconds(5);
+
+    struct Job {
+        snow_shot::storage::CaptureHistoryDraft draft;
+        std::shared_ptr<std::promise<snow_shot::storage::CaptureHistoryPublishResult>> promise;
+        snow_shot::runtime::RuntimeActivityLease activity;
+    };
+
+    void complete(const std::shared_ptr<PublishPromise>& promise, PublishResult result) {
+        promise->set_value(std::move(result));
+        // Reconcile pruning and failed placeholders even when the editor stays idle.
+        // Queuing also lets submit() install an immediately rejected write first.
+        QMetaObject::invokeMethod(&m_service, &ScreenshotHistoryService::refreshMetadata,
+                                  Qt::QueuedConnection);
+    }
+
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(m_mutex);
+                const bool ready = m_condition.wait_for(
+                    lock, kIdleTimeout, [this]() { return m_stopping || !m_jobs.empty(); });
+                if (!ready) {
+                    m_running = false;
+                    return;
+                }
+                if (m_jobs.empty()) {
+                    if (m_stopping) {
+                        m_running = false;
+                        return;
+                    }
+                    continue;
+                }
+                job = std::move(m_jobs.front());
+                m_jobs.pop_front();
+            }
+
+            try {
+                if (!validateCanvasPayload(job.draft.canvasHistory)) {
+                    complete(job.promise, {snow_shot::storage::StorageResult::failure(
+                                               QStringLiteral("Capture history is invalid")),
+                                           {}});
+                    continue;
+                }
+                std::shared_future<snow_shot::storage::CaptureHistoryPublishResult> publication =
+                    m_repository.publish(std::move(job.draft));
+                complete(job.promise,
+                         publication.valid()
+                             ? publication.get()
+                             : snow_shot::storage::CaptureHistoryPublishResult{
+                                   snow_shot::storage::StorageResult::failure(
+                                       QStringLiteral("History publication returned no result")),
+                                   {}});
+            } catch (const std::exception& error) {
+                complete(job.promise, {snow_shot::storage::StorageResult::failure(
+                                           QString::fromUtf8(error.what())),
+                                       {}});
+            } catch (...) {
+                complete(job.promise, {snow_shot::storage::StorageResult::failure(
+                                           QStringLiteral("History validation failed")),
+                                       {}});
+            }
+        }
+    }
+
+    snow_shot::storage::CaptureHistoryRepository& m_repository;
+    ScreenshotHistoryService& m_service;
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
+    std::deque<Job> m_jobs;
+    bool m_stopping = false;
+    // A retired thread remains joinable until the next submission reaps it.
+    bool m_running = false;
+    std::thread m_thread;
+};
+
+void ScreenshotHistoryService::initializeRepository() {
+    m_entries = m_repository->records();
+    m_validationQueue = std::make_unique<ScreenshotHistoryValidationQueue>(*m_repository, *this);
+}
+
+ScreenshotHistoryService::ScreenshotHistoryService(
+    ScreenshotHistoryServiceContext context,
+    snow_shot::storage::CaptureHistoryRepository& repository, Clock clock)
+    : m_context(std::move(context)), m_repository(&repository),
+      m_clock(clock ? std::move(clock) : []() { return QDateTime::currentDateTimeUtc(); }) {
+    initializeRepository();
+}
+
+ScreenshotHistoryService::~ScreenshotHistoryService() {
+    resetCaptureNavigation();
+    drainPendingLoads();
+    drainPendingWrites();
+}
+
+QRect ScreenshotHistoryService::currentCanvasBounds() const {
+    QRect bounds;
+    m_context.displays.forEachActiveDisplay(
+        [&bounds](qsizetype, const CapturedDisplayModel& display) {
+            bounds =
+                bounds.united(ScreenshotGeometryMapper::displayCanvasRect(display).toAlignedRect());
+        });
+    if (m_context.displays.hasImageSources())
+        m_context.displays.forEachImageSource(
+            [&bounds](qsizetype, const CapturedDisplayModel& source) {
+                bounds = bounds.united(source.imageSourceCanvasRect);
+            });
+    return bounds;
+}
+
+std::optional<ScreenshotHistoryEntry>
+ScreenshotHistoryService::snapshotCurrent(bool persistent) const {
+    if (persistent && (m_repository == nullptr || !m_repository->policy().enabled)) {
+        return std::nullopt;
+    }
+    const QRect bounds = currentCanvasBounds();
+    if (bounds.isEmpty()) {
+        return std::nullopt;
+    }
+    ScreenshotHistoryEntry entry;
+    entry.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    entry.createdUtc = m_clock().toUTC();
+    entry.recordedCanvasBounds = bounds;
+    // Active displays define the editor canvas even when history supplies different image
+    // sources. Re-exporting a restored item must record its position in this live canvas.
+    m_context.displays.forEachActiveDisplay(
+        [&entry](qsizetype, const CapturedDisplayModel& display) {
+            if (!entry.desktopGeometry && !display.physicalRect.isEmpty() &&
+                !display.canvasRect.isEmpty()) {
+                entry.desktopGeometry = snow_shot::storage::CaptureHistoryDesktopGeometry{
+                    display.physicalRect.topLeft() - display.canvasRect.topLeft(),
+                    display.canvasUsesPoints};
+            }
+        });
+    entry.selection = m_context.selection.params(bounds);
+    entry.canvasHistory = m_context.runtime.serializeDocumentHistory();
+    entry.intelligentSelectionMode = m_context.interaction.intelligentSelecting();
+    entry.persistent = persistent;
+    if (!persistent) {
+        entry.liveIntelligentSelection = m_context.intelligentSelection;
+    }
+    if (!structurallyValidCanvasPayload(entry.canvasHistory) ||
+        entry.selection.selection.isEmpty()) {
+        return std::nullopt;
+    }
+    entry.cursorVisible = m_context.displays.cursorVisible;
+    entry.cursorAvailable = m_context.displays.cursorAvailable;
+    m_context.displays.forEachImageSource([&entry](qsizetype, const CapturedDisplayModel& display) {
+        if (display.image.isNull()) {
+            return;
+        }
+        const QPoint origin =
+            ScreenshotGeometryMapper::displayImageSourceCanvasRect(display).topLeft().toPoint();
+        const QPoint displayOrigin =
+            ScreenshotGeometryMapper::displayCanvasRect(display).topLeft().toPoint();
+        entry.displays.push_back(ScreenshotHistoryDisplay{
+            display.stableId, display.name, display.image,
+            origin != displayOrigin ? std::optional<QPoint>(origin) : std::nullopt,
+            display.canvasUsesPoints
+                ? std::optional<QRect>(
+                      ScreenshotGeometryMapper::displayImageSourceCanvasRect(display)
+                          .toAlignedRect())
+                : std::nullopt,
+            display.canvasUsesPoints, display.backingScale, display.nativeDisplayId,
+            display.cursorPatch, display.cursorPixelRect});
+    });
+    if (entry.displays.isEmpty()) {
+        return std::nullopt;
+    }
+    return entry;
+}
+
+void ScreenshotHistoryService::commit(ScreenshotHistoryEntry entry) {
+    entry.persistent = true;
+    scheduleWrite(std::move(entry));
+}
+
+bool ScreenshotHistoryService::navigateToRecord(const QString& recordId) {
+    if (recordId.isEmpty() || m_navigationInProgress) {
+        return false;
+    }
+    // Other capture controllers publish directly to the shared repository.
+    refreshMetadata();
+    const auto target =
+        std::find_if(m_entries.cbegin(), m_entries.cend(),
+                     [&recordId](const snow_shot::storage::CaptureHistoryRecord& record) {
+                         return record.id == recordId;
+                     });
+    if (target == m_entries.cend() || !ensureLiveEndpoint()) {
+        return false;
+    }
+    const qsizetype recordIndex = std::distance(m_entries.cbegin(), target);
+    return navigateTo(static_cast<int>(recordIndex) + 1);
+}
+
+bool ScreenshotHistoryService::ensureLiveEndpoint() {
+    if (m_liveEndpoint.has_value() && m_navigationIndex != 0) {
+        return true;
+    }
+    std::optional<ScreenshotHistoryEntry> liveEndpoint = snapshotCurrent(false);
+    if (!liveEndpoint.has_value()) {
+        return false;
+    }
+    if (m_context.interaction.manualSelecting()) {
+        m_context.interaction.confirmSelection();
+        liveEndpoint->intelligentSelectionMode = false;
+    }
+    m_liveEndpoint = std::move(liveEndpoint);
+    m_navigationIndex = 0;
+    return true;
+}
+
+bool ScreenshotHistoryService::navigatePrevious() {
+    if (m_navigationInProgress) {
+        return false;
+    }
+    refreshMetadata();
+    if (m_entries.isEmpty()) {
+        return false;
+    }
+    if (!ensureLiveEndpoint()) {
+        return false;
+    }
+    return navigateTo(m_navigationIndex + 1);
+}
+
+bool ScreenshotHistoryService::navigateNext() {
+    if (m_navigationInProgress) {
+        return false;
+    }
+    refreshMetadata();
+    if (!ensureLiveEndpoint() || m_navigationIndex <= 0) {
+        return false;
+    }
+    return navigateTo(m_navigationIndex - 1);
+}
+
+bool ScreenshotHistoryService::returnToCurrentScreenshot() {
+    if (m_navigationInProgress || m_navigationIndex <= 0 || !m_liveEndpoint.has_value()) {
+        return false;
+    }
+    reapCompletedWrites();
+    return navigateTo(0);
+}
+
+bool ScreenshotHistoryService::navigateTo(int index) {
+    if (index < 0 || index > m_entries.size()) {
+        return false;
+    }
+    if (index == 0) {
+        if (!applyEntry(*m_liveEndpoint)) {
+            return false;
+        }
+        m_navigationIndex = 0;
+        return true;
+    }
+
+    snow_shot::storage::CaptureHistoryRecord metadata = m_entries[index - 1];
+    const QString entryId = metadata.id;
+    const std::shared_future<snow_shot::storage::CaptureHistoryPublishResult> pendingWrite =
+        pendingWriteFor(entryId);
+    const quint64 generation = ++m_navigationGeneration;
+    reapCompletedLoads();
+    m_navigationInProgress = true;
+    m_context.loadingStateChanged(true);
+    try {
+        m_pendingLoads.push_back(std::async(
+            std::launch::async,
+            snow_shot::runtime::trackRuntimeWork([this, generation, index, entryId,
+                                                  metadata = std::move(metadata),
+                                                  pendingWrite]() mutable {
+                snow_shot::platform::applyApplicationQoSToCurrentThread();
+                std::optional<ScreenshotHistoryEntry> loadedEntry;
+                try {
+                    if (pendingWrite.valid()) {
+                        const auto published = pendingWrite.get();
+                        if (published.storage.success) {
+                            metadata = published.record;
+                        } else {
+                            metadata.id.clear();
+                        }
+                    }
+                    if (!metadata.id.isEmpty()) {
+                        const auto payload = m_repository->load(metadata);
+                        if (payload.has_value()) {
+                            loadedEntry = presentationEntry(metadata, *payload);
+                            if (!loadedEntry.has_value()) {
+                                m_repository->reportReadFailure(
+                                    metadata,
+                                    QStringLiteral("Unable to restore the history canvas"));
+                            }
+                        }
+                    }
+                } catch (...) {
+                    loadedEntry.reset();
+                }
+
+                QMetaObject::invokeMethod(this,
+                                          snow_shot::runtime::trackRuntimeWork(
+                                              [this, generation, index, entryId,
+                                               loadedEntry = std::move(loadedEntry)]() mutable {
+                                                  finishPersistentNavigation(
+                                                      generation, index, entryId,
+                                                      std::move(loadedEntry));
+                                              }),
+                                          Qt::QueuedConnection);
+            })));
+    } catch (...) {
+        m_navigationInProgress = false;
+        m_context.loadingStateChanged(false);
+        return false;
+    }
+    return true;
+}
+
+void ScreenshotHistoryService::finishPersistentNavigation(
+    quint64 generation, int index, const QString& entryId,
+    std::optional<ScreenshotHistoryEntry> entry) {
+    if (generation != m_navigationGeneration || !m_navigationInProgress) {
+        reapCompletedLoads();
+        return;
+    }
+
+    m_navigationInProgress = false;
+    const auto target =
+        std::find_if(m_entries.cbegin(), m_entries.cend(),
+                     [&entryId](const auto& record) { return record.id == entryId; });
+    const bool targetStillExists = target != m_entries.cend();
+    if (targetStillExists)
+        index = static_cast<int>(std::distance(m_entries.cbegin(), target)) + 1;
+    if (!entry.has_value()) {
+        m_unreadableEntries.insert(entryId);
+        if (targetStillExists) {
+            m_entries.removeAt(index - 1);
+            if (index < m_navigationIndex) {
+                --m_navigationIndex;
+            }
+        }
+    } else if (targetStillExists && applyEntry(*entry)) {
+        m_navigationIndex = index;
+    }
+
+    m_context.loadingStateChanged(false);
+    reapCompletedLoads();
+}
+
+bool ScreenshotHistoryService::presentTransientEntry(const ScreenshotHistoryEntry& entry) {
+    if (entry.displays.isEmpty() || entry.canvasHistory.isEmpty())
+        return false;
+    resetCaptureNavigation();
+    auto imported = entry;
+    imported.persistent = false;
+    imported.intelligentSelectionMode = false;
+    return applyEntry(imported);
+}
+
+std::optional<ScreenshotSelectionParams>
+ScreenshotHistoryService::latestSelectionParams(const ScreenshotSelectionRestoreTarget& target) {
+    refreshMetadata();
+    for (const auto& record : m_entries) {
+        if (auto params = selectionForRestore(record, target))
+            return params;
+    }
+    return std::nullopt;
+}
+
+bool ScreenshotHistoryService::browsePreviousSelection(
+    const ScreenshotSelectionRestoreTarget& target,
+    const std::function<bool(const ScreenshotSelectionParams&)>& applySelection) {
+    return browseSelection(target, true, applySelection);
+}
+
+bool ScreenshotHistoryService::browseNextSelection(
+    const ScreenshotSelectionRestoreTarget& target,
+    const std::function<bool(const ScreenshotSelectionParams&)>& applySelection) {
+    return browseSelection(target, false, applySelection);
+}
+
+bool ScreenshotHistoryService::browseSelection(
+    const ScreenshotSelectionRestoreTarget& target, bool previous,
+    const std::function<bool(const ScreenshotSelectionParams&)>& applySelection) {
+    if (!applySelection || m_navigationInProgress)
+        return false;
+    refreshMetadata();
+    if (!m_selectionNavigationId.isEmpty() &&
+        (m_selectionNavigationRevision != m_context.selection.changeRevision() ||
+         m_selectionNavigationModeRevision != m_context.interaction.selectionModeRevision())) {
+        resetSelectionNavigation();
+    }
+    qsizetype index = -1;
+    if (!m_selectionNavigationId.isEmpty()) {
+        const auto current =
+            std::find_if(m_entries.cbegin(), m_entries.cend(),
+                         [this](const auto& r) { return r.id == m_selectionNavigationId; });
+        index = std::distance(m_entries.cbegin(), current);
+    } else if (!previous) {
+        return false;
+    }
+    const qsizetype step = previous ? 1 : -1;
+    for (index += step; index >= 0 && index < m_entries.size(); index += step) {
+        const auto params = selectionForRestore(m_entries[index], target);
+        if (!params)
+            continue;
+        const QString id = m_entries[index].id;
+        const quint64 generation = m_selectionNavigationGeneration;
+        if (!applySelection(*params))
+            return false;
+        // Confirmation can synchronously retire or replace the capture session.
+        if (generation == m_selectionNavigationGeneration) {
+            m_selectionNavigationId = id;
+            m_selectionNavigationRevision = m_context.selection.changeRevision();
+            m_selectionNavigationModeRevision = m_context.interaction.selectionModeRevision();
+        }
+        return true;
+    }
+    return false;
+}
+
+void ScreenshotHistoryService::resetSelectionNavigation() {
+    ++m_selectionNavigationGeneration;
+    m_selectionNavigationId.clear();
+}
+
+bool ScreenshotHistoryService::applyEntry(const ScreenshotHistoryEntry& entry) {
+    const bool pointSources =
+        std::any_of(entry.displays.cbegin(), entry.displays.cend(),
+                    [](const auto& display) { return display.canvasUsesPoints; });
+    const QRect bounds = pointSources ? currentCanvasBounds().united(entry.recordedCanvasBounds)
+                                      : currentCanvasBounds();
+    ScreenshotSelectionModel restoredSelection = m_context.selection;
+    auto selectionParams = entry.selection;
+    const bool imageOnly =
+        entry.contentKind == snow_shot::storage::CaptureHistoryContentKind::Image;
+    QPoint imageCanvasOffset;
+    if (imageOnly) {
+        if (entry.displays.front().sourceCanvasOrigin.has_value()) {
+            QRect physicalDesktop;
+            m_context.displays.forEachActiveDisplay(
+                [&physicalDesktop](qsizetype, const CapturedDisplayModel& display) {
+                    physicalDesktop = physicalDesktop.united(display.physicalRect);
+                });
+            imageCanvasOffset = bounds.topLeft() - physicalDesktop.topLeft();
+        } else {
+            imageCanvasOffset = bounds.topLeft();
+        }
+        selectionParams.selection.translate(imageCanvasOffset);
+        if (selectionParams.region)
+            selectionParams.region->translate(imageCanvasOffset);
+    }
+    if (!restoredSelection.applyParams(selectionParams, bounds) && !selectionParams.region) {
+        return false;
+    }
+
+    SnowCanvasRuntime replacement(
+        SnowCanvasRuntimeConfig{snow_shot::presentation::screenshotCanvasStyleDefaults()});
+    if (!restoreCanvasPayload(replacement, entry.canvasHistory)) {
+        return false;
+    }
+    const QByteArray documentHistory = replacement.serializeDocumentHistory();
+    if (documentHistory.isEmpty() ||
+        !m_context.runtime.restoreDocumentHistoryPreservingEditorStyles(documentHistory)) {
+        return false;
+    }
+
+    QVector<CapturedDisplayModel> sources;
+    if (pointSources) {
+        for (const auto& saved : entry.displays) {
+            CapturedDisplayModel source;
+            source.stableId = saved.stableId;
+            source.name = saved.name;
+            source.nativeDisplayId = saved.nativeDisplayId;
+            source.image = saved.image;
+            source.cursorPatch = saved.cursorPatch;
+            source.cursorPixelRect = saved.cursorPixelRect;
+            source.imageSourceCanvasRect = saved.sourceCanvasRect.value_or(
+                QRect(saved.sourceCanvasOrigin.value_or(QPoint()), saved.image.size()));
+            source.canvasRect = source.imageSourceCanvasRect;
+            source.canvasUsesPoints = saved.canvasUsesPoints;
+            source.backingScale =
+                saved.backingScale > 0
+                    ? saved.backingScale
+                    : std::max(source.image.width() / double(source.canvasRect.width()),
+                               source.image.height() / double(source.canvasRect.height()));
+            source.active = true;
+            sources.push_back(std::move(source));
+        }
+    }
+    m_context.displays.setImageSources(std::move(sources));
+    m_context.displays.cursorVisible = entry.cursorVisible;
+    m_context.displays.cursorAvailable = entry.cursorAvailable;
+
+    QVector<qsizetype> current;
+    m_context.displays.forEachActiveDisplay(
+        [&current](qsizetype index, const CapturedDisplayModel&) { current.push_back(index); });
+    QVector<int> matchedSaved(current.size(), -1);
+    QVector<bool> savedUsed(entry.displays.size(), false);
+    auto matchPass = [&](auto matches) {
+        for (qsizetype currentOrder = 0; currentOrder < current.size(); ++currentOrder) {
+            if (matchedSaved[currentOrder] >= 0) {
+                continue;
+            }
+            const CapturedDisplayModel& display =
+                m_context.displays.displayAt(current[currentOrder]);
+            for (qsizetype savedIndex = 0; savedIndex < entry.displays.size(); ++savedIndex) {
+                if (!savedUsed[savedIndex] && matches(display, entry.displays[savedIndex])) {
+                    matchedSaved[currentOrder] = static_cast<int>(savedIndex);
+                    savedUsed[savedIndex] = true;
+                    break;
+                }
+            }
+        }
+    };
+    matchPass([](const CapturedDisplayModel& currentDisplay,
+                 const ScreenshotHistoryDisplay& savedDisplay) {
+        return !currentDisplay.stableId.isEmpty() &&
+               currentDisplay.stableId == savedDisplay.stableId;
+    });
+    matchPass([](const CapturedDisplayModel& currentDisplay,
+                 const ScreenshotHistoryDisplay& savedDisplay) {
+        return !currentDisplay.name.isEmpty() && currentDisplay.name == savedDisplay.name;
+    });
+    matchPass([](const CapturedDisplayModel&, const ScreenshotHistoryDisplay&) { return true; });
+
+    for (qsizetype currentOrder = 0; currentOrder < current.size(); ++currentOrder) {
+        CapturedDisplayModel& display = m_context.displays.displayAt(current[currentOrder]);
+        display.cursorPatch = {};
+        display.cursorPixelRect = {};
+        if (imageOnly) {
+            display.image = entry.displays.front().image;
+            display.imageSourceCanvasRect = QRect(
+                entry.displays.front().sourceCanvasOrigin.value_or(QPoint()) + imageCanvasOffset,
+                display.image.size());
+            continue;
+        }
+        const int savedIndex = matchedSaved[currentOrder];
+        if (savedIndex < 0) {
+            display.image = QImage();
+            display.imageSourceCanvasRect = QRect();
+            continue;
+        }
+        const QImage& image = entry.displays[savedIndex].image;
+        display.image = image;
+        display.cursorPatch = entry.displays[savedIndex].cursorPatch;
+        display.cursorPixelRect = entry.displays[savedIndex].cursorPixelRect;
+        display.imageSourceCanvasRect = entry.displays[savedIndex].sourceCanvasRect.value_or(
+            QRect(entry.displays[savedIndex].sourceCanvasOrigin.value_or(
+                      ScreenshotGeometryMapper::displayCanvasRect(display).topLeft().toPoint()),
+                  image.size()));
+    }
+    m_context.selection = restoredSelection;
+    resetSelectionNavigation();
+    m_context.interaction.cancelDrag();
+    bool requestIntelligentSelection = false;
+    if (entry.persistent || !m_context.selection.hasPixelSelection()) {
+        m_context.intelligentSelection.clearTransientState();
+        m_context.interaction.returnToSelectionMode(false);
+    } else if (entry.intelligentSelectionMode) {
+        if (entry.liveIntelligentSelection.has_value()) {
+            m_context.intelligentSelection = *entry.liveIntelligentSelection;
+        }
+        m_context.interaction.returnToSelectionMode(true);
+        requestIntelligentSelection = true;
+    } else {
+        m_context.intelligentSelection.clearTransientState();
+        m_context.interaction.confirmSelection();
+    }
+    if (m_context.presentationChanged) {
+        m_context.presentationChanged();
+    }
+    if (requestIntelligentSelection && m_context.intelligentSelectionRequested) {
+        m_context.intelligentSelectionRequested();
+    }
+    return true;
+}
+
+void ScreenshotHistoryService::resetCaptureNavigation() {
+    resetSelectionNavigation();
+    ++m_navigationGeneration;
+    if (m_navigationInProgress) {
+        m_navigationInProgress = false;
+        m_context.loadingStateChanged(false);
+    }
+    m_liveEndpoint.reset();
+    m_navigationIndex = -1;
+}
+
+bool ScreenshotHistoryService::navigationInProgress() const {
+    return m_navigationInProgress;
+}
+
+void ScreenshotHistoryService::scheduleWrite(ScreenshotHistoryEntry entry) {
+    refreshMetadata();
+    if (m_validationQueue == nullptr || !structurallyValidCanvasPayload(entry.canvasHistory)) {
+        return;
+    }
+    snow_shot::storage::CaptureHistoryDraft draft = storageDraft(entry);
+    const QString id = draft.id;
+    m_entries.prepend(placeholderRecord(draft));
+    if (m_navigationIndex > 0) {
+        ++m_navigationIndex;
+    }
+    m_pendingWrites.push_back(PendingWrite{id, m_validationQueue->submit(std::move(draft))});
+}
+
+void ScreenshotHistoryService::reapCompletedWrites() {
+    const auto completed =
+        std::remove_if(m_pendingWrites.begin(), m_pendingWrites.end(), [this](PendingWrite& write) {
+            if (write.result.valid() &&
+                write.result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                return false;
+            }
+            const auto result = write.result.valid()
+                                    ? write.result.get()
+                                    : snow_shot::storage::CaptureHistoryPublishResult{};
+            const auto entry =
+                std::find_if(m_entries.begin(), m_entries.end(), [&write](const auto& candidate) {
+                    return candidate.id == write.entryId;
+                });
+            if (entry != m_entries.end()) {
+                if (result.storage.success) {
+                    *entry = result.record;
+                } else {
+                    m_entries.erase(entry);
+                }
+            }
+            return true;
+        });
+    m_pendingWrites.erase(completed, m_pendingWrites.end());
+}
+
+void ScreenshotHistoryService::drainPendingWrites() {
+    for (PendingWrite& write : m_pendingWrites) {
+        if (write.result.valid()) {
+            write.result.wait();
+        }
+    }
+    reapCompletedWrites();
+    m_repository->drain();
+    reapCompletedWrites();
+    refreshMetadata();
+}
+
+void ScreenshotHistoryService::refreshMetadata() {
+    const QString selectedId = m_navigationIndex > 0 && m_navigationIndex <= m_entries.size()
+                                   ? m_entries[m_navigationIndex - 1].id
+                                   : QString();
+    reapCompletedWrites();
+    QVector<snow_shot::storage::CaptureHistoryRecord> refreshed = m_repository->records();
+    for (const PendingWrite& pending : m_pendingWrites) {
+        const auto existing =
+            std::find_if(m_entries.cbegin(), m_entries.cend(), [&pending](const auto& candidate) {
+                return candidate.id == pending.entryId;
+            });
+        const auto alreadyPersisted =
+            std::find_if(refreshed.cbegin(), refreshed.cend(), [&pending](const auto& candidate) {
+                return candidate.id == pending.entryId;
+            });
+        if (existing != m_entries.cend() && alreadyPersisted == refreshed.cend()) {
+            refreshed.push_back(*existing);
+        }
+    }
+    // Payload deletion runs on the repository worker. Do not reintroduce a failed
+    // entry while that worker is still committing its removal.
+    QSet<QString> retainedUnreadable;
+    refreshed.erase(std::remove_if(refreshed.begin(), refreshed.end(),
+                                   [&](const auto& record) {
+                                       if (!m_unreadableEntries.contains(record.id))
+                                           return false;
+                                       retainedUnreadable.insert(record.id);
+                                       return true;
+                                   }),
+                    refreshed.end());
+    m_unreadableEntries = std::move(retainedUnreadable);
+    std::sort(refreshed.begin(), refreshed.end(), [](const auto& first, const auto& second) {
+        return first.createdUtc != second.createdUtc ? first.createdUtc > second.createdUtc
+                                                     : first.id < second.id;
+    });
+    m_entries = std::move(refreshed);
+    if (!m_selectionNavigationId.isEmpty() &&
+        std::none_of(m_entries.cbegin(), m_entries.cend(),
+                     [this](const auto& record) { return record.id == m_selectionNavigationId; })) {
+        resetSelectionNavigation();
+    }
+    if (!selectedId.isEmpty()) {
+        const auto selected =
+            std::find_if(m_entries.cbegin(), m_entries.cend(),
+                         [&selectedId](const auto& record) { return record.id == selectedId; });
+        if (selected != m_entries.cend()) {
+            m_navigationIndex = static_cast<int>(std::distance(m_entries.cbegin(), selected)) + 1;
+        } else {
+            // The displayed snapshot remains valid after its stored record disappears.
+            // Keep it beyond the retained oldest entry instead of selecting another row.
+            m_navigationIndex = static_cast<int>(m_entries.size()) + 1;
+        }
+    }
+    if (m_navigationIndex > m_entries.size()) {
+        m_navigationIndex = static_cast<int>(m_entries.size()) + 1;
+    }
+}
+
+std::shared_future<snow_shot::storage::CaptureHistoryPublishResult>
+ScreenshotHistoryService::pendingWriteFor(const QString& entryId) const {
+    for (const PendingWrite& write : m_pendingWrites) {
+        if (write.entryId == entryId) {
+            return write.result;
+        }
+    }
+    return {};
+}
+
+void ScreenshotHistoryService::reapCompletedLoads() {
+    const auto completed =
+        std::remove_if(m_pendingLoads.begin(), m_pendingLoads.end(), [](std::future<void>& load) {
+            return !load.valid() ||
+                   load.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+    m_pendingLoads.erase(completed, m_pendingLoads.end());
+}
+
+void ScreenshotHistoryService::drainPendingLoads() {
+    for (std::future<void>& load : m_pendingLoads) {
+        if (load.valid()) {
+            load.wait();
+        }
+    }
+    m_pendingLoads.clear();
+}

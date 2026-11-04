@@ -1,0 +1,98 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTCOLORPICKERWINDOW_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTCOLORPICKERWINDOW_H
+
+#include "snow_shot/presentation/screenshotselectiondisplayunit.h"
+
+#include <optional>
+#include <QColor>
+#include <QImage>
+#include <QPoint>
+#include <QPointF>
+#include <QRect>
+#include <QWidget>
+
+class QPaintEvent;
+
+class ScreenshotColorPickerWindow final : public QWidget {
+  public:
+    explicit ScreenshotColorPickerWindow(QWidget* parent = nullptr);
+
+    void setOwnerWindow(QWidget* owner);
+    void prepareNativeSurface();
+    void resetForNewCapture();
+    void setCaptureImage(const QImage& image, const QRect& physicalRect,
+                         const QImage& cursorPatch = {}, const QRect& cursorPixelRect = {});
+    [[nodiscard]] bool updateColorSample(const QPoint& physicalPoint);
+    void
+    updatePicker(const QPoint& physicalPoint, const QPointF& overlayLocalPosition, bool visible,
+                 std::optional<ScreenshotCoordinateDisplayValues> displayValues = std::nullopt);
+    void hidePicker();
+    void setCenterGuideLineColor(const QColor& color);
+    void cycleColorFormat();
+    void toggleCoordinateMode();
+    QString currentColorText() const;
+    QString currentPositionText() const;
+    bool hasCurrentColor() const;
+
+#if defined(SNOW_SHOT_BENCH_INTERNALS)
+    struct WorkCounters {
+        quint64 samples = 0;
+        quint64 previews = 0;
+        quint64 moves = 0;
+        quint64 ownerChanges = 0;
+    };
+    [[nodiscard]] WorkCounters workCounters() const {
+        return m_workCounters;
+    }
+    void resetWorkCounters() {
+        m_workCounters = {};
+    }
+#endif
+
+    QSize sizeHint() const override;
+
+  protected:
+    bool event(QEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
+    void paintEvent(QPaintEvent* event) override;
+    void changeEvent(QEvent* event) override;
+
+  private:
+    enum class ColorFormat {
+        Hex,
+        HexWithoutHash,
+        Rgb,
+        Hsl,
+    };
+
+    [[nodiscard]] bool updatePreview(const QPoint& physicalPoint);
+    [[nodiscard]] bool updatePosition(const QPointF& overlayLocalPosition);
+    QString formatColor(const QColor& color) const;
+    QRectF panelRect() const;
+    QRectF previewRect() const;
+    QRectF positionTextRect() const;
+    QRectF colorTextRect() const;
+
+    QImage m_captureImage;
+    QImage m_cursorPatch;
+    QRect m_cursorPixelRect;
+    QRect m_physicalRect;
+    QImage m_previewImage;
+    QPoint m_currentPhysicalPoint;
+    ScreenshotCoordinateDisplayValues m_displayValues;
+    mutable std::optional<QString> m_positionText;
+    QColor m_currentColor;
+    QColor m_panelBackground;
+    QColor m_panelTextColor;
+    QColor m_centerGuideLineColor = QColor(0, 0, 0, 0);
+    ColorFormat m_colorFormat = ColorFormat::Hex;
+    bool m_relativeCoordinates = false;
+    bool m_hasCurrentColor = false;
+    bool m_previewDirty = true;
+    qreal m_preparedSurfaceDevicePixelRatio = 0.0;
+#if defined(SNOW_SHOT_BENCH_INTERNALS)
+    WorkCounters m_workCounters;
+#endif
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTCOLORPICKERWINDOW_H

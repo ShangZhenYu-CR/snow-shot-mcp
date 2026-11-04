@@ -1,0 +1,1033 @@
+#include "snow_shot/presentation/screenshotocrcontroller.h"
+#include "snow_shot/presentation/screenshotclipboardcontent.h"
+#include "snow_shot/presentation/screenshotdocumentformatting.h"
+#include <QTextDocument>
+#include <QCryptographicHash>
+#include <QDataStream>
+#include <QIODevice>
+
+#include "snow_shot/app/editionfeatures.h"
+
+#include "snow_shot/presentation/screenshotcapturestate.h"
+#include "snow_shot/presentation/screenshotdisplaysession.h"
+#include "snow_shot/presentation/screenshotgeometry.h"
+#include "snow_shot/presentation/screenshotocrpresentation.h"
+#include "snow_shot/presentation/screenshotrecognitionsessioncontroller.h"
+#include "snow_shot/presentation/screenshotrecognitionwindow.h"
+#include "snow_shot/presentation/screenshotoverlaycoordinator.h"
+#include "snow_shot/presentation/screenshotoverlaywindow.h"
+#include "snow_shot/presentation/screenshotselectionmodel.h"
+#include "snow_shot/presentation/screenshotsourceimagecomposer.h"
+#include "snow_shot/presentation/screenshotcursorimagesource.h"
+#include "snow_shot/presentation/screenshottableeditor.h"
+#include "snow_shot/presentation/screenshottoolbarwindow.h"
+
+#include "theme/theme_manager.h"
+
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+
+#include "snow_shot/diagnostics/diagnostics.h"
+#include <QElapsedTimer>
+#include <QApplication>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QMimeData>
+#include <QScreen>
+#include <QTimer>
+#include <QUrl>
+
+#include <utility>
+
+namespace {
+constexpr auto kRecognitionMessageKey = "screenshot-ocr-recognition";
+constexpr auto kModelDownloadMessageKey = "screenshot-ocr-model-download";
+constexpr auto kStatusMessageKey = "screenshot-ocr-status";
+
+ScreenshotToolPalette::Tool paletteTool(ScreenshotActiveTool tool) {
+    switch (tool) {
+    case ScreenshotActiveTool::Select:
+        return ScreenshotToolPalette::Tool::Select;
+    case ScreenshotActiveTool::Shape:
+        return ScreenshotToolPalette::Tool::Shape;
+    case ScreenshotActiveTool::Arrow:
+        return ScreenshotToolPalette::Tool::Arrow;
+    case ScreenshotActiveTool::Distance:
+        return ScreenshotToolPalette::Tool::Distance;
+    case ScreenshotActiveTool::Angle:
+        return ScreenshotToolPalette::Tool::Angle;
+    case ScreenshotActiveTool::Bracket:
+        return ScreenshotToolPalette::Tool::Bracket;
+    case ScreenshotActiveTool::Line:
+        return ScreenshotToolPalette::Tool::Line;
+    case ScreenshotActiveTool::FreeDraw:
+        return ScreenshotToolPalette::Tool::FreeDraw;
+    case ScreenshotActiveTool::RectangleHighlight:
+        return ScreenshotToolPalette::Tool::RectangleHighlight;
+    case ScreenshotActiveTool::PenHighlight:
+        return ScreenshotToolPalette::Tool::PenHighlight;
+    case ScreenshotActiveTool::Eraser:
+        return ScreenshotToolPalette::Tool::Eraser;
+    case ScreenshotActiveTool::RectangleEraser:
+        return ScreenshotToolPalette::Tool::RectangleEraser;
+    case ScreenshotActiveTool::BrushEraser:
+        return ScreenshotToolPalette::Tool::BrushEraser;
+    case ScreenshotActiveTool::AutoFilter:
+        return ScreenshotToolPalette::Tool::AutoFilter;
+    case ScreenshotActiveTool::RectangleFilter:
+        return ScreenshotToolPalette::Tool::RectangleFilter;
+    case ScreenshotActiveTool::PenFilter:
+        return ScreenshotToolPalette::Tool::PenFilter;
+    case ScreenshotActiveTool::Text:
+        return ScreenshotToolPalette::Tool::Text;
+    case ScreenshotActiveTool::SerialNumber:
+        return ScreenshotToolPalette::Tool::SerialNumber;
+    case ScreenshotActiveTool::Ocr:
+        return ScreenshotToolPalette::Tool::Ocr;
+    case ScreenshotActiveTool::TextTranslation:
+        return ScreenshotToolPalette::Tool::TextTranslation;
+    case ScreenshotActiveTool::Table:
+        return ScreenshotToolPalette::Tool::Table;
+    case ScreenshotActiveTool::Qr:
+        return ScreenshotToolPalette::Tool::Qr;
+    case ScreenshotActiveTool::Latex:
+        return ScreenshotToolPalette::Tool::Latex;
+    case ScreenshotActiveTool::Markdown:
+        return ScreenshotToolPalette::Tool::Markdown;
+    case ScreenshotActiveTool::Html:
+        return ScreenshotToolPalette::Tool::Html;
+    case ScreenshotActiveTool::Move:
+    default:
+        return ScreenshotToolPalette::Tool::Move;
+    }
+}
+
+QRect recognitionGeometryForDisplay(const ScreenshotGeometryMapper& geometry,
+                                    const CapturedDisplayModel& display,
+                                    const QRectF& canvasSelection) {
+    const QRectF canvasRect = ScreenshotGeometryMapper::displayCanvasRect(display);
+    if (!canvasRect.isValid() || canvasRect.isEmpty() || !display.logicalRect.isValid() ||
+        display.logicalRect.isEmpty() || !canvasSelection.isValid() || canvasSelection.isEmpty()) {
+        return {};
+    }
+    return QRectF(geometry.logicalPositionForCanvasPoint(display, canvasSelection.topLeft()),
+                  geometry.logicalPositionForCanvasPoint(display, canvasSelection.bottomRight()))
+        .normalized()
+        .toAlignedRect();
+}
+} // namespace
+
+ScreenshotOcrController::ScreenshotOcrController(ScreenshotOcrControllerContext context,
+                                                 QObject* parent)
+    : QObject(parent), m_context(std::move(context)),
+      m_messages(std::make_unique<ScreenshotMessageService>(
+          m_context.displaySession, m_context.geometry, m_context.selection,
+          [this]() { return m_context.overlayCoordinator.toolbar(); })) {
+    m_session = std::make_unique<ScreenshotRecognitionSessionController>(
+        &m_context.recognition, m_context.qrRecognition, m_context.tableRecognition,
+        ScreenshotRecognitionSessionActions{
+            [this]() -> ScreenshotRecognitionWindow* {
+                if (m_context.captureState.presentationSuppressed)
+                    return nullptr;
+                return ensureRecognitionWindow() ? m_recognitionWindow.data() : nullptr;
+            },
+            [this](std::shared_ptr<ScreenshotOcrPresentation> presentation) {
+                if (m_recognitionWindow != nullptr) {
+                    m_recognitionWindow->setOcrPresentation(std::move(presentation));
+                }
+            },
+            [this](std::shared_ptr<ScreenshotOcrPresentation> presentation) {
+                m_presentation = std::move(presentation);
+                applyOcrBackgroundToOverlays(m_presentation);
+            },
+            [](std::shared_ptr<QTextDocument>) {},
+            [this]() { clearOcrBackgroundFromOverlays(); },
+            [](bool) {},
+            [this](int mode) {
+                if (mode < 0) {
+                    return;
+                }
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    const auto tool =
+                        mode == static_cast<int>(ScreenshotRecognitionSessionController::Mode::Text)
+                            ? (m_context.interaction.activeTool() ==
+                                       ScreenshotActiveTool::TextTranslation
+                                   ? ScreenshotActiveTool::TextTranslation
+                                   : ScreenshotActiveTool::Ocr)
+                        : mode == static_cast<int>(
+                                      ScreenshotRecognitionSessionController::Mode::Table)
+                            ? ScreenshotActiveTool::Table
+                        : mode == static_cast<int>(
+                                      ScreenshotRecognitionSessionController::Mode::Latex)
+                            ? ScreenshotActiveTool::Latex
+                        : mode == static_cast<int>(
+                                      ScreenshotRecognitionSessionController::Mode::Markdown)
+                            ? ScreenshotActiveTool::Markdown
+                        : mode ==
+                                static_cast<int>(ScreenshotRecognitionSessionController::Mode::Html)
+                            ? ScreenshotActiveTool::Html
+                            : ScreenshotActiveTool::Qr;
+                    toolbar->setActiveTool(paletteTool(tool));
+                }
+            },
+            [this](bool available, bool editing, bool canUndo, bool canRedo) {
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setTextEditingState(available, editing, canUndo, canRedo);
+                }
+            },
+            [this](bool available, bool translating, bool streaming, bool canUndo, bool canRedo,
+                   bool canReset, bool originalImage) {
+                if (translating && m_active && m_mode == Mode::Text &&
+                    m_context.interaction.activeTool() != ScreenshotActiveTool::TextTranslation) {
+                    m_context.interaction.setCanvasTool(ScreenshotActiveTool::TextTranslation);
+                }
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setTextTranslationState(available, translating, streaming, canUndo,
+                                                     canRedo, canReset, originalImage);
+                }
+            },
+            [this](bool available, bool canUndo, bool canRedo, bool canMerge, bool canSplit,
+                   bool canReset) {
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setTableEditingState(available, canUndo, canRedo, canMerge, canSplit,
+                                                  canReset);
+                }
+            },
+            [this](bool textBusy, bool tableBusy, bool qrBusy) {
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setOcrBusy(textBusy);
+                    toolbar->setTableBusy(tableBusy);
+                    toolbar->setQrBusy(qrBusy);
+                    if (toolbar->palette())
+                        toolbar->palette()->setLatexState(
+                            true,
+                            m_session && m_session->busy(
+                                             ScreenshotRecognitionSessionController::Mode::Latex));
+                }
+            },
+            [this]() { m_messages->destroy(QString::fromLatin1(kRecognitionMessageKey)); },
+            [this](const QString& message, bool error) { showStatus(message, error); },
+            [this]() -> QWidget* {
+                const QRectF selection = m_context.selection.normalizedSelection();
+                const CapturedDisplayModel* display = m_context.geometry.displayForCanvasPoint(
+                    m_context.displaySession, selection.center());
+                if (display == nullptr) {
+                    display = m_context.geometry.displayForCanvasRect(m_context.displaySession,
+                                                                      selection);
+                }
+                return m_context.displaySession.overlayForDisplay(display);
+            },
+            [this](const QString& formatting, const QString& punctuation) {
+                if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setTextTransformSelections(formatting, punctuation);
+                }
+            },
+            [this](const QString& message) {
+                if (m_context.captureState.presentationSuppressed)
+                    return;
+                m_messages->loading(QString::fromLatin1(kModelDownloadMessageKey), message, {},
+                                    m_recognitionWindow.data());
+            },
+            [this](const QString& message) {
+                if (m_context.captureState.presentationSuppressed)
+                    return;
+                m_messages->loading(QString::fromLatin1(kRecognitionMessageKey), message, {},
+                                    m_recognitionWindow.data());
+            },
+            [this]() { m_messages->destroy(QString::fromLatin1(kModelDownloadMessageKey)); },
+            [this]() {
+                if (ensureRecognitionWindow() && m_recognitionWindow != nullptr) {
+                    const auto theme = adqt::theme::ThemeManager::instance().resolveTheme(
+                        m_recognitionWindow.data());
+                    return theme.colorBgContainer.isValid() ? theme.colorBgContainer
+                                                            : QColor(Qt::white);
+                }
+                return QColor(Qt::white);
+            },
+            {},
+            {},
+            [this](std::shared_ptr<ScreenshotOcrPresentation> presentation, QImage filteredImage,
+                   QRectF filteredImageCanvasRect) {
+                applyOcrBackgroundToOverlays(presentation, std::move(filteredImage),
+                                             filteredImageCanvasRect);
+            },
+            [this](int lineIndex, const QString& text) {
+                if (m_recognitionWindow != nullptr) {
+                    m_recognitionWindow->updateOcrText(lineIndex, text);
+                }
+            },
+            [this](bool, bool busy, SnowShotImageConversionFormat format) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setImageConversionBusy(
+                        busy && format == SnowShotImageConversionFormat::Markdown,
+                        busy && format == SnowShotImageConversionFormat::Html);
+                }
+            },
+            [this](bool show) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setShowOriginalImage(show);
+                }
+                m_context.displaySession.forEachOverlay(
+                    [show](qsizetype, ScreenshotOverlayWindow* overlay) {
+                        if (overlay != nullptr) {
+                            overlay->setScreenshotOcrVisible(!show);
+                        }
+                    });
+            },
+            [this](const QString& language) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar())
+                    toolbar->setTextTargetLanguage(language);
+            },
+            [this](bool available, bool canUndo, bool canRedo) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    if (auto* palette = toolbar->palette())
+                        palette->setLatexEditingState(available, canUndo, canRedo);
+                }
+            },
+            [this](int mode, const ScreenshotRecognitionModelState& state) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    toolbar->setRecognitionModelState(
+                        mode == static_cast<int>(
+                                    ScreenshotRecognitionSessionController::Mode::Table)
+                            ? ScreenshotToolPalette::Tool::Table
+                            : ScreenshotToolPalette::Tool::Latex,
+                        state);
+                }
+            },
+            [this]() -> QImage {
+                if (!m_recognitionWindow || m_surfaceKey != currentCacheKey())
+                    return {};
+                auto snapshot = m_recognitionWindow->imageSnapshot(
+                    m_surfaceImage, QRectF(m_context.selection.pixelSelection()), m_filteredImage,
+                    m_filteredCanvasRect, m_context.selection.resultStyle(), true);
+                if (snapshot) {
+                    snapshot->layoutCompaction = m_context.selection.exportLayoutCompaction();
+                    if (snapshot->resultStyle.backgroundOpacityPercent > 0) {
+                        m_context.displaySession.forEachImageSource(
+                            [&](qsizetype, const CapturedDisplayModel& display) {
+                                for (const auto& layer : screenshotDisplayImageLayers(
+                                         display, m_context.displaySession.cursorVisible))
+                                    snapshot->backgroundSources.append(
+                                        {layer.image, layer.destinationCanvasRect});
+                            });
+                    }
+                }
+                return snapshot ? renderScreenshotRecognitionImage(*snapshot) : QImage{};
+            },
+            {},
+            [this](const QVector<SnowShotChatModel>& models, const QString& selection,
+                   bool loading) {
+                if (auto* toolbar = m_context.overlayCoordinator.toolbar()) {
+                    if (auto* palette = toolbar->palette())
+                        palette->setTextTranslationServices(models, selection, loading);
+                }
+            },
+        },
+        this);
+    connect(m_session.get(), &ScreenshotRecognitionSessionController::textEditingChanged, this,
+            &ScreenshotOcrController::textEditingChanged);
+    connect(m_session.get(), &ScreenshotRecognitionSessionController::textResultChanged, this,
+            [this](bool available) {
+                // This explicit action takes precedence over the configurable OCR follow-up.
+                if (m_copyAndEndCapture) {
+                    if (available && m_active && m_mode == Mode::Text) {
+                        // Let recognition finish publishing its result before ending the session.
+                        QTimer::singleShot(0, this, [this, activation = m_activationId] {
+                            if (activation == m_activationId && m_copyAndEndCapture && m_active &&
+                                m_mode == Mode::Text && hasTextResult())
+                                static_cast<void>(copyRecognitionToClipboard(true));
+                        });
+                    }
+                    return;
+                }
+                emit textResultChanged(available);
+            });
+    connect(m_session.get(), &ScreenshotRecognitionSessionController::textDraftChanged, this,
+            &ScreenshotOcrController::textDraftChanged);
+    connect(m_session.get(), &ScreenshotRecognitionSessionController::workflowStateChanged, this,
+            &ScreenshotOcrController::workflowStateChanged);
+    connect(m_session.get(), &ScreenshotRecognitionSessionController::recognitionResultsChanged,
+            this, &ScreenshotOcrController::workflowStateChanged);
+}
+
+ScreenshotOcrController::~ScreenshotOcrController() {
+    invalidateSession();
+}
+
+std::optional<ScreenshotRecognitionImageSnapshot>
+ScreenshotOcrController::imageSnapshot(const ScreenshotResultStyle& style) const {
+    if (!m_active || !m_session->originalImageVisible() || m_recognitionWindow == nullptr ||
+        m_surfaceKey != currentCacheKey())
+        return std::nullopt;
+    return m_recognitionWindow->imageSnapshot(m_surfaceImage,
+                                              QRectF(m_context.selection.pixelSelection()),
+                                              m_filteredImage, m_filteredCanvasRect, style);
+}
+
+bool ScreenshotOcrController::active() const {
+    return m_active;
+}
+
+ScreenshotOcrController::Mode ScreenshotOcrController::mode() const {
+    return m_mode;
+}
+
+bool ScreenshotOcrController::tableModeActive() const {
+    return m_session->tableModeActive();
+}
+
+bool ScreenshotOcrController::latexModeActive() const {
+    return m_session->active() &&
+           m_session->mode() == ScreenshotRecognitionSessionController::Mode::Latex;
+}
+
+bool ScreenshotOcrController::qrModeActive() const {
+    return m_session->qrModeActive();
+}
+
+void ScreenshotOcrController::activate() {
+    activateMode(Mode::Text);
+}
+
+void ScreenshotOcrController::activateAndCopy() {
+    activateMode(Mode::Text, false, true);
+}
+
+void ScreenshotOcrController::activateTextTranslation() {
+#if SNOW_SHOT_ENABLE_TEXT_TRANSLATION
+    activateMode(Mode::Text, true);
+#endif
+}
+
+void ScreenshotOcrController::activateTable() {
+    activateMode(Mode::Table);
+}
+
+void ScreenshotOcrController::activateQr() {
+    activateMode(Mode::Qr);
+}
+
+void ScreenshotOcrController::activateLatex() {
+    activateMode(Mode::Latex);
+}
+
+void ScreenshotOcrController::setRecognitionModel(const QString& selection) {
+    m_session->setRecognitionModel(selection);
+}
+
+void ScreenshotOcrController::activateImageConversion(SnowShotImageConversionFormat format) {
+    activateMode(format == SnowShotImageConversionFormat::Markdown ? Mode::Markdown : Mode::Html);
+}
+
+void ScreenshotOcrController::openImageConversionSettings() {
+    m_session->openImageConversionSettings();
+}
+
+namespace {
+QImage clipRecognitionSelection(QImage image, const ScreenshotSelectionModel& selection) {
+    if (image.isNull() || selection.rectangular())
+        return image;
+    auto style = selection.resultStyle();
+    const qreal scale = qreal(image.width()) / selection.pixelSelection().width();
+    style = ScreenshotResultCompositor::scaledStyle(style, scale);
+    style.shadowWidth = 0;
+    style.borderWidth = 0;
+    style.backgroundOpacityPercent = 0;
+    return ScreenshotResultCompositor::compose(image, style);
+}
+} // namespace
+
+QString ScreenshotOcrController::currentCacheKey() const {
+    const QRect selection = m_context.selection.pixelSelection();
+    QByteArray geometry;
+    QDataStream stream(&geometry, QIODevice::WriteOnly);
+    stream << m_context.selection.selectionRegion();
+    return QStringLiteral("%1:%2,%3,%4,%5:%6")
+        .arg(m_context.captureState.sessionId)
+        .arg(selection.x())
+        .arg(selection.y())
+        .arg(selection.width())
+        .arg(selection.height())
+        .arg(QString::fromLatin1(
+            QCryptographicHash::hash(geometry, QCryptographicHash::Sha256).toHex()));
+}
+
+void ScreenshotOcrController::activateMode(Mode mode, bool textTranslation,
+                                           bool copyAndEndCapture) {
+    const int sessionMode = mode == Mode::Text       ? 0
+                            : mode == Mode::Table    ? 1
+                            : mode == Mode::Qr       ? 2
+                            : mode == Mode::Markdown ? 3
+                            : mode == Mode::Html     ? 4
+                                                     : 5;
+    if (!snow_shot::app::editionRecognitionModeAvailable(sessionMode))
+        return;
+    const QRect selection = m_context.selection.pixelSelection();
+    if (selection.width() < 1 || selection.height() < 1) {
+        if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+            toolbar->setActiveTool(paletteTool(m_context.interaction.activeTool()));
+        }
+        showStatus(tr("Select an area to recognize"), false);
+        return;
+    }
+
+    ++m_activationId;
+    m_copyAndEndCapture = copyAndEndCapture;
+    if (!m_active) {
+        m_previousTool = m_context.interaction.activeTool();
+        m_canvasStates.clear();
+        m_context.displaySession.forEachOverlay(
+            [this](qsizetype, ScreenshotOverlayWindow* overlay) {
+                if (overlay == nullptr || overlay->canvas() == nullptr) {
+                    return;
+                }
+                SnowCanvasWidget* canvas = overlay->canvas();
+                m_canvasStates.push_back(CanvasState{
+                    overlay,
+                    canvas,
+                    canvas->canvasContentVisible(),
+                    canvas->interactionEnabled(),
+                    overlay->hasScreenshotSelection(),
+                    overlay->screenshotSelectionHandlesVisible(),
+                    overlay->screenshotSelectionBorderVisible(),
+                });
+                canvas->setInteractionEnabled(false);
+                canvas->setCanvasContentVisible(false);
+                overlay->setScreenshotSelection(m_context.selection.normalizedSelection(), false,
+                                                m_context.selection.cornerRadius());
+                if (!m_context.selection.rectangular())
+                    overlay->setScreenshotSelectionRegion(m_context.selection.selectionRegion(),
+                                                          m_context.selection.selectionRegion(), {},
+                                                          false, {});
+                overlay->setScreenshotSelectionBorderVisible(false);
+            });
+        m_active = true;
+        m_context.captureState.sessionState = ScreenshotSessionState::Editing;
+        m_context.hideColorPicker();
+    }
+
+    m_mode = mode;
+    clearOcrBackgroundFromOverlays();
+    if (!m_context.captureState.presentationSuppressed && !ensureRecognitionWindow()) {
+        restorePreviousToolAfterFailure();
+        return;
+    }
+    if (m_recognitionWindow) {
+        m_recognitionWindow->clearOcrPresentation();
+        m_recognitionWindow->clearTableSession();
+        m_recognitionWindow->clearQrContents();
+    }
+    const ScreenshotActiveTool activeTool =
+        mode == Mode::Text
+            ? (textTranslation ? ScreenshotActiveTool::TextTranslation : ScreenshotActiveTool::Ocr)
+        : mode == Mode::Table    ? ScreenshotActiveTool::Table
+        : mode == Mode::Markdown ? ScreenshotActiveTool::Markdown
+        : mode == Mode::Latex    ? ScreenshotActiveTool::Latex
+        : mode == Mode::Html     ? ScreenshotActiveTool::Html
+                                 : ScreenshotActiveTool::Qr;
+    m_context.interaction.setCanvasTool(activeTool);
+    if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+        toolbar->setActiveTool(paletteTool(activeTool));
+    }
+
+    const QString key = currentCacheKey();
+    QElapsedTimer composition;
+    composition.start();
+    QImage source = m_surfaceKey == key
+                        ? m_surfaceImage
+                        : composeScreenshotSourceSelection(m_context.displaySession, selection);
+    source = clipRecognitionSelection(std::move(source), m_context.selection);
+    if (mode == Mode::Table) {
+        snow_shot::diagnostics::logEvent(QStringLiteral("snow_shot.capture"),
+                                         QStringLiteral("table.source_prepared"),
+                                         {{QStringLiteral("composition_ms"), composition.elapsed()},
+                                          {QStringLiteral("width"), source.width()},
+                                          {QStringLiteral("height"), source.height()}});
+    }
+    if (source.isNull()) {
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        restorePreviousToolAfterFailure();
+        return;
+    }
+    m_session->setTarget(ScreenshotRecognitionTarget{
+        key, std::move(source), QRectF(selection),
+        key == m_importedTargetKey ? m_importedFormattedDocument : nullptr,
+        key == m_importedTargetKey ? m_importedPlainText : QString()});
+    m_session->activate(static_cast<ScreenshotRecognitionSessionController::Mode>(mode));
+}
+
+bool ScreenshotOcrController::copyRecognitionToClipboard(bool endCapture) {
+    if (!m_active || QApplication::clipboard() == nullptr) {
+        return false;
+    }
+    if (m_session->tableModeActive()) {
+        if (m_recognitionWindow != nullptr) {
+            m_recognitionWindow->commitActiveTableEdit();
+        }
+    }
+    // Conversion toolbar Copy exports source; selection Copy is handled inside the preview.
+    bool copied = !m_session->conversionModeActive() && m_recognitionWindow != nullptr &&
+                  m_recognitionWindow->copyVisibleContentToClipboard();
+    if (!copied) {
+        std::unique_ptr<QMimeData> mimeData =
+            m_session->recognitionClipboardMimeData(m_presentation.get());
+        if (mimeData == nullptr) {
+            if (m_session->translating())
+                showStatus(QCoreApplication::translate("ScreenshotRecognitionSessionController",
+                                                       "Unable to copy translation results"),
+                           true);
+            return false;
+        }
+        QApplication::clipboard()->setMimeData(mimeData.release(), QClipboard::Clipboard);
+    }
+    if (endCapture) {
+        m_context.cancelCapture();
+    }
+    return true;
+}
+
+void ScreenshotOcrController::mergeTableSelection() {
+    m_session->mergeTableSelection();
+}
+
+void ScreenshotOcrController::splitTableSelection() {
+    m_session->splitTableSelection();
+}
+
+void ScreenshotOcrController::resetTable() {
+    m_session->resetTable();
+}
+
+bool ScreenshotOcrController::openSpreadsheetFile() {
+    return m_session->openSpreadsheetFile();
+}
+
+void ScreenshotOcrController::undoTableEdit() {
+    m_session->undoTableEdit();
+}
+
+void ScreenshotOcrController::redoTableEdit() {
+    m_session->redoTableEdit();
+}
+
+void ScreenshotOcrController::undoTextEdit() {
+    m_session->undoTextEdit();
+}
+
+void ScreenshotOcrController::redoTextEdit() {
+    m_session->redoTextEdit();
+}
+
+void ScreenshotOcrController::setShowOriginalImage(bool show) {
+    m_session->setShowOriginalImage(show);
+}
+
+void ScreenshotOcrController::beginTextEditing() {
+    m_session->beginTextEditing();
+}
+
+void ScreenshotOcrController::beginTextTranslation() {
+    m_session->beginTextTranslation();
+}
+
+void ScreenshotOcrController::endTextEditing() {
+    m_session->endTextEditing();
+}
+
+void ScreenshotOcrController::openTranslationSettings() {
+    m_session->openTranslationSettings();
+}
+
+void ScreenshotOcrController::resetTextEditing() {
+    m_session->resetTextEditing();
+}
+
+void ScreenshotOcrController::applyTextFormatting(const QString& value) {
+    m_session->applyTextFormatting(value);
+}
+
+void ScreenshotOcrController::applyTextTargetLanguage(const QString& language) {
+    m_session->applyTextTargetLanguage(language);
+}
+
+void ScreenshotOcrController::requestTextTranslationServices() {
+    m_session->requestTextTranslationServices();
+}
+
+void ScreenshotOcrController::applyTextTranslationService(const QString& service) {
+    m_session->applyTextTranslationService(service);
+}
+
+void ScreenshotOcrController::applyTextPunctuation(const QString& value) {
+    m_session->applyTextPunctuation(value);
+}
+
+bool ScreenshotOcrController::editing() const {
+    return m_session->editing();
+}
+
+bool ScreenshotOcrController::translating() const {
+    return m_session->translating();
+}
+
+bool ScreenshotOcrController::hasTextResult() const {
+    return m_session->hasTextResult();
+}
+
+QString ScreenshotOcrController::sourceTextDraft() const {
+    return m_session->sourceTextDraft();
+}
+
+std::optional<ScreenshotRecognitionFileSnapshot> ScreenshotOcrController::fileExportSnapshot() {
+    return m_session->fileExportSnapshot();
+}
+
+void ScreenshotOcrController::seedImportedResults(
+    ScreenshotRecognitionResults results,
+    const ScreenshotClipboardOriginalContent& originalContent) {
+    const auto selection = m_context.selection.pixelSelection();
+    if (selection.isEmpty())
+        return;
+    const auto key = currentCacheKey();
+    auto image = composeScreenshotSourceSelection(m_context.displaySession, selection);
+    image = clipRecognitionSelection(std::move(image), m_context.selection);
+    if (image.isNull())
+        return;
+    m_importedTargetKey = key;
+    m_importedPlainText = originalContent.text;
+    m_importedFormattedDocument.reset();
+    if (!originalContent.html.isEmpty() || !originalContent.text.isEmpty()) {
+        m_importedFormattedDocument = std::make_shared<QTextDocument>();
+        if (!originalContent.html.isEmpty())
+            m_importedFormattedDocument->setHtml(originalContent.html);
+        else if (originalContent.textFormat == snow_shot::storage::PinnedTextFormat::Markdown) {
+            m_importedFormattedDocument =
+                std::make_shared<snow_shot::presentation::ScreenshotInertDocument>();
+            m_importedFormattedDocument->setMarkdown(originalContent.text,
+                                                     QTextDocument::MarkdownDialectGitHub);
+            m_importedPlainText = m_importedFormattedDocument->toPlainText();
+        } else
+            m_importedFormattedDocument->setPlainText(originalContent.text);
+        if (m_importedPlainText.isEmpty())
+            m_importedPlainText = m_importedFormattedDocument->toPlainText();
+    }
+    m_session->setTarget({key, std::move(image), QRectF(selection), m_importedFormattedDocument,
+                          m_importedPlainText});
+    results.key = key;
+    m_session->seedRecognitionResults(results);
+}
+
+ScreenshotRecognitionResults ScreenshotOcrController::cachedRecognitionResults() const {
+    return m_session->cachedRecognitionResults();
+}
+
+ScreenshotRecognitionResults ScreenshotOcrController::recognitionResultsSnapshot() const {
+    return m_session->recognitionResultsSnapshot();
+}
+
+void ScreenshotOcrController::setTextDraft(const QString& text) {
+    m_session->setTextDraft(text);
+}
+
+void ScreenshotOcrController::handleQrLinkActivated(const QUrl& url) {
+    const QString scheme = url.scheme().toLower();
+    if (!qrModeActive() || !url.isValid() || url.isRelative() || url.host().isEmpty() ||
+        (scheme != QStringLiteral("http") && scheme != QStringLiteral("https"))) {
+        return;
+    }
+    if (!QDesktopServices::openUrl(url)) {
+        showStatus(tr("Unable to open the recognized link"), true);
+        return;
+    }
+    QTimer::singleShot(0, this, [this]() {
+        if (qrModeActive()) {
+            m_context.cancelCapture();
+        }
+    });
+}
+
+void ScreenshotOcrController::deactivate() {
+    deactivateImpl(false);
+}
+
+void ScreenshotOcrController::deactivateForSelectionResize() {
+    deactivateImpl(true);
+}
+
+void ScreenshotOcrController::deactivateImpl(bool preserveRecognitionWindow) {
+    ++m_activationId;
+    m_copyAndEndCapture = false;
+    m_session->deactivate();
+    if (!m_active && m_canvasStates.isEmpty() && m_recognitionWindow == nullptr) {
+        return;
+    }
+    m_active = false;
+    clearOcrBackgroundFromOverlays();
+    if (!preserveRecognitionWindow) {
+        destroyRecognitionWindow();
+    }
+    m_context.displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr && overlay->canvas() != nullptr) {
+            overlay->canvas()->clearCursorForLayer(SnowCanvasCursorLayer::Host);
+        }
+    });
+    for (const CanvasState& state : std::as_const(m_canvasStates)) {
+        if (state.overlay != nullptr) {
+            state.overlay->setScreenshotSelectionBorderVisible(state.selectionBorderVisible);
+            if (state.hadSelection) {
+                state.overlay->setScreenshotSelection(m_context.selection.normalizedSelection(),
+                                                      state.selectionHandlesVisible,
+                                                      m_context.selection.cornerRadius());
+                if (!m_context.selection.rectangular())
+                    state.overlay->setScreenshotSelectionRegion(
+                        m_context.selection.selectionRegion(),
+                        m_context.selection.selectionRegion(), {}, false, {});
+            } else {
+                state.overlay->clearScreenshotSelection();
+            }
+        }
+        if (state.canvas != nullptr) {
+            state.canvas->setCanvasContentVisible(state.contentVisible);
+            state.canvas->setInteractionEnabled(state.interactionEnabled);
+        }
+    }
+    m_canvasStates.clear();
+}
+
+void ScreenshotOcrController::invalidateSession() {
+    m_importedTargetKey.clear();
+    m_importedFormattedDocument.reset();
+    m_importedPlainText.clear();
+    m_session->invalidate();
+    deactivate();
+    m_presentation.reset();
+    m_surfaceKey.clear();
+    m_surfaceImage = QImage();
+}
+
+void ScreenshotOcrController::restorePreviousToolAfterFailure() {
+    const ScreenshotActiveTool previousTool = m_previousTool;
+    deactivate();
+    if (previousTool == ScreenshotActiveTool::Move) {
+        m_context.interaction.setMoveTool(m_context.selection.hasPixelSelection(), false);
+    } else {
+        m_context.interaction.setCanvasTool(previousTool);
+    }
+    if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+        toolbar->setActiveTool(paletteTool(previousTool));
+    }
+    updateOverlays();
+}
+
+void ScreenshotOcrController::updateOverlays() const {
+    m_context.displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr && overlay->canvas() != nullptr) {
+            overlay->canvas()->update();
+        }
+    });
+}
+
+void ScreenshotOcrController::applyOcrBackgroundToOverlays(
+    const std::shared_ptr<ScreenshotOcrPresentation>& presentation, QImage filteredImage,
+    QRectF filteredImageCanvasRect) {
+    if (m_backgroundPresentation != presentation) {
+        m_filteredImage = {};
+        m_filteredCanvasRect = {};
+        m_backgroundPresentation = presentation;
+    }
+    if (!filteredImage.isNull()) {
+        m_filteredImage = filteredImage;
+        m_filteredCanvasRect =
+            filteredImageCanvasRect.isValid() && !filteredImageCanvasRect.isEmpty()
+                ? filteredImageCanvasRect.normalized()
+                : (presentation != nullptr ? QRectF(presentation->selection) : QRectF());
+    }
+    m_context.displaySession.forEachOverlay([this, &presentation, &filteredImage,
+                                             &filteredImageCanvasRect](
+                                                qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr) {
+            overlay->setScreenshotOcrVisible(!m_session->showOriginalImage());
+            overlay->setScreenshotOcrBackground(presentation);
+            if (!filteredImage.isNull()) {
+                const QRectF canvasRect =
+                    filteredImageCanvasRect.isValid() && !filteredImageCanvasRect.isEmpty()
+                        ? filteredImageCanvasRect.normalized()
+                        : (presentation != nullptr ? QRectF(presentation->selection) : QRectF());
+                overlay->setScreenshotOcrFilteredImage(filteredImage, canvasRect);
+            }
+        }
+    });
+}
+
+void ScreenshotOcrController::clearOcrBackgroundFromOverlays() {
+    m_filteredImage = {};
+    m_filteredCanvasRect = {};
+    m_backgroundPresentation.reset();
+    m_context.displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr) {
+            overlay->clearScreenshotOcrBackground();
+        }
+    });
+}
+
+bool ScreenshotOcrController::ensureRecognitionWindow() {
+    if (m_context.captureState.presentationSuppressed)
+        return false;
+    const QRect selection = m_context.selection.pixelSelection();
+    const QString key = currentCacheKey();
+    const QPointF center = QRectF(selection).center();
+    const CapturedDisplayModel* display =
+        m_context.geometry.displayForCanvasPoint(m_context.displaySession, center);
+    if (display == nullptr) {
+        display =
+            m_context.geometry.displayForCanvasRect(m_context.displaySession, QRectF(selection));
+    }
+    if (display == nullptr) {
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        return false;
+    }
+
+    ScreenshotOverlayWindow* overlay = m_context.displaySession.overlayForDisplay(display);
+    if (overlay == nullptr) {
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        return false;
+    }
+    QScreen* screen =
+        ScreenshotGeometryMapper::screenForCaptureDisplay(display->name, display->physicalRect);
+    if (screen == nullptr) {
+        screen = overlay->screen();
+    }
+    if (screen == nullptr) {
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        return false;
+    }
+
+    const ScreenshotRecognitionWindow::Config config{
+        screen,
+        overlay,
+        recognitionGeometryForDisplay(m_context.geometry, *display, QRectF(selection)),
+        QRectF(selection),
+    };
+    if (m_recognitionWindow != nullptr && m_surfaceKey == key) {
+        if (!m_recognitionWindow->present(config)) {
+            showStatus(tr("Unable to read the selected screenshot"), true);
+            return false;
+        }
+        if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+            toolbar->raise();
+        }
+        return true;
+    }
+
+    destroyRecognitionWindow();
+    QImage source = clipRecognitionSelection(
+        composeScreenshotSourceSelection(m_context.displaySession, selection), m_context.selection);
+    if (source.isNull()) {
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        return false;
+    }
+    auto* window = new ScreenshotRecognitionWindow(
+        ScreenshotRecognitionWindowActions{
+            [this]() { m_context.cancelCapture(); },
+            [this](const QString& text) { setTextDraft(text); },
+            [this](const ScreenshotTableCommandState& state) {
+                m_session->handleTableCommandState(state);
+            },
+            [this](const QString& message) { showStatus(message, false); },
+            [this](const QUrl& url) { handleQrLinkActivated(url); },
+            [this]() { undoTextEdit(); },
+            [this]() { redoTextEdit(); },
+            [this](const QPointF& globalPosition) {
+                return m_context.selectionResizeDragMode(
+                    m_context.geometry.canvasPositionForLogicalPoint(m_context.displaySession,
+                                                                     globalPosition));
+            },
+            [this](const QPointF& globalPosition) {
+                return m_context.beginSelectionResize(
+                    m_context.geometry.canvasPositionForLogicalPoint(m_context.displaySession,
+                                                                     globalPosition));
+            },
+            [this](const QPointF& globalPosition) {
+                m_context.updateSelectionResize(m_context.geometry.canvasPositionForLogicalPoint(
+                    m_context.displaySession, globalPosition));
+                updateRecognitionWindowGeometry();
+            },
+            [this](const QPointF& globalPosition) {
+                m_context.finishSelectionResize(m_context.geometry.canvasPositionForLogicalPoint(
+                    m_context.displaySession, globalPosition));
+                updateRecognitionWindowGeometry();
+            },
+            []() {},
+            [this]() { m_context.cancelCapture(); },
+        },
+        nullptr, ScreenshotRecognitionWindow::PresentationMode::TopLevelWindow,
+        m_context.shortcutManager);
+    window->setOriginalImagePreviewAboveSiblingProvider(
+        [this]() -> QWidget* { return m_context.overlayCoordinator.toolbar(); });
+    if (!window->present(config)) {
+        delete window;
+        showStatus(tr("Unable to read the selected screenshot"), true);
+        return false;
+    }
+
+    m_surfaceKey = key;
+    m_surfaceImage = std::move(source);
+    m_recognitionWindow = window;
+    if (ScreenshotToolbarWindow* toolbar = m_context.overlayCoordinator.toolbar()) {
+        toolbar->raise();
+    }
+    return true;
+}
+
+void ScreenshotOcrController::updateRecognitionWindowGeometry() {
+    if (m_recognitionWindow == nullptr) {
+        return;
+    }
+    const QRectF selection = m_context.selection.normalizedSelection();
+    const CapturedDisplayModel* display =
+        m_context.geometry.displayForCanvasPoint(m_context.displaySession, selection.center());
+    if (display == nullptr) {
+        display = m_context.geometry.displayForCanvasRect(m_context.displaySession, selection);
+    }
+    if (display == nullptr) {
+        return;
+    }
+    static_cast<void>(m_recognitionWindow->updateSelectionGeometry(
+        recognitionGeometryForDisplay(m_context.geometry, *display, selection), selection));
+}
+
+void ScreenshotOcrController::destroyRecognitionWindow() {
+    if (m_recognitionWindow != nullptr) {
+        delete m_recognitionWindow.data();
+        m_recognitionWindow = nullptr;
+    }
+    m_surfaceKey.clear();
+    m_surfaceImage = QImage();
+}
+
+void ScreenshotOcrController::showStatus(const QString& message, bool error) const {
+    if (m_context.captureState.presentationSuppressed)
+        return;
+    if (message.isEmpty()) {
+        return;
+    }
+    if (error) {
+        m_messages->error(QString::fromLatin1(kStatusMessageKey), message, {},
+                          m_recognitionWindow.data());
+    } else {
+        m_messages->warning(QString::fromLatin1(kStatusMessageKey), message, {},
+                            m_recognitionWindow.data());
+    }
+}
+
+QJsonObject ScreenshotOcrController::workflowState() const {
+    return m_session->workflowState();
+}
+QJsonObject ScreenshotOcrController::workflowResult() const {
+    return m_session->workflowResult();
+}
+bool ScreenshotOcrController::editWorkflow(const QJsonObject& params) {
+    return m_session->editWorkflow(params);
+}
+void ScreenshotOcrController::cancelWorkflow() {
+    m_session->cancelWorkflow();
+}

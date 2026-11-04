@@ -1,0 +1,1084 @@
+use std::collections::{BTreeSet, HashMap};
+
+use crate::history::HistoryStore;
+use snow_draw_engine_core::{
+    Camera, EngineConfig as ViewEngineConfig, ErrorCode, GridConfig, Point, SnapConfig,
+};
+use snow_draw_engine_display::{PatchCursor, ViewportPatch};
+use snow_draw_engine_document::{ElementId, SpotlightConfig, WatermarkConfig};
+use snow_draw_engine_editor::{
+    ActiveTool, ApplyTransactionCommand, DocumentSyncSnapshot, EditorCommand, EditorSession,
+    EditorSessionSnapshot, EditorStyleDefaults, EditorViewportState, FilterStyle, HistoryState,
+    RectangleShapeStyle, SerialNumberToolbarState, ShapeStylePatch, StyleToolbarState,
+};
+use snow_draw_engine_interaction::{InputEvent, InteractionOutput};
+use snow_draw_engine_model::DocumentModel;
+use snow_draw_engine_scene::{DocumentSceneCache, ViewportComposer};
+
+#[cfg(test)]
+mod angle_tests;
+mod annotations;
+#[cfg(test)]
+mod auto_filter_tests;
+#[cfg(test)]
+mod automatic_selection_tests;
+#[cfg(test)]
+mod bracket_tests;
+#[cfg(test)]
+mod distance_tests;
+mod document_commands;
+#[cfg(test)]
+mod duplicate_drag_tests;
+#[cfg(test)]
+mod eraser_filter_tests;
+#[cfg(test)]
+mod filter_snap_tests;
+#[cfg(test)]
+mod free_draw_continuation_tests;
+mod input;
+#[cfg(test)]
+mod magnifier_binding_tests;
+#[cfg(test)]
+mod magnifier_drag_style_tests;
+#[cfg(test)]
+mod magnifier_group_move_tests;
+#[cfg(test)]
+mod magnifier_lifecycle_tests;
+#[cfg(test)]
+mod magnifier_tests;
+mod mutations;
+#[cfg(test)]
+mod pen_highlight_angle_tests;
+#[cfg(test)]
+mod retained_tests;
+#[cfg(test)]
+mod rounded_diamond_tests;
+#[cfg(test)]
+mod shape_text_tests;
+#[cfg(test)]
+mod speech_bubble_tests;
+#[cfg(test)]
+mod spotlight_shape_tests;
+mod text_commands;
+mod viewports;
+
+pub use text_commands::TextElementInfo;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StyleDefaults {
+    pub editor: EditorStyleDefaults,
+    pub watermark: WatermarkConfig,
+    pub spotlight: SpotlightConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineConfig {
+    pub style_defaults: StyleDefaults,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ViewportConfig {
+    pub engine: ViewEngineConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ViewportId(pub u64);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MutationResult {
+    pub changed_viewports: Vec<ViewportId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputUpdate {
+    pub interaction: InteractionOutput,
+    pub changed_viewports: Vec<ViewportId>,
+}
+
+#[derive(Debug)]
+struct ViewportSlot {
+    view: EditorViewportState,
+    composer: ViewportComposer,
+    retained: Option<std::cell::RefCell<snow_draw_engine_scene::RetainedSceneComposer>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SpeechBubbleLayoutOrigin {
+    revision: snow_draw_engine_document::DocumentRevision,
+    history_generation: u64,
+    owners:
+        HashMap<snow_draw_engine_document::ElementId, (snow_draw_engine_document::ElementId, u64)>,
+}
+
+#[derive(Debug)]
+pub struct Engine {
+    pub(crate) config: EngineConfig,
+    pub(crate) model: DocumentModel,
+    pub(crate) history: HistoryStore,
+    pub(crate) editor: EditorSession,
+    pub(crate) session_config_seeded: bool,
+    pub(crate) scene_cache: DocumentSceneCache,
+    viewports: HashMap<ViewportId, ViewportSlot>,
+    next_viewport_id: u64,
+    presentation_update_depth: u32,
+    pending_viewports: BTreeSet<ViewportId>,
+    pub(crate) speech_bubble_layout_origin: Option<SpeechBubbleLayoutOrigin>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new(EngineConfig::default())
+    }
+}
+
+impl Engine {
+    pub fn has_pointer_capture(&self) -> bool {
+        self.editor.has_pointer_capture()
+    }
+
+    pub fn has_active_interaction(&self) -> bool {
+        self.editor.has_active_interaction()
+    }
+
+    pub fn new(config: EngineConfig) -> Self {
+        Self::try_new(config).expect("runtime config should be valid")
+    }
+
+    pub fn try_new(mut config: EngineConfig) -> Result<Self, ErrorCode> {
+        config.style_defaults.watermark.template_application_time = config
+            .style_defaults
+            .watermark
+            .template_application_time
+            .filter(|time| time.is_valid());
+        validate_style_defaults(&config.style_defaults)?;
+        let mut model = DocumentModel::default();
+        let mut initial_config = snow_draw_engine_document::Transaction::new("runtime defaults");
+        initial_config.update_watermark(config.style_defaults.watermark.clone());
+        initial_config.update_spotlight(config.style_defaults.spotlight);
+        model.apply_transaction(initial_config)?;
+        let mut engine = Self {
+            editor: EditorSession::new_with_style_defaults(
+                ViewEngineConfig::default(),
+                &config.style_defaults.editor,
+            )?,
+            config,
+            model,
+            history: HistoryStore::default(),
+            session_config_seeded: false,
+            scene_cache: DocumentSceneCache::default(),
+            viewports: HashMap::new(),
+            next_viewport_id: 0,
+            presentation_update_depth: 0,
+            pending_viewports: BTreeSet::new(),
+            speech_bubble_layout_origin: None,
+        };
+        engine.scene_cache.sync(&engine.model, None);
+        Ok(engine)
+    }
+
+    pub fn style_defaults(&self) -> &StyleDefaults {
+        &self.config.style_defaults
+    }
+
+    pub fn clear_document_preserving_viewports(&mut self) -> Result<MutationResult, ErrorCode> {
+        // Clearing a document must discard document/transient state without
+        // discarding the user's current creation appearance. Serial numbering
+        // belongs to the old document and restarts from the runtime profile.
+        // Most styles live in the editor session; watermark appearance and
+        // spotlight style are document-wide configuration, so carry those fields
+        // explicitly while dropping watermark content from the old document.
+        let mut watermark = self.model.watermark_config().clone();
+        watermark.text = String::new();
+        watermark.template_value = String::new();
+        watermark.template_application_time = None;
+        let spotlight = self.model.spotlight_config();
+        let mut replacement = Self::try_new(self.config.clone())?;
+        let mut retained_styles = snow_draw_engine_document::Transaction::new("retained styles");
+        retained_styles.update_watermark(watermark);
+        retained_styles.update_spotlight(spotlight);
+        replacement.model.apply_transaction(retained_styles)?;
+        self.model = replacement.model;
+        self.history = HistoryStore::default();
+        self.speech_bubble_layout_origin = None;
+        self.editor
+            .reset_document_retained_state(&self.config.style_defaults.editor.serial_number);
+        self.session_config_seeded = false;
+        self.scene_cache = DocumentSceneCache::default();
+        self.scene_cache.sync(&self.model, None);
+        for slot in self.viewports.values_mut() {
+            slot.composer.reset_document_retained_state();
+            if let Some(retained) = &mut slot.retained {
+                retained.get_mut().invalidate_document();
+            }
+        }
+        self.refresh_all_viewports()
+    }
+
+    pub(crate) fn clone_document_session(&self) -> Self {
+        let mut engine = Self {
+            config: self.config.clone(),
+            model: self.model.clone(),
+            history: self.history.clone(),
+            editor: self.editor.clone(),
+            session_config_seeded: self.session_config_seeded,
+            scene_cache: DocumentSceneCache::default(),
+            viewports: self
+                .viewports
+                .iter()
+                .map(|(id, slot)| {
+                    (
+                        *id,
+                        ViewportSlot {
+                            view: slot.view,
+                            composer: ViewportComposer::new(),
+                            retained: slot.retained.as_ref().map(|_| {
+                                std::cell::RefCell::new(
+                                    snow_draw_engine_scene::RetainedSceneComposer::new(),
+                                )
+                            }),
+                        },
+                    )
+                })
+                .collect(),
+            next_viewport_id: self.next_viewport_id,
+            presentation_update_depth: 0,
+            pending_viewports: BTreeSet::new(),
+            speech_bubble_layout_origin: None,
+        };
+        engine.editor.reset_magnifier_wheel_input();
+        engine.editor.reset_pointer_capture_state();
+        engine.scene_cache.sync(&engine.model, None);
+        let _ = engine.refresh_all_viewports();
+        engine
+    }
+
+    pub fn clone_document_session_with_config(
+        &self,
+        config: EngineConfig,
+    ) -> Result<Self, ErrorCode> {
+        validate_style_defaults(&config.style_defaults)?;
+        let mut clone = self.clone_document_session();
+        clone.config = config;
+        Ok(clone)
+    }
+
+    pub fn viewport_active_tool(&self, id: ViewportId) -> Result<ActiveTool, ErrorCode> {
+        self.ensure_viewport(id)?;
+        Ok(self.editor.active_tool())
+    }
+
+    pub fn set_viewport_active_tool(
+        &mut self,
+        id: ViewportId,
+        tool: ActiveTool,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        self.editor.set_active_tool(tool)?;
+        self.history.break_angle_wheel_coalescing();
+        self.refresh_after_session_mutation(before)
+    }
+
+    pub fn set_automatically_select_newly_created_elements(
+        &mut self,
+        enabled: bool,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.editor
+            .set_automatically_select_newly_created_elements(enabled);
+        Ok(MutationResult::default())
+    }
+
+    pub fn set_automatic_selection_excluded_tools(
+        &mut self,
+        tools: u64,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.editor.set_automatic_selection_excluded_tools(tools);
+        Ok(MutationResult::default())
+    }
+
+    pub fn quick_selection_disabled_tools(&self) -> u64 {
+        self.editor.quick_selection_disabled_tools()
+    }
+
+    pub fn set_quick_selection_disabled_tools(
+        &mut self,
+        tools: u64,
+    ) -> Result<MutationResult, ErrorCode> {
+        if self.editor.quick_selection_disabled_tools() == tools {
+            return Ok(MutationResult::default());
+        }
+        self.editor.set_quick_selection_disabled_tools(tools);
+        self.refresh_all_viewports()
+    }
+
+    pub fn viewport_snap_config(&self, id: ViewportId) -> Result<SnapConfig, ErrorCode> {
+        self.ensure_viewport(id)?;
+        Ok(self.editor.snap_config())
+    }
+
+    pub fn set_viewport_snap_config(
+        &mut self,
+        id: ViewportId,
+        snap: SnapConfig,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        self.editor.set_snap_config(snap)?;
+        self.refresh_after_session_mutation(before)
+    }
+
+    pub fn viewport_grid_config(&self, id: ViewportId) -> Result<GridConfig, ErrorCode> {
+        self.ensure_viewport(id)?;
+        Ok(self.editor.grid_config())
+    }
+
+    pub fn set_viewport_grid_config(
+        &mut self,
+        id: ViewportId,
+        grid: GridConfig,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        self.editor.set_grid_config(grid)?;
+        self.refresh_after_session_mutation(before)
+    }
+
+    pub fn viewport_style_toolbar_state(
+        &self,
+        id: ViewportId,
+    ) -> Result<StyleToolbarState, ErrorCode> {
+        self.ensure_viewport(id)?;
+        Ok(StyleToolbarState {
+            source: self.editor.style_toolbar_source(&self.model),
+            selected_element_count: self.editor.selected_element_count(&self.model) as u32,
+            shape_style: self.editor.shape_style(&self.model),
+            text_style: self.editor.text_style(&self.model),
+            serial_number_style: self.editor.serial_number_style(&self.model),
+            text_style_mixed: self.editor.text_style_mixed(&self.model),
+            serial_number_style_mixed: self.editor.serial_number_style_mixed(&self.model),
+            shape_style_mixed: self.editor.shape_style_mixed(&self.model),
+            filter_style: self.editor.filter_style(&self.model),
+            filter_style_mixed: self.editor.filter_style_mixed(&self.model),
+            brush_eraser_style: self.editor.brush_eraser_style(),
+            distance_style: self.editor.distance_style(&self.model),
+            distance_style_mixed: self.editor.distance_style_mixed(&self.model),
+            angle_style: self.editor.angle_style(&self.model),
+            bracket_style: self.editor.bracket_style(&self.model),
+            angle_style_mixed: self.editor.angle_style_mixed(&self.model),
+            bracket_style_mixed: self.editor.bracket_style_mixed(&self.model),
+            magnifier_style: self.editor.magnifier_style(&self.model),
+            magnifier_style_mixed: self.editor.magnifier_style_mixed(&self.model),
+            distance_measured_length: self.editor.distance_measured_length(&self.model),
+        })
+    }
+
+    pub fn viewport_serial_number_toolbar_state(
+        &self,
+        id: ViewportId,
+    ) -> Result<SerialNumberToolbarState, ErrorCode> {
+        let slot = self.viewport_slot(id)?;
+        Ok(self
+            .editor
+            .serial_number_toolbar_state(&self.model, &slot.view))
+    }
+
+    pub fn viewport_rectangle_shape_style(
+        &self,
+        id: ViewportId,
+    ) -> Result<RectangleShapeStyle, ErrorCode> {
+        self.ensure_viewport(id)?;
+        Ok(self.editor.rectangle_shape_style(&self.model))
+    }
+
+    pub fn set_viewport_magnifier_style_patch(
+        &mut self,
+        id: ViewportId,
+        style: snow_draw_engine_editor::MagnifierStyle,
+        properties: u32,
+        creation_defaults: bool,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        if let Some(command) = self.editor.set_magnifier_style_patch(
+            &self.model,
+            style,
+            properties,
+            creation_defaults,
+        )? {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_angle_style_patch(
+        &mut self,
+        id: ViewportId,
+        style: snow_draw_engine_editor::AngleStyle,
+        properties: u32,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        if let Some(command) = self
+            .editor
+            .set_angle_style_patch(&self.model, style, properties)?
+        {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_bracket_style_patch(
+        &mut self,
+        id: ViewportId,
+        style: snow_draw_engine_editor::BracketStyle,
+        properties: u32,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        if let Some(command) =
+            self.editor
+                .set_bracket_style_patch(&self.model, style, properties)?
+        {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn adjust_viewport_angle_value(
+        &mut self,
+        id: ViewportId,
+        delta_radians: f64,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before_scene = self.editor.scene_input_revision();
+        let before_overlay = self.editor.overlay_input_revision();
+        if let Some(command) = self.editor.adjust_angle_value(&self.model, delta_radians)? {
+            self.apply_editor_command(id, command)
+        } else if self.editor.scene_input_revision() != before_scene
+            || self.editor.overlay_input_revision() != before_overlay
+        {
+            self.refresh_all_viewports()
+        } else {
+            Ok(MutationResult::default())
+        }
+    }
+
+    pub fn set_viewport_distance_style_patch(
+        &mut self,
+        id: ViewportId,
+        style: snow_draw_engine_editor::DistanceStyle,
+        properties: u32,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        let command = self
+            .editor
+            .set_distance_style_patch(&self.model, style, properties)?;
+        if let Some(command) = command {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_distance_pixel_scale(
+        &mut self,
+        id: ViewportId,
+        scale: Point<f64>,
+    ) -> Result<MutationResult, ErrorCode> {
+        if !scale.x.is_finite() || scale.x <= 0.0 || !scale.y.is_finite() || scale.y <= 0.0 {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        self.viewport_slot_mut(id)?.view.distance_pixel_scale = scale;
+        Ok(MutationResult::default())
+    }
+
+    pub fn set_viewport_shape_style_patch(
+        &mut self,
+        id: ViewportId,
+        patch: ShapeStylePatch,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        let command = self.editor.set_shape_style_patch(&self.model, patch)?;
+        if let Some(command) = command {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_filter_style(
+        &mut self,
+        id: ViewportId,
+        style: FilterStyle,
+        properties: u32,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        let command = self
+            .editor
+            .set_filter_style(&self.model, style, properties)?;
+        if let Some(command) = command {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_brush_eraser_creation_style(
+        &mut self,
+        id: ViewportId,
+        style: snow_draw_engine_editor::BrushEraserStyle,
+        properties: u32,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        self.editor
+            .set_brush_eraser_creation_style(style, properties)?;
+        self.refresh_after_session_mutation(before)
+    }
+
+    pub fn set_viewport_filter_creation_style(
+        &mut self,
+        id: ViewportId,
+        style: FilterStyle,
+        properties: u32,
+        tool: ActiveTool,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        self.editor
+            .set_filter_creation_style(style, properties, tool)?;
+        self.refresh_after_session_mutation(before)
+    }
+
+    pub fn watermark_config(&self) -> &WatermarkConfig {
+        self.model.watermark_config()
+    }
+
+    pub fn set_viewport_watermark_config(
+        &mut self,
+        id: ViewportId,
+        config: WatermarkConfig,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        if let Some(command) = self.editor.set_watermark_config(&self.model, config)? {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn spotlight_config(&self) -> SpotlightConfig {
+        self.model.spotlight_config()
+    }
+
+    pub fn set_viewport_spotlight_config(
+        &mut self,
+        id: ViewportId,
+        config: SpotlightConfig,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        if let Some(command) = self.editor.set_spotlight_config(&self.model, config)? {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+
+    pub fn set_viewport_rectangle_shape_style(
+        &mut self,
+        id: ViewportId,
+        style: RectangleShapeStyle,
+    ) -> Result<MutationResult, ErrorCode> {
+        self.ensure_viewport(id)?;
+        let before = self.editor.snapshot();
+        let command = self.editor.set_rectangle_shape_style(&self.model, style)?;
+        if let Some(command) = command {
+            self.apply_editor_command(id, command)
+        } else {
+            self.refresh_after_session_mutation(before)
+        }
+    }
+}
+
+fn validate_style_defaults(defaults: &StyleDefaults) -> Result<(), ErrorCode> {
+    snow_draw_engine_editor::validate_editor_style_defaults(&defaults.editor)?;
+    snow_draw_engine_document::validate_watermark_config(&defaults.watermark)?;
+    snow_draw_engine_document::validate_spotlight_config(&defaults.spotlight)?;
+    if !(0.0..=1.0).contains(&defaults.watermark.opacity)
+        || defaults.watermark.gap <= 0.0
+        || !(0.0..=1.0).contains(&defaults.spotlight.opacity)
+        || defaults.watermark.text.trim() != defaults.watermark.text
+        || defaults.watermark.font_family.trim() != defaults.watermark.font_family
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snow_draw_engine_core::{ColorRgba8, CornerRadii};
+    use snow_draw_engine_document::{CanvasFilterType, FillStyle};
+    use snow_draw_engine_editor::FILTER_STYLE_PROPERTY_ALL;
+
+    #[test]
+    fn filter_creation_style_synchronizes_views_without_tool_or_history_changes() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let first = engine.create_viewport(ViewportConfig::default()).unwrap();
+        let second = engine.create_viewport(ViewportConfig::default()).unwrap();
+        engine
+            .set_viewport_active_tool(first, ActiveTool::PenFilter)
+            .unwrap();
+        let history = engine.serialize_document_history().unwrap();
+        let style = FilterStyle {
+            filter_type: CanvasFilterType::GaussianBlur,
+            strength: 0.3,
+            opacity: 0.6,
+            stroke_width: 20.0,
+        };
+        let result = engine
+            .set_viewport_filter_creation_style(
+                first,
+                style,
+                FILTER_STYLE_PROPERTY_ALL,
+                ActiveTool::PenFilter,
+            )
+            .unwrap();
+        assert!(
+            result.changed_viewports.is_empty(),
+            "creation defaults alone must not invalidate rendered patches"
+        );
+        for viewport in [first, second] {
+            assert_eq!(
+                engine.viewport_active_tool(viewport).unwrap(),
+                ActiveTool::PenFilter
+            );
+            assert_eq!(
+                engine
+                    .viewport_style_toolbar_state(viewport)
+                    .unwrap()
+                    .filter_style,
+                style
+            );
+        }
+        assert_eq!(engine.serialize_document_history().unwrap(), history);
+        for _ in 0..128 {
+            assert!(
+                engine
+                    .set_viewport_filter_creation_style(
+                        first,
+                        style,
+                        FILTER_STYLE_PROPERTY_ALL,
+                        ActiveTool::PenFilter
+                    )
+                    .unwrap()
+                    .changed_viewports
+                    .is_empty()
+            );
+        }
+        let before = engine.serialize_document_session().unwrap();
+        assert_eq!(
+            engine
+                .set_viewport_filter_creation_style(
+                    first,
+                    style,
+                    FILTER_STYLE_PROPERTY_ALL,
+                    ActiveTool::Shape
+                )
+                .unwrap_err(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(engine.serialize_document_session().unwrap(), before);
+    }
+
+    fn custom_config(seed: u8) -> EngineConfig {
+        let mut defaults = StyleDefaults::default();
+        let color = ColorRgba8 {
+            r: seed,
+            g: seed.wrapping_add(1),
+            b: seed.wrapping_add(2),
+            a: 0x80,
+        };
+        defaults.editor.rectangle.fill = color;
+        defaults.editor.rectangle.fill_style = FillStyle::CrossLine;
+        defaults.editor.rectangle.stroke_width = 3.0;
+        defaults.editor.rectangle.corner_radii = CornerRadii::splat(4.0);
+        defaults.editor.arrow.stroke = color;
+        defaults.editor.arrow.stroke_width = 4.0;
+        defaults.editor.line.stroke = color;
+        defaults.editor.line.stroke_width = 5.0;
+        defaults.editor.line.opacity = 0.91;
+        defaults.editor.free_draw.stroke = color;
+        defaults.editor.free_draw.stroke_width = 6.0;
+        defaults.editor.free_draw.opacity = 0.81;
+        defaults.editor.rectangle_highlight.fill = color;
+        defaults.editor.rectangle_highlight.stroke_width = 7.0;
+        defaults.editor.rectangle_highlight.opacity = 0.71;
+        defaults.editor.pen_highlight.stroke = color;
+        defaults.editor.pen_highlight.stroke_width = 8.0;
+        defaults.editor.pen_highlight.opacity = 0.61;
+        defaults.editor.rectangle_filter = FilterStyle {
+            filter_type: CanvasFilterType::GaussianBlur,
+            strength: 0.42,
+            opacity: 0.52,
+            stroke_width: 9.0,
+        };
+        defaults.editor.pen_filter = FilterStyle {
+            filter_type: CanvasFilterType::Inversion,
+            strength: 0.43,
+            opacity: 0.53,
+            stroke_width: 10.0,
+        };
+        defaults.editor.text.color = color;
+        defaults.editor.text.font_size = 31.0;
+        defaults.editor.text.font_family = Some(format!("Text {seed}"));
+        defaults.editor.text.opacity = 0.72;
+        defaults.editor.serial_number.number = i64::from(seed);
+        defaults.editor.serial_number.color = color;
+        defaults.editor.serial_number.font_size = 25.0;
+        defaults.editor.serial_number.font_family = Some(format!("Serial {seed}"));
+        defaults.editor.serial_number.opacity = 0.73;
+        defaults.watermark.color = color;
+        defaults.watermark.text = format!("Watermark{seed}");
+        defaults.watermark.font_size = 13.0;
+        defaults.watermark.font_family = format!("Watermark {seed}");
+        defaults.watermark.angle = 21.0;
+        defaults.watermark.gap = 44.0;
+        defaults.watermark.opacity = 0.23;
+        defaults.spotlight.color = color;
+        defaults.spotlight.opacity = 0.63;
+        EngineConfig {
+            style_defaults: defaults,
+        }
+    }
+
+    fn watermark_appearance(mut config: WatermarkConfig) -> WatermarkConfig {
+        config.text.clear();
+        config.template_value.clear();
+        config.template_application_time = None;
+        config
+    }
+
+    fn assert_editor_defaults(
+        engine: &mut Engine,
+        viewport: ViewportId,
+        expected: &EditorStyleDefaults,
+    ) {
+        assert_eq!(
+            engine.viewport_rectangle_shape_style(viewport).unwrap(),
+            expected.rectangle
+        );
+        assert_eq!(engine.editor.arrow_style(&engine.model), expected.arrow);
+
+        for (tool, style) in [
+            (ActiveTool::Line, expected.line),
+            (ActiveTool::FreeDraw, expected.free_draw),
+            (ActiveTool::RectangleHighlight, expected.rectangle_highlight),
+            (ActiveTool::PenHighlight, expected.pen_highlight),
+        ] {
+            engine.set_viewport_active_tool(viewport, tool).unwrap();
+            assert_eq!(
+                engine
+                    .viewport_style_toolbar_state(viewport)
+                    .unwrap()
+                    .shape_style,
+                style
+            );
+        }
+
+        for (tool, style) in [
+            (ActiveTool::RectangleFilter, expected.rectangle_filter),
+            (ActiveTool::AutoFilter, expected.rectangle_filter),
+            (
+                ActiveTool::PenFilter,
+                FilterStyle {
+                    strength: expected.rectangle_filter.strength,
+                    ..expected.pen_filter
+                },
+            ),
+        ] {
+            engine.set_viewport_active_tool(viewport, tool).unwrap();
+            assert_eq!(
+                engine
+                    .viewport_style_toolbar_state(viewport)
+                    .unwrap()
+                    .filter_style,
+                style
+            );
+        }
+
+        engine
+            .set_viewport_active_tool(viewport, ActiveTool::Text)
+            .unwrap();
+        assert_eq!(
+            engine
+                .viewport_style_toolbar_state(viewport)
+                .unwrap()
+                .text_style,
+            expected.text
+        );
+        engine
+            .set_viewport_active_tool(viewport, ActiveTool::SerialNumber)
+            .unwrap();
+        assert_eq!(
+            engine
+                .viewport_style_toolbar_state(viewport)
+                .unwrap()
+                .serial_number_style,
+            expected.serial_number
+        );
+    }
+
+    #[test]
+    fn clear_preserves_current_creation_styles_without_watermark_content() {
+        let config = custom_config(17);
+        let mut engine = Engine::try_new(config.clone()).unwrap();
+        assert_eq!(engine.style_defaults(), &config.style_defaults);
+        assert_eq!(engine.watermark_config(), &config.style_defaults.watermark);
+        assert_eq!(engine.spotlight_config(), config.style_defaults.spotlight);
+
+        let viewport = engine
+            .create_viewport(ViewportConfig {
+                engine: ViewEngineConfig {
+                    snap: SnapConfig {
+                        enabled: true,
+                        ..SnapConfig::default()
+                    },
+                    ..ViewEngineConfig::default()
+                },
+            })
+            .unwrap();
+        assert_editor_defaults(&mut engine, viewport, &config.style_defaults.editor);
+
+        let mut changed_rectangle = config.style_defaults.editor.rectangle;
+        changed_rectangle.stroke_width = 22.0;
+        engine
+            .set_viewport_rectangle_shape_style(viewport, changed_rectangle)
+            .unwrap();
+        let mut changed_filter = config.style_defaults.editor.pen_filter;
+        changed_filter.stroke_width = 33.0;
+        engine
+            .set_viewport_active_tool(viewport, ActiveTool::PenFilter)
+            .unwrap();
+        engine
+            .set_viewport_filter_style(viewport, changed_filter, FILTER_STYLE_PROPERTY_ALL)
+            .unwrap();
+        let mut changed_watermark = config.style_defaults.watermark.clone();
+        changed_watermark.text = "old document".to_owned();
+        changed_watermark.template_value = "{text}-{YYYY}".to_owned();
+        changed_watermark.template_application_time = Some(
+            snow_draw_engine_document::WatermarkTemplateApplicationTime {
+                year: 2026,
+                month: 9,
+                day: 15,
+                hour: 12,
+                minute: 34,
+                second: 56,
+            },
+        );
+        changed_watermark.opacity = 0.87;
+        engine
+            .set_viewport_watermark_config(viewport, changed_watermark.clone())
+            .unwrap();
+        let changed_spotlight = SpotlightConfig {
+            opacity: 0.29,
+            ..config.style_defaults.spotlight
+        };
+        engine
+            .set_viewport_spotlight_config(viewport, changed_spotlight)
+            .unwrap();
+
+        engine.clear_document_preserving_viewports().unwrap();
+        let mut expected_editor = config.style_defaults.editor.clone();
+        expected_editor.rectangle = changed_rectangle;
+        expected_editor.pen_filter = changed_filter;
+        expected_editor.rectangle_filter.strength = changed_filter.strength;
+        assert_editor_defaults(&mut engine, viewport, &expected_editor);
+        assert_eq!(
+            engine.watermark_config(),
+            &watermark_appearance(changed_watermark)
+        );
+        assert_eq!(engine.spotlight_config(), changed_spotlight);
+        assert_eq!(engine.history_state(), HistoryState::default());
+        assert_eq!(engine.style_defaults(), &config.style_defaults);
+        assert_eq!(engine.watermark_config().text.capacity(), 0);
+        assert_eq!(engine.watermark_config().template_value.capacity(), 0);
+    }
+
+    #[test]
+    fn invalid_profiles_are_rejected_without_filter_role_ambiguity() {
+        let mut config = custom_config(23);
+        config.style_defaults.editor.rectangle_filter.stroke_width = 0.0;
+        config.style_defaults.editor.pen_filter.stroke_width = 0.0;
+        assert_eq!(
+            Engine::try_new(config).unwrap_err(),
+            ErrorCode::InvalidArgument
+        );
+
+        let mut config = custom_config(24);
+        config.style_defaults.editor.rectangle_filter.stroke_width = 0.0;
+        assert!(Engine::try_new(config).is_ok());
+
+        let mut config = custom_config(25);
+        config.style_defaults.editor.text.font_size = f64::NAN;
+        assert_eq!(
+            Engine::try_new(config).unwrap_err(),
+            ErrorCode::InvalidArgument
+        );
+
+        let mut config = custom_config(26);
+        config.style_defaults.watermark.opacity = 1.1;
+        assert_eq!(
+            Engine::try_new(config).unwrap_err(),
+            ErrorCode::InvalidArgument
+        );
+
+        let mut config = custom_config(27);
+        config.style_defaults.spotlight.opacity = -0.1;
+        assert_eq!(
+            Engine::try_new(config).unwrap_err(),
+            ErrorCode::InvalidArgument
+        );
+
+        let mut config = custom_config(28);
+        config.style_defaults.watermark.template_application_time = Some(
+            snow_draw_engine_document::WatermarkTemplateApplicationTime {
+                year: 2025,
+                month: 2,
+                day: 29,
+                hour: 12,
+                minute: 34,
+                second: 56,
+            },
+        );
+        let engine = Engine::try_new(config).unwrap();
+        assert_eq!(
+            engine.style_defaults().watermark.template_application_time,
+            None
+        );
+        assert_eq!(engine.watermark_config().template_application_time, None);
+    }
+
+    #[test]
+    fn restore_and_clone_clear_with_current_creation_styles() {
+        let source_config = custom_config(31);
+        let target_config = custom_config(71);
+        let mut source = Engine::try_new(source_config).unwrap();
+        let source_viewport = source.create_viewport(ViewportConfig::default()).unwrap();
+        let mut edited_rectangle = source
+            .viewport_rectangle_shape_style(source_viewport)
+            .unwrap();
+        edited_rectangle.stroke_width = 41.0;
+        source
+            .set_viewport_rectangle_shape_style(source_viewport, edited_rectangle)
+            .unwrap();
+        let mut edited_watermark = source.watermark_config().clone();
+        edited_watermark.text = "Edited".to_owned();
+        source
+            .set_viewport_watermark_config(source_viewport, edited_watermark.clone())
+            .unwrap();
+
+        let session = source.serialize_document_session().unwrap();
+        let history = source.serialize_document_history().unwrap();
+
+        let mut full =
+            Engine::from_serialized_document_session_with_config(&session, target_config.clone())
+                .unwrap();
+        let full_viewport = full.create_viewport(ViewportConfig::default()).unwrap();
+        assert_eq!(
+            full.viewport_rectangle_shape_style(full_viewport).unwrap(),
+            edited_rectangle
+        );
+        assert_eq!(full.watermark_config(), &edited_watermark);
+        assert_eq!(full.style_defaults(), &target_config.style_defaults);
+        full.clear_document_preserving_viewports().unwrap();
+        let mut expected_full_editor = source.style_defaults().editor.clone();
+        expected_full_editor.rectangle = edited_rectangle;
+        // Clearing the restored document retains appearance but starts a new
+        // numbering session using the receiving runtime's profile.
+        expected_full_editor.serial_number.number =
+            target_config.style_defaults.editor.serial_number.number;
+        assert_editor_defaults(
+            &mut full,
+            full_viewport,
+            &EditorStyleDefaults {
+                ..expected_full_editor
+            },
+        );
+        let expected_watermark = watermark_appearance(edited_watermark.clone());
+        assert_eq!(full.watermark_config(), &expected_watermark);
+
+        let mut history_only =
+            Engine::from_serialized_document_history_with_config(&history, target_config.clone())
+                .unwrap();
+        let history_viewport = history_only
+            .create_viewport(ViewportConfig::default())
+            .unwrap();
+        assert_editor_defaults(
+            &mut history_only,
+            history_viewport,
+            &target_config.style_defaults.editor,
+        );
+        assert_eq!(history_only.watermark_config(), &edited_watermark);
+        history_only.clear_document_preserving_viewports().unwrap();
+        assert_eq!(history_only.watermark_config(), &expected_watermark);
+
+        let mut cloned = source
+            .clone_document_session_with_config(target_config.clone())
+            .unwrap();
+        assert_eq!(
+            cloned
+                .viewport_rectangle_shape_style(source_viewport)
+                .unwrap(),
+            edited_rectangle
+        );
+        assert_eq!(cloned.watermark_config(), &edited_watermark);
+        assert_eq!(cloned.style_defaults(), &target_config.style_defaults);
+        cloned.clear_document_preserving_viewports().unwrap();
+        let mut expected_clone_editor = source.style_defaults().editor.clone();
+        expected_clone_editor.rectangle = edited_rectangle;
+        expected_clone_editor.serial_number.number =
+            target_config.style_defaults.editor.serial_number.number;
+        assert_editor_defaults(
+            &mut cloned,
+            source_viewport,
+            &EditorStyleDefaults {
+                ..expected_clone_editor
+            },
+        );
+        assert_eq!(cloned.watermark_config(), &expected_watermark);
+    }
+}
+
+#[cfg(test)]
+#[path = "engine/arrow_text_tests.rs"]
+mod arrow_text_tests;
+
+impl Engine {
+    pub fn smart_erase_items(&mut self) -> Vec<snow_draw_engine_display::SceneDisplayItem> {
+        self.scene_cache.sync(&self.model, None);
+        let presentation = self.editor.smart_erase_presentation(&self.model);
+        snow_draw_engine_scene::cached_smart_erase_items(
+            &self.model,
+            &self.scene_cache,
+            &presentation,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "engine/serial_number_drag_tests.rs"]
+mod serial_number_drag_tests;
+
+#[cfg(test)]
+#[path = "engine/pressure_brush_tests.rs"]
+mod pressure_brush_tests;

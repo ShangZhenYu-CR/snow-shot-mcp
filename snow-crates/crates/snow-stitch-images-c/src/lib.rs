@@ -1,0 +1,1918 @@
+use snow_memory::RasterBuffer;
+use std::cell::RefCell;
+use std::ffi::{CString, c_char, c_void};
+use std::mem::size_of;
+use std::ptr;
+use std::slice;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use snow_stitch_images::{
+    Frame, MotionDiagnostics, MotionStage, PixelFormat, StitchAxis, StitchBranch, StitchDecision,
+    StitchError, StitchOptions, Stitcher, TiledCanvasSnapshot,
+};
+
+#[cfg(target_os = "macos")]
+mod execution;
+
+// Snow Shot streams snapshots through Snow Image. Standalone clients retain
+// the native PNG exporter by default.
+#[cfg(feature = "png-export")]
+mod png_export;
+#[cfg(feature = "png-export")]
+pub use png_export::*;
+
+const DEFAULT_MAX_OUTPUT_HEIGHT: u32 = 2_160 * 32;
+
+#[cfg(feature = "perf-instrumentation")]
+#[unsafe(no_mangle)]
+pub extern "C" fn snow_stitch_perf_reset_thread() {
+    snow_stitch_images::perf::reset();
+}
+
+#[cfg(feature = "perf-instrumentation")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `output` must be null or point to writable storage of `output_size` bytes.
+pub unsafe extern "C" fn snow_stitch_perf_read_thread(
+    output: *mut snow_stitch_images::perf::Snapshot,
+    output_size: usize,
+) -> u8 {
+    if output.is_null() || output_size != size_of::<snow_stitch_images::perf::Snapshot>() {
+        return 0;
+    }
+    unsafe { output.write(snow_stitch_images::perf::snapshot()) };
+    1
+}
+
+#[cfg(all(test, feature = "perf-instrumentation"))]
+mod perf_ffi_tests {
+    use super::*;
+    use snow_stitch_images::perf::{Scope, Snapshot, Stage};
+
+    #[test]
+    fn snapshot_checks_size_and_preserves_counters() {
+        snow_stitch_perf_reset_thread();
+        Scope::new(Stage::FrameFreeze).finish();
+        let mut output = Snapshot::default();
+        assert_eq!(
+            unsafe { snow_stitch_perf_read_thread(ptr::null_mut(), size_of::<Snapshot>()) },
+            0
+        );
+        assert_eq!(unsafe { snow_stitch_perf_read_thread(&mut output, 1) }, 0);
+        assert_eq!(output, Snapshot::default());
+        assert_eq!(
+            unsafe { snow_stitch_perf_read_thread(&mut output, size_of::<Snapshot>()) },
+            1
+        );
+        assert_eq!(output.calls[Stage::FrameFreeze as usize], 1);
+        assert_eq!(output, snow_stitch_images::perf::snapshot());
+    }
+}
+const DEFAULT_MAX_OUTPUT_PIXELS: u64 = 3_840 * 2_160 * 32;
+const DEFAULT_MIN_OVERLAP_ROWS: u32 = 48;
+const DEFAULT_MIN_OVERLAP_RATIO: f32 = 0.15;
+const DEFAULT_ACCEPTED_HISTORY_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy)]
+struct FrameDimensions {
+    width: u32,
+    height: u32,
+}
+
+struct FramePoolInner {
+    dimensions: FrameDimensions,
+    length: usize,
+    capacity: usize,
+    active: AtomicUsize,
+    returned: Mutex<Vec<RasterBuffer>>,
+}
+
+struct RgbaFramePool {
+    inner: Arc<FramePoolInner>,
+}
+
+impl RgbaFramePool {
+    fn new(width: u32, height: u32, capacity: usize) -> Result<Self, StitchError> {
+        if width == 0 || height == 0 || capacity == 0 {
+            return Err(StitchError::InvalidOptions {
+                message: "frame-pool dimensions and capacity must be non-zero".to_owned(),
+            });
+        }
+        let length = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(StitchError::Arithmetic {
+                operation: "calculating RGBA frame-pool buffer length",
+            })?;
+        Ok(Self {
+            inner: Arc::new(FramePoolInner {
+                dimensions: FrameDimensions { width, height },
+                length,
+                capacity,
+                active: AtomicUsize::new(0),
+                returned: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    fn acquire(&self) -> Result<RgbaFrameBuffer, StitchError> {
+        self.acquire_with_clear(true)
+    }
+
+    fn acquire_for_overwrite(&self) -> Result<RgbaFrameBuffer, StitchError> {
+        self.acquire_with_clear(false)
+    }
+
+    fn acquire_with_clear(&self, clear_pixels: bool) -> Result<RgbaFrameBuffer, StitchError> {
+        let mut active = self.inner.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.inner.capacity {
+                return Err(StitchError::InvalidFrame {
+                    message: format!(
+                        "RGBA frame pool is exhausted (capacity {})",
+                        self.inner.capacity
+                    ),
+                });
+            }
+            match self.inner.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => active = next,
+            }
+        }
+        let data = self
+            .inner
+            .returned
+            .lock()
+            .expect("frame pool mutex poisoned")
+            .pop()
+            .unwrap_or_else(|| RasterBuffer::zeroed(self.inner.length));
+        let mut data = data;
+        if data.len() != self.inner.length {
+            data.resize_for_overwrite(self.inner.length);
+        }
+        if clear_pixels {
+            data.fill(0);
+        }
+        Ok(RgbaFrameBuffer {
+            dimensions: self.inner.dimensions,
+            data: Some(data),
+            pool: Arc::clone(&self.inner),
+        })
+    }
+}
+
+struct RgbaFrameBuffer {
+    dimensions: FrameDimensions,
+    data: Option<RasterBuffer>,
+    pool: Arc<FramePoolInner>,
+}
+
+impl RgbaFrameBuffer {
+    fn dimensions(&self) -> FrameDimensions {
+        self.dimensions
+    }
+
+    fn as_mut_rgba_bytes(&mut self) -> &mut [u8] {
+        self.data
+            .as_mut()
+            .expect("live RGBA frame buffer owns its pixels")
+    }
+
+    fn freeze(mut self) -> Result<Frame, StitchError> {
+        let _perf =
+            snow_stitch_images::perf::Scope::new(snow_stitch_images::perf::Stage::FrameFreeze);
+        let data = self
+            .data
+            .take()
+            .expect("live RGBA frame buffer owns its pixels");
+        let result = Frame::from_buffer(
+            self.dimensions.width,
+            self.dimensions.height,
+            PixelFormat::Rgba8,
+            data.clone(),
+        );
+        self.pool
+            .returned
+            .lock()
+            .expect("frame pool mutex poisoned")
+            .push(data);
+        result
+    }
+}
+
+impl Drop for RgbaFrameBuffer {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.pool
+                .returned
+                .lock()
+                .expect("frame pool mutex poisoned")
+                .push(data);
+        }
+        self.pool.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ExternalRgbaPixels {
+    bytes: *const u8,
+    length: usize,
+    context: *mut c_void,
+    release: unsafe extern "C" fn(*mut c_void),
+}
+
+// The external-frame ABI requires immutable pixels and a release callback that
+// may run on any thread. No mutable slice is ever exposed for this storage.
+unsafe impl Send for ExternalRgbaPixels {}
+unsafe impl Sync for ExternalRgbaPixels {}
+
+impl AsRef<[u8]> for ExternalRgbaPixels {
+    fn as_ref(&self) -> &[u8] {
+        // Construction validates the slice; the owner's callback keeps it live.
+        unsafe { slice::from_raw_parts(self.bytes, self.length) }
+    }
+}
+
+impl Drop for ExternalRgbaPixels {
+    fn drop(&mut self) {
+        unsafe { (self.release)(self.context) };
+    }
+}
+
+#[derive(Clone)]
+struct RgbaImage {
+    frame: Frame,
+}
+
+impl RgbaImage {
+    fn width(&self) -> u32 {
+        self.frame.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.frame.height()
+    }
+
+    fn as_rgba_bytes(&self) -> &[u8] {
+        self.frame.pixels()
+    }
+}
+
+#[derive(Clone)]
+struct StitchImageSnapshot {
+    canvas: TiledCanvasSnapshot,
+}
+
+impl StitchImageSnapshot {
+    fn width(&self) -> u32 {
+        self.canvas.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.canvas.height()
+    }
+
+    fn rgba_len(&self) -> Result<usize, StitchError> {
+        self.width()
+            .checked_mul(self.height())
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or(StitchError::Arithmetic {
+                operation: "calculating snapshot RGBA length",
+            })
+    }
+
+    fn slice_rows(&self, top: u32, bottom: u32) -> Result<Self, StitchError> {
+        if top >= bottom || bottom > self.height() {
+            return Err(StitchError::InvalidFrame {
+                message: format!(
+                    "row range {top}..{bottom} is outside snapshot height {}",
+                    self.height()
+                ),
+            });
+        }
+        Ok(Self {
+            canvas: self.canvas.slice_rows(top, bottom)?,
+        })
+    }
+
+    fn slice_axis(&self, start: u32, end: u32) -> Result<Self, StitchError> {
+        Ok(Self {
+            canvas: self.canvas.slice_axis(start, end)?,
+        })
+    }
+
+    fn materialize(&self) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self.canvas.materialize()?,
+        })
+    }
+
+    fn render_scaled(&self, width: u32, height: u32) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self.canvas.render_scaled(width, height)?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct StitchLimits {
+    max_output_height: u32,
+    max_output_pixels: u64,
+}
+
+#[derive(Clone)]
+struct StitchConfig {
+    axis: StitchAxis,
+    limits: StitchLimits,
+    min_overlap_rows: u32,
+    min_overlap_ratio: f32,
+    accepted_history_capacity: usize,
+}
+
+impl Default for StitchConfig {
+    fn default() -> Self {
+        Self {
+            axis: StitchAxis::Vertical,
+            limits: StitchLimits {
+                max_output_height: DEFAULT_MAX_OUTPUT_HEIGHT,
+                max_output_pixels: DEFAULT_MAX_OUTPUT_PIXELS,
+            },
+            min_overlap_rows: DEFAULT_MIN_OVERLAP_ROWS,
+            min_overlap_ratio: DEFAULT_MIN_OVERLAP_RATIO,
+            accepted_history_capacity: DEFAULT_ACCEPTED_HISTORY_CAPACITY,
+        }
+    }
+}
+
+impl StitchConfig {
+    fn validate(&self) -> Result<(), StitchError> {
+        if self.limits.max_output_height == 0 || self.limits.max_output_pixels == 0 {
+            return Err(StitchError::InvalidOptions {
+                message: "output limits must be greater than zero".to_owned(),
+            });
+        }
+        if self.min_overlap_rows == 0
+            || !(0.0..=0.5).contains(&self.min_overlap_ratio)
+            || !(1..=8).contains(&self.accepted_history_capacity)
+        {
+            return Err(StitchError::InvalidOptions {
+                message: "invalid compatibility stitching configuration".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FrameEvent {
+    Initial,
+    ExtendedTop,
+    ExtendedBottom,
+    ExtendedLeft,
+    ExtendedRight,
+    Covered,
+    Duplicate,
+    Unmatched,
+}
+
+#[derive(Clone, Copy)]
+enum UnmatchedReason {
+    InsufficientOverlap,
+    LowInformation,
+    Ambiguous,
+    ConflictingReferences,
+    VerificationFailed,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MatchMetrics {
+    score: f32,
+    second_score: f32,
+    content_coverage: f32,
+    inlier_ratio: f32,
+    feature_support: u32,
+    reference_count: u32,
+}
+
+#[derive(Clone, Copy)]
+struct FrameOutcome {
+    event: FrameEvent,
+    matched_reference_offset: Option<i32>,
+    unmatched_reason: Option<UnmatchedReason>,
+    metrics: MatchMetrics,
+    added_extent: u32,
+    output_dimensions: FrameDimensions,
+    delta_start: u32,
+    delta_extent: u32,
+}
+
+struct StitchSession {
+    config: StitchConfig,
+    stitcher: Stitcher,
+}
+
+impl StitchSession {
+    fn new(config: StitchConfig) -> Result<Self, StitchError> {
+        config.validate()?;
+        let axis = config.axis;
+        Ok(Self {
+            config,
+            stitcher: Stitcher::new(StitchOptions {
+                axis,
+                record_decisions: true,
+                ..StitchOptions::default()
+            })?,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.stitcher.reset();
+    }
+
+    fn push_owned_frame(
+        &mut self,
+        frame: Result<Frame, StitchError>,
+    ) -> Result<FrameOutcome, StitchError> {
+        let frame = frame?;
+        let initial = self.stitcher.input_count() == 0;
+        #[cfg(target_os = "macos")]
+        let decision = execution::install(|| self.stitcher.push(frame))??;
+        #[cfg(not(target_os = "macos"))]
+        let decision = self.stitcher.push(frame)?;
+        let (width, height) = self
+            .stitcher
+            .image_dimensions()
+            .expect("a successful push initializes the stitcher");
+        let pixels = u64::from(width) * u64::from(height);
+        let output_extent = self.config.axis.primary_extent(width, height);
+        if output_extent > self.config.limits.max_output_height
+            || pixels > self.config.limits.max_output_pixels
+        {
+            return Err(StitchError::InvalidFrame {
+                message: format!(
+                    "stitched output {}x{} exceeds configured limits",
+                    width, height
+                ),
+            });
+        }
+        let dimensions = FrameDimensions { width, height };
+        if initial {
+            return Ok(FrameOutcome {
+                event: FrameEvent::Initial,
+                matched_reference_offset: None,
+                unmatched_reason: None,
+                metrics: MatchMetrics::default(),
+                added_extent: output_extent,
+                output_dimensions: dimensions,
+                delta_start: 0,
+                delta_extent: output_extent,
+            });
+        }
+        let outcome = decision
+            .as_ref()
+            .map(|event| frame_outcome(event, dimensions, self.config.axis))
+            .ok_or_else(|| StitchError::InvalidFrame {
+                message: "incremental stitcher did not emit a decision record".to_owned(),
+            })?;
+        self.stitcher.clear_decisions();
+        Ok(outcome)
+    }
+
+    fn copy_rows(&self, top: u32, rows: u32, destination: &mut [u8]) -> Result<(), StitchError> {
+        let (width, height) = self
+            .stitcher
+            .image_dimensions()
+            .ok_or(StitchError::EmptyInput)?;
+        let bottom = top.checked_add(rows).ok_or(StitchError::Arithmetic {
+            operation: "calculating copied row range",
+        })?;
+        if bottom > height {
+            return Err(StitchError::InvalidFrame {
+                message: "copied row range is outside the stitched image".to_owned(),
+            });
+        }
+        let row_bytes = width as usize * 4;
+        let expected = rows as usize * row_bytes;
+        if destination.len() != expected {
+            return Err(StitchError::InvalidFrame {
+                message: format!("row copy needs {expected} bytes, got {}", destination.len()),
+            });
+        }
+        self.stitcher.copy_rows(top, rows, destination)
+    }
+
+    fn snapshot(&self, top: u32, bottom: u32) -> Result<StitchImageSnapshot, StitchError> {
+        Ok(StitchImageSnapshot {
+            canvas: self.stitcher.snapshot_axis(top, bottom)?,
+        })
+    }
+
+    fn materialize_rows(&self, top: u32, bottom: u32) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self.stitcher.materialize_rows(top, bottom)?,
+        })
+    }
+
+    fn materialize_axis(&self, start: u32, end: u32) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self.stitcher.materialize_axis(start, end)?,
+        })
+    }
+
+    fn render_scaled_rows(
+        &self,
+        top: u32,
+        rows: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self.stitcher.render_scaled_rows(top, rows, width, height)?,
+        })
+    }
+
+    fn render_scaled_axis(
+        &self,
+        start: u32,
+        span: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, StitchError> {
+        Ok(RgbaImage {
+            frame: self
+                .stitcher
+                .render_scaled_axis(start, span, width, height)?,
+        })
+    }
+}
+
+fn frame_outcome(
+    event: &StitchDecision,
+    dimensions: FrameDimensions,
+    axis: StitchAxis,
+) -> FrameOutcome {
+    let frame_event = match (axis, event.branch) {
+        (StitchAxis::Vertical, StitchBranch::Append) => FrameEvent::ExtendedBottom,
+        (StitchAxis::Vertical, StitchBranch::Prepend) => FrameEvent::ExtendedTop,
+        (StitchAxis::Horizontal, StitchBranch::Append) => FrameEvent::ExtendedRight,
+        (StitchAxis::Horizontal, StitchBranch::Prepend) => FrameEvent::ExtendedLeft,
+        (_, StitchBranch::Contained) => FrameEvent::Covered,
+        (_, StitchBranch::Skip) => FrameEvent::Duplicate,
+        (_, StitchBranch::NoMovement) => FrameEvent::Unmatched,
+    };
+    let unmatched_reason = (event.branch == StitchBranch::NoMovement)
+        .then(|| unmatched_reason(event.motion_diagnostics.as_ref()));
+    let metrics = event
+        .motion_diagnostics
+        .as_ref()
+        .map(|diagnostics| match_metrics(event.confidence, diagnostics))
+        .unwrap_or_default();
+    let band = event.canvas_band_height.unwrap_or(0);
+    let delta_start = match event.branch {
+        StitchBranch::Append => event
+            .before
+            .canvas_height
+            .saturating_sub(band.saturating_sub(event.growth)),
+        StitchBranch::Prepend => 0,
+        StitchBranch::Contained | StitchBranch::Skip | StitchBranch::NoMovement => 0,
+    };
+    FrameOutcome {
+        event: frame_event,
+        matched_reference_offset: event.accepted_offset,
+        unmatched_reason,
+        metrics,
+        added_extent: event.growth,
+        output_dimensions: dimensions,
+        delta_start,
+        delta_extent: band,
+    }
+}
+
+fn unmatched_reason(diagnostics: Option<&MotionDiagnostics>) -> UnmatchedReason {
+    match diagnostics.map(|diagnostics| diagnostics.stage) {
+        Some(MotionStage::InputTooSmall | MotionStage::EmptyDescriptors) => {
+            UnmatchedReason::LowInformation
+        }
+        Some(MotionStage::NoMatches) => UnmatchedReason::InsufficientOverlap,
+        Some(MotionStage::NoCandidates) => UnmatchedReason::ConflictingReferences,
+        Some(MotionStage::LowConfidence) => UnmatchedReason::Ambiguous,
+        Some(MotionStage::SceneCut | MotionStage::SelectedNoMotion) => {
+            UnmatchedReason::VerificationFailed
+        }
+        Some(MotionStage::IdenticalInterior | MotionStage::Selected) | None => {
+            UnmatchedReason::VerificationFailed
+        }
+    }
+}
+
+fn match_metrics(confidence: Option<f32>, diagnostics: &MotionDiagnostics) -> MatchMetrics {
+    let selected = diagnostics.selected_offset.and_then(|offset| {
+        diagnostics
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offset == offset)
+    });
+    let mut scores = diagnostics
+        .candidates
+        .iter()
+        .map(|candidate| candidate.score)
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| right.total_cmp(left));
+    MatchMetrics {
+        score: confidence.unwrap_or_default(),
+        second_score: scores.get(1).copied().unwrap_or_default(),
+        content_coverage: selected.map_or(0.0, |candidate| candidate.spatial_coverage),
+        inlier_ratio: selected.map_or(0.0, |candidate| candidate.weighted_inlier_share),
+        feature_support: selected.map_or(0, |candidate| candidate.raw_inliers),
+        reference_count: 1,
+    }
+}
+
+pub struct SnowStitchFramePoolImpl {
+    pool: RgbaFramePool,
+}
+
+pub struct SnowStitchFrameBufferImpl {
+    buffer: Option<RgbaFrameBuffer>,
+}
+
+pub struct SnowStitchSessionImpl {
+    session: StitchSession,
+}
+
+pub struct SnowStitchSnapshotImpl {
+    snapshot: StitchImageSnapshot,
+}
+
+pub struct SnowStitchOwnedImageImpl {
+    image: RgbaImage,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum SnowStitchFrameEvent {
+    Initial = 0,
+    ExtendedTop = 1,
+    ExtendedBottom = 2,
+    Covered = 3,
+    Duplicate = 4,
+    Unmatched = 5,
+    ExtendedLeft = 6,
+    ExtendedRight = 7,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum SnowStitchAxis {
+    Vertical = 0,
+    Horizontal = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum SnowStitchUnmatchedReason {
+    None = 0,
+    InsufficientOverlap = 1,
+    LowInformation = 2,
+    Ambiguous = 3,
+    ConflictingReferences = 4,
+    VerificationFailed = 5,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnowStitchConfig {
+    struct_size: u32,
+    max_output_height: u32,
+    max_output_pixels: u64,
+    min_overlap_rows: u32,
+    min_overlap_ratio: f32,
+    accepted_history_capacity: u32,
+    axis: u32,
+    reserved: [u32; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnowStitchMatchMetrics {
+    score: f32,
+    second_score: f32,
+    content_coverage: f32,
+    inlier_ratio: f32,
+    feature_support: u32,
+    reference_count: u32,
+}
+
+#[repr(C)]
+pub struct SnowStitchMutableImageInfo {
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    rgba_bytes: *mut u8,
+    rgba_len: usize,
+}
+
+#[repr(C)]
+pub struct SnowStitchImageInfo {
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    rgba_bytes: *const u8,
+    rgba_len: usize,
+}
+
+#[repr(C)]
+pub struct SnowStitchFrameOutcome {
+    event: SnowStitchFrameEvent,
+    unmatched_reason: SnowStitchUnmatchedReason,
+    matched_reference_offset_y: i32,
+    has_matched_reference_offset_y: u8,
+    reserved: [u8; 3],
+    metrics: SnowStitchMatchMetrics,
+    added_rows: u32,
+    output_width: u32,
+    output_height: u32,
+    delta_top: u32,
+    delta_rows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum SnowStitchPngCompression {
+    Fast = 0,
+    Balanced = 1,
+    Best = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum SnowStitchExportStage {
+    Preparing = 0,
+    Encoding = 1,
+    Committing = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnowStitchExportStatus {
+    Running = 0,
+    Complete = 1,
+    Failed = 2,
+    Canceled = 3,
+}
+
+#[repr(C)]
+pub struct SnowStitchPngExportConfig {
+    output_path_utf8: *const c_char,
+    compression: SnowStitchPngCompression,
+    overwrite: u8,
+    reserved: [u8; 31],
+}
+
+#[repr(C)]
+pub struct SnowStitchExportProgress {
+    stage: SnowStitchExportStage,
+    rows_written: u32,
+    total_rows: u32,
+    percent: f32,
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").expect("empty C string"));
+}
+
+fn sanitize_cstring(value: impl AsRef<str>) -> CString {
+    let bytes = value
+        .as_ref()
+        .as_bytes()
+        .iter()
+        .copied()
+        .filter(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    CString::new(bytes).expect("interior NUL bytes were removed")
+}
+
+fn set_last_error(error: impl ToString) {
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = sanitize_cstring(error.to_string()));
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = CString::new("").expect("empty C string"));
+}
+
+fn ffi_config(config: StitchConfig) -> SnowStitchConfig {
+    SnowStitchConfig {
+        struct_size: size_of::<SnowStitchConfig>() as u32,
+        max_output_height: config.limits.max_output_height,
+        max_output_pixels: config.limits.max_output_pixels,
+        min_overlap_rows: config.min_overlap_rows,
+        min_overlap_ratio: config.min_overlap_ratio,
+        accepted_history_capacity: config.accepted_history_capacity as u32,
+        axis: match config.axis {
+            StitchAxis::Vertical => SnowStitchAxis::Vertical as u32,
+            StitchAxis::Horizontal => SnowStitchAxis::Horizontal as u32,
+        },
+        reserved: [0; 8],
+    }
+}
+
+fn rust_config(config: &SnowStitchConfig) -> Result<StitchConfig, String> {
+    if config.struct_size < size_of::<SnowStitchConfig>() as u32 {
+        return Err(format!(
+            "SnowStitchConfig.struct_size is {}, expected at least {}",
+            config.struct_size,
+            size_of::<SnowStitchConfig>()
+        ));
+    }
+    let accepted_history_capacity = usize::try_from(config.accepted_history_capacity)
+        .map_err(|_| "accepted_history_capacity does not fit size_t".to_owned())?;
+    let axis = match config.axis {
+        value if value == SnowStitchAxis::Vertical as u32 => StitchAxis::Vertical,
+        value if value == SnowStitchAxis::Horizontal as u32 => StitchAxis::Horizontal,
+        value => return Err(format!("unknown SnowStitchAxis value {value}")),
+    };
+    let config = StitchConfig {
+        axis,
+        limits: StitchLimits {
+            max_output_height: config.max_output_height,
+            max_output_pixels: config.max_output_pixels,
+        },
+        min_overlap_rows: config.min_overlap_rows,
+        min_overlap_ratio: config.min_overlap_ratio,
+        accepted_history_capacity,
+    };
+    config.validate().map_err(|error| error.to_string())?;
+    Ok(config)
+}
+
+fn ffi_event(event: FrameEvent) -> SnowStitchFrameEvent {
+    match event {
+        FrameEvent::Initial => SnowStitchFrameEvent::Initial,
+        FrameEvent::ExtendedTop => SnowStitchFrameEvent::ExtendedTop,
+        FrameEvent::ExtendedBottom => SnowStitchFrameEvent::ExtendedBottom,
+        FrameEvent::ExtendedLeft => SnowStitchFrameEvent::ExtendedLeft,
+        FrameEvent::ExtendedRight => SnowStitchFrameEvent::ExtendedRight,
+        FrameEvent::Covered => SnowStitchFrameEvent::Covered,
+        FrameEvent::Duplicate => SnowStitchFrameEvent::Duplicate,
+        FrameEvent::Unmatched => SnowStitchFrameEvent::Unmatched,
+    }
+}
+
+fn ffi_unmatched_reason(reason: Option<UnmatchedReason>) -> SnowStitchUnmatchedReason {
+    match reason {
+        None => SnowStitchUnmatchedReason::None,
+        Some(UnmatchedReason::InsufficientOverlap) => {
+            SnowStitchUnmatchedReason::InsufficientOverlap
+        }
+        Some(UnmatchedReason::LowInformation) => SnowStitchUnmatchedReason::LowInformation,
+        Some(UnmatchedReason::Ambiguous) => SnowStitchUnmatchedReason::Ambiguous,
+        Some(UnmatchedReason::ConflictingReferences) => {
+            SnowStitchUnmatchedReason::ConflictingReferences
+        }
+        Some(UnmatchedReason::VerificationFailed) => SnowStitchUnmatchedReason::VerificationFailed,
+    }
+}
+
+fn ffi_metrics(metrics: MatchMetrics) -> SnowStitchMatchMetrics {
+    SnowStitchMatchMetrics {
+        score: metrics.score,
+        second_score: metrics.second_score,
+        content_coverage: metrics.content_coverage,
+        inlier_ratio: metrics.inlier_ratio,
+        feature_support: metrics.feature_support,
+        reference_count: metrics.reference_count,
+    }
+}
+
+fn ffi_outcome(outcome: FrameOutcome) -> SnowStitchFrameOutcome {
+    SnowStitchFrameOutcome {
+        event: ffi_event(outcome.event),
+        unmatched_reason: ffi_unmatched_reason(outcome.unmatched_reason),
+        matched_reference_offset_y: outcome.matched_reference_offset.unwrap_or_default(),
+        has_matched_reference_offset_y: u8::from(outcome.matched_reference_offset.is_some()),
+        reserved: [0; 3],
+        metrics: ffi_metrics(outcome.metrics),
+        added_rows: outcome.added_extent,
+        output_width: outcome.output_dimensions.width,
+        output_height: outcome.output_dimensions.height,
+        delta_top: outcome.delta_start,
+        delta_rows: outcome.delta_extent,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn snow_stitch_frame_pool_create(
+    width: u32,
+    height: u32,
+    capacity: usize,
+) -> *mut SnowStitchFramePoolImpl {
+    match RgbaFramePool::new(width, height, capacity) {
+        Ok(pool) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchFramePoolImpl { pool }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `pool` must be null or a live handle returned by `snow_stitch_frame_pool_create`
+/// that has not already been destroyed.
+pub unsafe extern "C" fn snow_stitch_frame_pool_destroy(pool: *mut SnowStitchFramePoolImpl) {
+    if !pool.is_null() {
+        drop(unsafe { Box::from_raw(pool) });
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `pool` must be null or point to a live frame pool for the duration of this call.
+pub unsafe extern "C" fn snow_stitch_frame_pool_acquire(
+    pool: *mut SnowStitchFramePoolImpl,
+) -> *mut SnowStitchFrameBufferImpl {
+    unsafe { acquire_frame_buffer(pool, false) }
+}
+
+#[unsafe(no_mangle)]
+/// Acquire initialized pixels without clearing previously returned storage.
+/// The caller must overwrite every packed RGBA byte before submitting the frame.
+///
+/// # Safety
+/// `pool` must be null or point to a live frame pool for the duration of this call.
+pub unsafe extern "C" fn snow_stitch_frame_pool_acquire_for_overwrite(
+    pool: *mut SnowStitchFramePoolImpl,
+) -> *mut SnowStitchFrameBufferImpl {
+    unsafe { acquire_frame_buffer(pool, true) }
+}
+
+unsafe fn acquire_frame_buffer(
+    pool: *mut SnowStitchFramePoolImpl,
+    overwrite: bool,
+) -> *mut SnowStitchFrameBufferImpl {
+    let Some(pool) = (unsafe { pool.as_ref() }) else {
+        set_last_error("RGBA frame pool is null");
+        return ptr::null_mut();
+    };
+    let result = if overwrite {
+        pool.pool.acquire_for_overwrite()
+    } else {
+        pool.pool.acquire()
+    };
+    match result {
+        Ok(buffer) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchFrameBufferImpl {
+                buffer: Some(buffer),
+            }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `frame` must be a live, exclusively accessed frame handle and `out_info`
+/// must point to writable storage for one `SnowStitchMutableImageInfo`.
+pub unsafe extern "C" fn snow_stitch_frame_buffer_info(
+    frame: *mut SnowStitchFrameBufferImpl,
+    out_info: *mut SnowStitchMutableImageInfo,
+) -> u8 {
+    if out_info.is_null() {
+        set_last_error("mutable image info is null");
+        return 0;
+    }
+    let Some(frame) = (unsafe { frame.as_mut() }) else {
+        set_last_error("RGBA frame buffer is null");
+        return 0;
+    };
+    let Some(buffer) = frame.buffer.as_mut() else {
+        set_last_error("RGBA frame buffer was already consumed");
+        return 0;
+    };
+    let dimensions = buffer.dimensions();
+    let bytes = buffer.as_mut_rgba_bytes();
+    unsafe {
+        *out_info = SnowStitchMutableImageInfo {
+            width: dimensions.width,
+            height: dimensions.height,
+            stride_bytes: dimensions.width * 4,
+            rgba_bytes: bytes.as_mut_ptr(),
+            rgba_len: bytes.len(),
+        };
+    }
+    clear_last_error();
+    1
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `frame` must be null or a live handle returned by this library that has not
+/// been consumed or previously destroyed.
+pub unsafe extern "C" fn snow_stitch_frame_buffer_destroy(frame: *mut SnowStitchFrameBufferImpl) {
+    if !frame.is_null() {
+        drop(unsafe { Box::from_raw(frame) });
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `out_config` must point to writable storage for one
+/// `SnowStitchConfig`.
+pub unsafe extern "C" fn snow_stitch_config_default(out_config: *mut SnowStitchConfig) -> u8 {
+    if out_config.is_null() {
+        set_last_error("stitch config is null");
+        return 0;
+    }
+    unsafe { *out_config = ffi_config(StitchConfig::default()) };
+    clear_last_error();
+    1
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `config` must point to a readable `SnowStitchConfig` whose
+/// `struct_size` covers the current structure.
+pub unsafe extern "C" fn snow_stitch_session_create(
+    config: *const SnowStitchConfig,
+) -> *mut SnowStitchSessionImpl {
+    let Some(config) = (unsafe { config.as_ref() }) else {
+        set_last_error("stitch config is null");
+        return ptr::null_mut();
+    };
+    let result = rust_config(config)
+        .and_then(|config| StitchSession::new(config).map_err(|error| error.to_string()));
+    match result {
+        Ok(session) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchSessionImpl { session }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must be null or a live session handle that has not already been
+/// destroyed.
+pub unsafe extern "C" fn snow_stitch_session_destroy(session: *mut SnowStitchSessionImpl) {
+    if !session.is_null() {
+        drop(unsafe { Box::from_raw(session) });
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must point to a live, exclusively accessed session.
+pub unsafe extern "C" fn snow_stitch_session_reset(session: *mut SnowStitchSessionImpl) -> u8 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        set_last_error("stitch session is null");
+        return 0;
+    };
+    session.session.reset();
+    clear_last_error();
+    1
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must be live and exclusively accessed. `inout_frame` must point
+/// to a live frame-handle slot and `out_outcome` must be writable. The frame
+/// handle is consumed and the caller's slot is nulled even when stitching fails.
+pub unsafe extern "C" fn snow_stitch_session_push_owned(
+    session: *mut SnowStitchSessionImpl,
+    inout_frame: *mut *mut SnowStitchFrameBufferImpl,
+    out_outcome: *mut SnowStitchFrameOutcome,
+) -> u8 {
+    if inout_frame.is_null() || out_outcome.is_null() {
+        set_last_error("owned frame pointer and outcome must be non-null");
+        return 0;
+    }
+    let frame_ptr = unsafe { *inout_frame };
+    unsafe { *inout_frame = ptr::null_mut() };
+    if frame_ptr.is_null() {
+        set_last_error("owned frame is null");
+        return 0;
+    }
+    let mut frame = unsafe { Box::from_raw(frame_ptr) };
+    let Some(buffer) = frame.buffer.take() else {
+        set_last_error("owned frame was already consumed");
+        return 0;
+    };
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        set_last_error("stitch session is null");
+        return 0;
+    };
+
+    match session.session.push_owned_frame(buffer.freeze()) {
+        Ok(outcome) => {
+            unsafe { *out_outcome = ffi_outcome(outcome) };
+            clear_last_error();
+            1
+        }
+        Err(error) => {
+            set_last_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must be live and exclusively accessed, and `out_outcome` writable
+/// when non-null. `rgba_bytes` must describe `rgba_len` initialized, immutable
+/// bytes that remain valid until `release(context)` runs. The callback must be
+/// callable on any thread. A non-null callback transfers the context even when
+/// validation or stitching fails, and is called exactly once after the last lease.
+pub unsafe extern "C" fn snow_stitch_session_push_external_rgba(
+    session: *mut SnowStitchSessionImpl,
+    width: u32,
+    height: u32,
+    rgba_bytes: *const u8,
+    rgba_len: usize,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+    context: *mut c_void,
+    out_outcome: *mut SnowStitchFrameOutcome,
+) -> u8 {
+    let Some(release) = release else {
+        set_last_error("external frame release callback is null");
+        return 0;
+    };
+    let preparation =
+        snow_stitch_images::perf::Scope::new(snow_stitch_images::perf::Stage::FrameFreeze);
+    let pixels = Arc::new(ExternalRgbaPixels {
+        bytes: rgba_bytes,
+        length: rgba_len,
+        context,
+        release,
+    });
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if rgba_bytes.is_null()
+        || rgba_len == 0
+        || rgba_len > isize::MAX as usize
+        || expected != Some(rgba_len)
+        || out_outcome.is_null()
+    {
+        set_last_error("external frame requires packed RGBA pixels and a writable outcome");
+        return 0;
+    }
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        set_last_error("stitch session is null");
+        return 0;
+    };
+    let frame = Frame::from_shared_buffer(width, height, PixelFormat::Rgba8, pixels);
+    preparation.finish();
+    match session.session.push_owned_frame(frame) {
+        Ok(outcome) => {
+            unsafe { *out_outcome = ffi_outcome(outcome) };
+            clear_last_error();
+            1
+        }
+        Err(error) => {
+            set_last_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified during the call. `destination`
+/// must be writable for exactly `destination_len` bytes.
+pub unsafe extern "C" fn snow_stitch_session_copy_rows(
+    session: *const SnowStitchSessionImpl,
+    top: u32,
+    rows: u32,
+    destination: *mut u8,
+    destination_len: usize,
+) -> u8 {
+    if destination.is_null() {
+        set_last_error("row destination is null");
+        return 0;
+    }
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return 0;
+    };
+    let bytes = unsafe { slice::from_raw_parts_mut(destination, destination_len) };
+    match session.session.copy_rows(top, rows, bytes) {
+        Ok(()) => {
+            clear_last_error();
+            1
+        }
+        Err(error) => {
+            set_last_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified during the call.
+pub unsafe extern "C" fn snow_stitch_session_materialize_rows(
+    session: *const SnowStitchSessionImpl,
+    top: u32,
+    bottom: u32,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    owned_image(session.session.materialize_rows(top, bottom))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified during the call.
+pub unsafe extern "C" fn snow_stitch_session_materialize_axis(
+    session: *const SnowStitchSessionImpl,
+    start: u32,
+    end: u32,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    owned_image(session.session.materialize_axis(start, end))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified during the call.
+pub unsafe extern "C" fn snow_stitch_session_render_scaled_rows(
+    session: *const SnowStitchSessionImpl,
+    top: u32,
+    rows: u32,
+    width: u32,
+    height: u32,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    owned_image(session.session.render_scaled_rows(top, rows, width, height))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified during the call.
+pub unsafe extern "C" fn snow_stitch_session_render_scaled_axis(
+    session: *const SnowStitchSessionImpl,
+    start: u32,
+    span: u32,
+    width: u32,
+    height: u32,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    owned_image(
+        session
+            .session
+            .render_scaled_axis(start, span, width, height),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_session_snapshot(
+    session: *const SnowStitchSessionImpl,
+    trim_top: u32,
+    trim_bottom: u32,
+) -> *mut SnowStitchSnapshotImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    match session.session.snapshot(trim_top, trim_bottom) {
+        Ok(snapshot) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchSnapshotImpl { snapshot }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `session` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_session_snapshot_axis(
+    session: *const SnowStitchSessionImpl,
+    start: u32,
+    end: u32,
+) -> *mut SnowStitchSnapshotImpl {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        set_last_error("stitch session is null");
+        return ptr::null_mut();
+    };
+    match session.session.snapshot(start, end) {
+        Ok(snapshot) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchSnapshotImpl { snapshot }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must be null or a live snapshot handle that has not already been
+/// destroyed.
+pub unsafe extern "C" fn snow_stitch_snapshot_destroy(snapshot: *mut SnowStitchSnapshotImpl) {
+    if !snapshot.is_null() {
+        drop(unsafe { Box::from_raw(snapshot) });
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live during the call and `out_info` must point to
+/// writable storage for one `SnowStitchImageInfo`.
+pub unsafe extern "C" fn snow_stitch_snapshot_info(
+    snapshot: *const SnowStitchSnapshotImpl,
+    out_info: *mut SnowStitchImageInfo,
+) -> u8 {
+    if out_info.is_null() {
+        set_last_error("snapshot image info is null");
+        return 0;
+    }
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return 0;
+    };
+    unsafe {
+        *out_info = SnowStitchImageInfo {
+            width: snapshot.snapshot.width(),
+            height: snapshot.snapshot.height(),
+            stride_bytes: snapshot.snapshot.width() * 4,
+            rgba_bytes: ptr::null(),
+            rgba_len: snapshot.snapshot.rgba_len().unwrap_or(0),
+        };
+    }
+    clear_last_error();
+    1
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live and unmodified during the call. `destination`
+/// must be writable for `destination_len` bytes.
+pub unsafe extern "C" fn snow_stitch_snapshot_copy_rows(
+    snapshot: *const SnowStitchSnapshotImpl,
+    top: u32,
+    rows: u32,
+    destination_stride: usize,
+    destination: *mut u8,
+    destination_len: usize,
+) -> u8 {
+    if destination.is_null() {
+        set_last_error("snapshot row destination is null");
+        return 0;
+    }
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return 0;
+    };
+    let bytes = unsafe { slice::from_raw_parts_mut(destination, destination_len) };
+    match snapshot
+        .snapshot
+        .canvas
+        .copy_rows_strided(top, rows, destination_stride, bytes)
+    {
+        Ok(()) => {
+            clear_last_error();
+            1
+        }
+        Err(error) => {
+            set_last_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_snapshot_slice_rows(
+    snapshot: *const SnowStitchSnapshotImpl,
+    top: u32,
+    bottom: u32,
+) -> *mut SnowStitchSnapshotImpl {
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return ptr::null_mut();
+    };
+    match snapshot.snapshot.slice_rows(top, bottom) {
+        Ok(snapshot) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchSnapshotImpl { snapshot }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_snapshot_slice_axis(
+    snapshot: *const SnowStitchSnapshotImpl,
+    start: u32,
+    end: u32,
+) -> *mut SnowStitchSnapshotImpl {
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return ptr::null_mut();
+    };
+    match snapshot.snapshot.slice_axis(start, end) {
+        Ok(snapshot) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchSnapshotImpl { snapshot }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn owned_image(image: Result<RgbaImage, impl ToString>) -> *mut SnowStitchOwnedImageImpl {
+    match image {
+        Ok(image) => {
+            clear_last_error();
+            Box::into_raw(Box::new(SnowStitchOwnedImageImpl { image }))
+        }
+        Err(error) => {
+            set_last_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_snapshot_materialize(
+    snapshot: *const SnowStitchSnapshotImpl,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return ptr::null_mut();
+    };
+    owned_image(snapshot.snapshot.materialize())
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `snapshot` must remain live and unmodified for the duration of the call.
+pub unsafe extern "C" fn snow_stitch_snapshot_render_scaled(
+    snapshot: *const SnowStitchSnapshotImpl,
+    width: u32,
+    height: u32,
+) -> *mut SnowStitchOwnedImageImpl {
+    let Some(snapshot) = (unsafe { snapshot.as_ref() }) else {
+        set_last_error("stitch snapshot is null");
+        return ptr::null_mut();
+    };
+    owned_image(snapshot.snapshot.render_scaled(width, height))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `image` must remain live during the call and `out_info` must point to
+/// writable storage for one `SnowStitchImageInfo`.
+pub unsafe extern "C" fn snow_stitch_owned_image_info(
+    image: *const SnowStitchOwnedImageImpl,
+    out_info: *mut SnowStitchImageInfo,
+) -> u8 {
+    if out_info.is_null() {
+        set_last_error("owned image info is null");
+        return 0;
+    }
+    let Some(image) = (unsafe { image.as_ref() }) else {
+        set_last_error("owned image is null");
+        return 0;
+    };
+    let bytes = image.image.as_rgba_bytes();
+    unsafe {
+        *out_info = SnowStitchImageInfo {
+            width: image.image.width(),
+            height: image.image.height(),
+            stride_bytes: image.image.width() * 4,
+            rgba_bytes: bytes.as_ptr(),
+            rgba_len: bytes.len(),
+        };
+    }
+    clear_last_error();
+    1
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `image` must be null or a live owned-image handle that has not already been
+/// destroyed.
+pub unsafe extern "C" fn snow_stitch_owned_image_destroy(image: *mut SnowStitchOwnedImageImpl) {
+    if !image.is_null() {
+        drop(unsafe { Box::from_raw(image) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn snow_stitch_last_error_message() -> *const c_char {
+    LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scene_cuts_do_not_report_fixed_content_classification() {
+        let diagnostics = MotionDiagnostics {
+            stage: MotionStage::SceneCut,
+            reference_keypoints: 0,
+            incoming_keypoints: 0,
+            mutual_matches: 0,
+            direct_similarity: 0.0,
+            selected_offset: None,
+            candidates: Vec::new(),
+        };
+        assert!(matches!(
+            unmatched_reason(Some(&diagnostics)),
+            UnmatchedReason::VerificationFailed
+        ));
+        let metrics = ffi_metrics(match_metrics(Some(0.25), &diagnostics));
+        assert_eq!(metrics.score, 0.25);
+    }
+
+    struct ExternalTestPixels {
+        pixels: Vec<u8>,
+        released: Arc<AtomicUsize>,
+    }
+
+    unsafe extern "C" fn release_test_pixels(context: *mut c_void) {
+        let owner = unsafe { Box::from_raw(context.cast::<ExternalTestPixels>()) };
+        owner.released.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn external_test_pixels(released: &Arc<AtomicUsize>) -> (*const u8, *mut c_void) {
+        let owner = Box::new(ExternalTestPixels {
+            pixels: vec![0x5a; 5 * 5 * 4],
+            released: Arc::clone(released),
+        });
+        (owner.pixels.as_ptr(), Box::into_raw(owner).cast())
+    }
+
+    #[test]
+    fn external_frame_retains_pixels_until_reset_and_snapshot_outlives_input() {
+        let mut config = StitchConfig::default();
+        for axis in [StitchAxis::Vertical, StitchAxis::Horizontal] {
+            config.axis = axis;
+            let ffi_config = ffi_config(config.clone());
+            let session = unsafe { snow_stitch_session_create(&ffi_config) };
+            let released = Arc::new(AtomicUsize::new(0));
+            let (bytes, context) = external_test_pixels(&released);
+            let mut outcome: SnowStitchFrameOutcome = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    snow_stitch_session_push_external_rgba(
+                        session,
+                        5,
+                        5,
+                        bytes,
+                        100,
+                        Some(release_test_pixels),
+                        context,
+                        &mut outcome,
+                    )
+                },
+                1
+            );
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            // Initial reference and previous input share exactly the supplied allocation.
+            let snapshot = unsafe { snow_stitch_session_snapshot_axis(session, 0, 5) };
+            let (duplicate, duplicate_context) = external_test_pixels(&released);
+            assert_eq!(
+                unsafe {
+                    snow_stitch_session_push_external_rgba(
+                        session,
+                        5,
+                        5,
+                        duplicate,
+                        100,
+                        Some(release_test_pixels),
+                        duplicate_context,
+                        &mut outcome,
+                    )
+                },
+                1
+            );
+            assert_eq!(released.load(Ordering::SeqCst), 1);
+            assert_eq!(unsafe { snow_stitch_session_reset(session) }, 1);
+            assert_eq!(released.load(Ordering::SeqCst), 2);
+            unsafe { snow_stitch_session_destroy(session) };
+            let image = unsafe { snow_stitch_snapshot_materialize(snapshot) };
+            assert!(!image.is_null());
+            assert!(
+                unsafe { &*image }
+                    .image
+                    .frame
+                    .pixels()
+                    .iter()
+                    .all(|&pixel| pixel == 0x5a)
+            );
+            unsafe {
+                snow_stitch_owned_image_destroy(image);
+                snow_stitch_snapshot_destroy(snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn external_frame_failure_releases_context_exactly_once() {
+        let config = ffi_config(StitchConfig::default());
+        let session = unsafe { snow_stitch_session_create(&config) };
+        let released = Arc::new(AtomicUsize::new(0));
+        for case in 0..6 {
+            let (bytes, context) = external_test_pixels(&released);
+            let mut outcome: SnowStitchFrameOutcome = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                snow_stitch_session_push_external_rgba(
+                    if case == 0 { ptr::null_mut() } else { session },
+                    if case == 1 {
+                        4
+                    } else if case == 5 {
+                        u32::MAX
+                    } else {
+                        5
+                    },
+                    if case == 1 {
+                        4
+                    } else if case == 5 {
+                        u32::MAX
+                    } else {
+                        5
+                    },
+                    if case == 2 { ptr::null() } else { bytes },
+                    if case == 1 {
+                        64
+                    } else if case == 3 {
+                        99
+                    } else {
+                        100
+                    },
+                    Some(release_test_pixels),
+                    context,
+                    if case == 4 {
+                        ptr::null_mut()
+                    } else {
+                        &mut outcome
+                    },
+                )
+            };
+            assert_eq!(status, 0);
+            assert_eq!(released.load(Ordering::SeqCst), case + 1);
+        }
+        unsafe { snow_stitch_session_destroy(session) };
+    }
+
+    #[test]
+    fn config_is_sized_and_rejects_truncated_callers() {
+        let mut config = ffi_config(StitchConfig::default());
+        assert_eq!(config.struct_size as usize, size_of::<SnowStitchConfig>());
+        config.struct_size -= 1;
+        let session = unsafe { snow_stitch_session_create(&config) };
+        assert!(session.is_null());
+    }
+
+    #[test]
+    fn config_defaults_vertical_and_rejects_unknown_axis() {
+        let mut config = ffi_config(StitchConfig::default());
+        assert_eq!(config.axis, SnowStitchAxis::Vertical as u32);
+        config.axis = 99;
+        let session = unsafe { snow_stitch_session_create(&config) };
+        assert!(session.is_null());
+    }
+
+    #[test]
+    fn owned_frame_is_consumed_and_snapshot_survives_session() {
+        let pool = snow_stitch_frame_pool_create(5, 5, 2);
+        let config = ffi_config(StitchConfig::default());
+        let session = unsafe { snow_stitch_session_create(&config) };
+        assert!(!pool.is_null() && !session.is_null());
+        let mut frame = unsafe { snow_stitch_frame_pool_acquire(pool) };
+        let mut info = SnowStitchMutableImageInfo {
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            rgba_bytes: ptr::null_mut(),
+            rgba_len: 0,
+        };
+        assert_eq!(
+            unsafe { snow_stitch_frame_buffer_info(frame, &mut info) },
+            1
+        );
+        unsafe { slice::from_raw_parts_mut(info.rgba_bytes, info.rgba_len).fill(0x7f) };
+        let mut outcome = SnowStitchFrameOutcome {
+            event: SnowStitchFrameEvent::Unmatched,
+            unmatched_reason: SnowStitchUnmatchedReason::None,
+            matched_reference_offset_y: 0,
+            has_matched_reference_offset_y: 0,
+            reserved: [0; 3],
+            metrics: ffi_metrics(MatchMetrics::default()),
+            added_rows: 0,
+            output_width: 0,
+            output_height: 0,
+            delta_top: 0,
+            delta_rows: 0,
+        };
+        assert_eq!(
+            unsafe { snow_stitch_session_push_owned(session, &mut frame, &mut outcome) },
+            1
+        );
+        assert!(frame.is_null());
+        let snapshot = unsafe { snow_stitch_session_snapshot(session, 0, 5) };
+        assert!(!snapshot.is_null());
+        let slice = unsafe { snow_stitch_snapshot_slice_rows(snapshot, 0, 1) };
+        assert!(!slice.is_null());
+        assert!(unsafe { snow_stitch_snapshot_slice_rows(snapshot, 1, 1) }.is_null());
+        unsafe { snow_stitch_session_destroy(session) };
+        let mut copied = [0_u8; 24];
+        assert_eq!(
+            unsafe {
+                snow_stitch_snapshot_copy_rows(
+                    slice,
+                    0,
+                    1,
+                    copied.len(),
+                    copied.as_mut_ptr(),
+                    copied.len(),
+                )
+            },
+            1
+        );
+        assert!(copied[..20].iter().all(|byte| *byte == 0x7f));
+        assert!(copied[20..].iter().all(|byte| *byte == 0));
+        let image = unsafe { snow_stitch_snapshot_materialize(snapshot) };
+        assert!(!image.is_null());
+        let scaled = unsafe { snow_stitch_snapshot_render_scaled(slice, 1, 3) };
+        assert!(!scaled.is_null());
+        let mut scaled_info = SnowStitchImageInfo {
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            rgba_bytes: ptr::null(),
+            rgba_len: 0,
+        };
+        assert_eq!(
+            unsafe { snow_stitch_owned_image_info(scaled, &mut scaled_info) },
+            1
+        );
+        assert_eq!((scaled_info.width, scaled_info.height), (1, 3));
+        assert!(
+            unsafe { slice::from_raw_parts(scaled_info.rgba_bytes, scaled_info.rgba_len) }
+                .iter()
+                .all(|byte| *byte == 0x7f)
+        );
+        unsafe {
+            snow_stitch_owned_image_destroy(scaled);
+            snow_stitch_owned_image_destroy(image);
+            snow_stitch_snapshot_destroy(slice);
+            snow_stitch_snapshot_destroy(snapshot);
+            snow_stitch_frame_pool_destroy(pool);
+        }
+    }
+
+    #[test]
+    fn large_pool_freeze_preserves_pixels_and_recycles_mapped_storage() {
+        let pool = RgbaFramePool::new(1024, 256, 1).unwrap();
+        let mut buffer = pool.acquire().unwrap();
+        let pointer = buffer.as_mut_rgba_bytes().as_ptr();
+        buffer.as_mut_rgba_bytes().fill(0x5a);
+        let frame = buffer.freeze().unwrap();
+        assert_ne!(frame.pixels().as_ptr(), pointer);
+        assert!(frame.pixels().iter().all(|&byte| byte == 0x5a));
+        let mut reused = pool.acquire().unwrap();
+        assert_eq!(reused.as_mut_rgba_bytes().as_ptr(), pointer);
+        assert!(reused.as_mut_rgba_bytes().iter().all(|&byte| byte == 0));
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        {
+            assert!(reused.data.as_ref().unwrap().is_page_backed());
+            assert!(frame.into_buffer().is_page_backed());
+        }
+    }
+
+    #[test]
+    fn overwrite_pool_reuses_initialized_pixels_without_changing_frozen_frames() {
+        for (width, height) in [(8, 16), (1024, 256)] {
+            let pool = RgbaFramePool::new(width, height, 1).unwrap();
+            let mut buffer = pool.acquire_for_overwrite().unwrap();
+            assert!(buffer.as_mut_rgba_bytes().iter().all(|&byte| byte == 0));
+            let pointer = buffer.as_mut_rgba_bytes().as_ptr();
+            buffer.as_mut_rgba_bytes().fill(0x5a);
+            let frame = buffer.freeze().unwrap();
+
+            let mut reused = pool.acquire_for_overwrite().unwrap();
+            assert_eq!(reused.as_mut_rgba_bytes().as_ptr(), pointer);
+            assert!(reused.as_mut_rgba_bytes().iter().all(|&byte| byte == 0x5a));
+            reused.as_mut_rgba_bytes().fill(0x7f);
+            assert!(frame.pixels().iter().all(|&byte| byte == 0x5a));
+            drop(reused);
+
+            let mut cleared = pool.acquire().unwrap();
+            assert_eq!(cleared.as_mut_rgba_bytes().as_ptr(), pointer);
+            assert!(cleared.as_mut_rgba_bytes().iter().all(|&byte| byte == 0));
+        }
+    }
+
+    #[test]
+    fn overwrite_pool_bounds_and_lifetime_survive_failed_freeze() {
+        assert!(RgbaFramePool::new(0, 4, 1).is_err());
+        assert!(RgbaFramePool::new(4, 4, 0).is_err());
+        let pool = RgbaFramePool::new(4, 4, 1).unwrap();
+        let mut buffer = pool.acquire_for_overwrite().unwrap();
+        assert!(pool.acquire().is_err());
+        assert!(pool.acquire_for_overwrite().is_err());
+        assert_eq!(pool.inner.active.load(Ordering::Acquire), 1);
+        // A failed submission must return the slot and leave initialized storage reusable.
+        buffer.data.as_mut().unwrap().truncate(3);
+        assert!(buffer.freeze().is_err());
+        assert_eq!(pool.inner.active.load(Ordering::Acquire), 0);
+        let mut buffer = pool.acquire_for_overwrite().unwrap();
+        assert_eq!(buffer.as_mut_rgba_bytes().len(), 4 * 4 * 4);
+        assert!(buffer.as_mut_rgba_bytes().iter().all(|&byte| byte == 0));
+
+        let owner = Arc::downgrade(&pool.inner);
+        drop(pool);
+        assert!(owner.upgrade().is_some());
+        buffer.as_mut_rgba_bytes().fill(0x5a);
+        drop(buffer);
+        assert!(
+            owner.upgrade().is_none(),
+            "the last buffer must release the pool"
+        );
+    }
+
+    #[test]
+    fn overwrite_acquisition_ffi_validates_handles_and_retains_pool_until_buffer_drop() {
+        assert!(unsafe { snow_stitch_frame_pool_acquire_for_overwrite(ptr::null_mut()) }.is_null());
+        let pool = snow_stitch_frame_pool_create(4, 4, 1);
+        assert!(!pool.is_null());
+        let frame = unsafe { snow_stitch_frame_pool_acquire_for_overwrite(pool) };
+        assert!(!frame.is_null());
+        assert!(unsafe { snow_stitch_frame_pool_acquire_for_overwrite(pool) }.is_null());
+        let mut info = SnowStitchMutableImageInfo {
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            rgba_bytes: ptr::null_mut(),
+            rgba_len: 0,
+        };
+        assert_eq!(
+            unsafe { snow_stitch_frame_buffer_info(frame, ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { snow_stitch_frame_buffer_info(frame, &mut info) },
+            1
+        );
+        assert_eq!(
+            (info.width, info.height, info.stride_bytes, info.rgba_len),
+            (4, 4, 16, 64)
+        );
+        unsafe { snow_stitch_frame_pool_destroy(pool) };
+        let pixels = unsafe { slice::from_raw_parts_mut(info.rgba_bytes, info.rgba_len) };
+        assert!(pixels.iter().all(|&byte| byte == 0));
+        pixels.fill(0x7f);
+        unsafe { snow_stitch_frame_buffer_destroy(frame) };
+    }
+}

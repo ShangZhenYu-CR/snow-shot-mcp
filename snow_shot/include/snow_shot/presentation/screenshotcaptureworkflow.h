@@ -1,0 +1,139 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTCAPTUREWORKFLOW_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTCAPTUREWORKFLOW_H
+
+#include "snow_shot/presentation/screenshotcaptureworkflowports.h"
+#include "snow_shot/presentation/screenshotintelligentselectionmodel.h"
+#include "snow_shot/presentation/screenshottypes.h"
+
+#include "snow_shot/presentation/screenshotstartupcontext.h"
+#include <QCursor>
+#include <cstdint>
+#include <functional>
+#include <memory>
+
+struct ScreenshotCaptureState;
+class ScreenshotDisplaySession;
+class ScreenshotGeometryMapper;
+class ScreenshotInteractionState;
+class ScreenshotIntelligentSelectionModel;
+class ScreenshotSelectionModel;
+
+enum class ScreenshotCaptureFocusDisposition { RestorePrevious, KeepCurrent };
+
+struct ScreenshotCapturePresentationCallbacks {
+    std::function<void()> hideToolbar;
+    std::function<void()> updateOverlayState;
+    std::function<void()> updateColorPicker;
+    std::function<void()> capturePresented;
+    std::function<void()> beforeCapturePresented = []() {};
+    std::function<void()> resetPresentation = []() {};
+};
+
+struct ScreenshotCaptureWorkflowContext {
+    ScreenshotCaptureState& state;
+    ScreenshotCaptureRuntimePort& runtime;
+    ScreenshotGeometryMapper& geometry;
+    ScreenshotDisplaySession& displaySession;
+    ScreenshotInteractionState& interaction;
+    ScreenshotSelectionModel& selection;
+    ScreenshotIntelligentSelectionModel& intelligentSelection;
+    ScreenshotCapturePresentationCallbacks presentation;
+    std::function<void()> captureTerminated = []() {};
+    std::function<snow_shot::SmartSelectionMode()> smartSelectionMode = []() {
+        return snow_shot::SmartSelectionMode::WindowSubElement;
+    };
+    std::function<void()> refreshCanvasCreationStyles = []() {};
+    std::function<void()> restoreSelectionPreferences = []() {};
+    std::function<bool()> restoreOriginalScreenColors = []() { return true; };
+    std::function<bool()> showCursor = []() { return false; };
+    std::function<void(bool, const QString&)> recaptureCompleted = [](bool, const QString&) {};
+    std::function<QPoint()> cursorPosition = [] { return QCursor::pos(); };
+    // Navigation's live desktop backup belongs to the ending capture, not its exports.
+    std::function<void()> releaseCaptureHistory = []() {};
+    std::function<bool()> screenshotSoundNotification = []() { return false; };
+    std::function<void()> playShutterSound = []() {};
+    std::function<void(bool)> captureStarting = [](bool) {};
+    std::function<void(ScreenshotCaptureFocusDisposition)> captureEnding =
+        [](ScreenshotCaptureFocusDisposition) {};
+    // Runs after presentation teardown, unlike captureTerminated's model cleanup hook.
+    std::function<void()> captureEnded = []() {};
+};
+
+class ScreenshotCaptureWorkflow final : private ScreenshotCaptureWorkerEventSink {
+  public:
+    explicit ScreenshotCaptureWorkflow(ScreenshotCaptureWorkflowContext context);
+    ~ScreenshotCaptureWorkflow() override;
+
+    void prewarmResources();
+    void setCaptureSuspended(bool suspended);
+    [[nodiscard]] bool captureSuspended() const;
+    enum class StartMode { Normal, ExternalDrag };
+    enum class ToolbarPreparation { Prewarm, OnDemand };
+    enum class ToolbarVisibility { ShowAfterSelection, Suppressed };
+    enum class PresentationMode { Visible, Silent };
+    void startCapture(StartMode mode = StartMode::Normal,
+                      ToolbarPreparation toolbarPreparation = ToolbarPreparation::Prewarm,
+                      ToolbarVisibility toolbarVisibility = ToolbarVisibility::ShowAfterSelection,
+                      PresentationMode presentation = PresentationMode::Visible);
+    [[nodiscard]] bool startRecapture(const QVector<std::uint32_t>& excludedWindowIds = {});
+    [[nodiscard]] bool recaptureInProgress() const;
+    [[nodiscard]] bool suppressCaptureToolbar() const;
+    void cancelCapture(ScreenshotCaptureFocusDisposition focus =
+                           ScreenshotCaptureFocusDisposition::RestorePrevious);
+    void cancelCaptureForExport();
+    void completeDeferredExportCleanup();
+    void handleInitialSmartSelectionResolved(quint64 sessionId);
+
+    void destroyDisplayPool();
+    void destroyUiSelectorService();
+    void shutdownCaptureWorker();
+    void handleDisplayConfigurationChanged();
+
+  private:
+    void clearCapturePresentationReadiness();
+    void resetCaptureModels();
+    void clearDisplays();
+    void finishCaptureSession(bool deferExportCleanup = false);
+    void cleanupActiveSessionForRestart();
+    void beginCapturePreparation(quint64 sessionId);
+    [[nodiscard]] bool beginCapturePresentation(quint64 sessionId);
+    void prepareOverlayPresentation(quint64 sessionId);
+    void finishCapturePreparation(const ScreenshotCaptureResult& result);
+    void finishRecapturePreparation(const ScreenshotCaptureResult& result);
+    void completeRecapture(bool succeeded, const QString& errorMessage = {});
+    void showCapturePresentationWhenReady(quint64 sessionId);
+    void enterOverlaySelectionModeAtCursor();
+    void handleLayoutReady(const ScreenshotCaptureLayout& layout) override;
+    void handleCapturePrepared(quint64 requestId, bool ok) override;
+    void handleCaptureFinished(const ScreenshotCaptureResult& result) override;
+    void handleLayoutRefreshed(quint64 requestId, bool ok) override;
+    void prewarmOverlayPool();
+    void initializeIdleResources(quint64 requestId);
+    void scheduleLayoutRefresh(quint64 refreshId);
+    void resetCanvasRuntimeState();
+    [[nodiscard]] bool capturePresentationPrepared(quint64 sessionId) const;
+
+    std::shared_ptr<ScreenshotStartupContext> m_startup;
+    ScreenshotCaptureWorkflowContext m_context;
+    ScreenshotCaptureState& m_state;
+    quint64 m_preparedPresentationSessionId = 0;
+    quint64 m_capturedPresentationSessionId = 0;
+    quint64 m_initialSmartSelectionPendingSessionId = 0;
+    quint64 m_initialSmartSelectionResolvedSessionId = 0;
+    quint64 m_visiblePresentationSessionId = 0;
+    bool m_captureModelsClean = false;
+    bool m_canvasRuntimeClean = false;
+    bool m_deferredExportCleanup = false;
+    bool m_layoutRefreshInFlight = false;
+    bool m_refreshAfterCapture = false;
+    bool m_recaptureInProgress = false;
+    bool m_captureSuspended = false;
+    quint64 m_recaptureRequestId = 0;
+    quint64 m_nextRecaptureRequestId = 0;
+    quint64 m_layoutChangeSerial = 0;
+    StartMode m_startMode = StartMode::Normal;
+    ToolbarPreparation m_toolbarPreparation = ToolbarPreparation::Prewarm;
+    ToolbarVisibility m_toolbarVisibility = ToolbarVisibility::ShowAfterSelection;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTCAPTUREWORKFLOW_H

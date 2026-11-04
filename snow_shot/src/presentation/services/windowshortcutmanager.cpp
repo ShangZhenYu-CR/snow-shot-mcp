@@ -1,0 +1,953 @@
+#include "snow_shot/presentation/windowshortcutmanager.h"
+
+#include <QApplication>
+#include <QCoreApplication>
+#include <QEvent>
+#include <QHash>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QLineEdit>
+#include <QAbstractSpinBox>
+#include <QPlainTextEdit>
+#include <QPointer>
+#include <QSet>
+#include <QTextEdit>
+#include <QWidget>
+#include <QWindow>
+#include <QtGui/private/qguiapplication_p.h>
+
+#include <algorithm>
+#include <utility>
+
+#ifdef Q_OS_MACOS
+#include "../../platform/macos/windowshortcutinput_p.h"
+#endif
+
+namespace snow_shot::presentation {
+namespace {
+
+// Qt keeps its Windows pressed-key bookkeeping for the application lifetime.
+// Preserve lost-release evidence for the same lifetime, including when the
+// last pin is closed and a later pin creates a new shortcut manager.
+struct UnreleasedKeyState final : QObject {
+    explicit UnreleasedKeyState(QObject* parent) : QObject(parent) {}
+    QSet<quint64> keys;
+    QHash<quint64, quint64> revisions;
+    QHash<quint64, QPointer<WindowShortcutManager>> releaseOwners;
+};
+
+UnreleasedKeyState& applicationKeyState() {
+    static QPointer<UnreleasedKeyState> state;
+    if (state == nullptr) {
+        state = new UnreleasedKeyState(QCoreApplication::instance());
+    }
+    return *state;
+}
+
+QList<QKeyCombination> normalizedCombinations(const QList<QKeyCombination>& combinations) {
+    QList<QKeyCombination> result;
+    QSet<int> seen;
+    result.reserve(combinations.size());
+    for (const QKeyCombination combination : combinations) {
+        if (combination.key() == Qt::Key_unknown) {
+            continue;
+        }
+        const int combined = combination.toCombined();
+        if (!seen.contains(combined)) {
+            seen.insert(combined);
+            result.push_back(combination);
+        }
+    }
+    return result;
+}
+
+shortcuts::ShortcutBindingList normalizedBindings(const shortcuts::ShortcutBindingList& bindings,
+                                                  bool allowModifierOnlyControl = false) {
+    shortcuts::ShortcutBindingList result;
+    for (const shortcuts::ShortcutBinding& candidate : bindings) {
+        const bool modifierOnlyShift =
+            candidate.portableText.compare(QStringLiteral("Shift"), Qt::CaseInsensitive) == 0;
+        const bool modifierOnlyAlt =
+            candidate.portableText.compare(QStringLiteral("Alt"), Qt::CaseInsensitive) == 0;
+        const shortcuts::ShortcutBinding binding = shortcuts::canonicalBinding(
+            candidate, modifierOnlyShift, modifierOnlyAlt, allowModifierOnlyControl,
+            shortcuts::ShortcutPolicy::Application);
+        if (binding.portableText.isEmpty()) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            result.cbegin(), result.cend(), [&binding](const shortcuts::ShortcutBinding& existing) {
+                return shortcuts::bindingsConflict(existing, binding,
+                                                   shortcuts::ShortcutPolicy::Application);
+            });
+        if (!duplicate) {
+            result.push_back(binding);
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+struct WindowShortcutManager::Impl {
+    struct RegisteredScope {
+        QPointer<QWidget> window;
+        QMetaObject::Connection destroyedConnection;
+    };
+
+    struct PendingActivation {
+        BindingHandle handle = 0;
+        QPointer<QWidget> scope;
+    };
+
+    struct RegisteredBinding {
+        BindingHandle handle = 0;
+        quint64 order = 0;
+        QPointer<QObject> owner;
+        Binding binding;
+        shortcuts::ShortcutBindingList activeReleaseBindings;
+        QMetaObject::Connection destroyedConnection;
+    };
+
+    struct Candidate {
+        BindingHandle handle = 0;
+        int priority = 0;
+        quint64 order = 0;
+        shortcuts::ShortcutBinding binding;
+    };
+
+    explicit Impl(WindowShortcutManager& manager)
+        : q(manager), m_unreleasedKeys(applicationKeyState().keys),
+          m_keyStateRevisions(applicationKeyState().revisions) {
+#ifdef Q_OS_MACOS
+        m_nativeInput = platform::macos::makeWindowShortcutInputFilter(
+            [this](QWidget* receiver, QKeyEvent& event) {
+                return q.eventFilter(receiver, &event);
+            });
+#endif
+    }
+
+    // Physical keys whose press was observed through this filter without a
+    // matching release, and keys that were still held when keyboard input last
+    // became unreachable for the scope windows. When the capture UI closes
+    // while a completion key is still held, the key release is delivered to
+    // whichever window regains the foreground and never reaches this process;
+    // Qt's Windows key mapper then keeps the key recorded as pressed and labels
+    // the NEXT physical press of it as an auto-repeat. Tracking the observed
+    // press state lets the manager recognize such mislabeled presses and
+    // dispatch them as the fresh presses they physically are.
+    [[nodiscard]] bool isStaleAutoRepeat(const QKeyEvent& event) const {
+        const quint64 token =
+            shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application);
+        return event.isAutoRepeat() &&
+               shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application) !=
+                   static_cast<quint64>(Qt::Key_unknown) &&
+               !m_heldKeys.contains(token) && m_unreleasedKeys.contains(token);
+    }
+
+    void noteKeyPress(const QKeyEvent& event) {
+        if (shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application) ==
+            static_cast<quint64>(Qt::Key_unknown)) {
+            return;
+        }
+        const quint64 token =
+            shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application);
+        ++m_keyStateRevisions[token];
+        m_heldKeys.insert(token);
+        m_unreleasedKeys.remove(token);
+    }
+
+    void noteKeyRelease(const QKeyEvent& event) {
+        // Auto-repeat sequences include synthetic repeat releases that must not
+        // end the held state; only a real release clears the records.
+        if (!event.isAutoRepeat() &&
+            shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application) !=
+                static_cast<quint64>(Qt::Key_unknown)) {
+            const quint64 token =
+                shortcuts::eventKeyToken(event, shortcuts::ShortcutPolicy::Application);
+            ++m_keyStateRevisions[token];
+            m_heldKeys.remove(token);
+            m_unreleasedKeys.remove(token);
+        }
+    }
+
+    // While no scope window can receive keyboard input, releases of keys the
+    // user is still holding are routed to other applications and never reach
+    // this process. From that point on the release state of every held key is
+    // unknown: move it to the unreleased set so a later auto-repeat-labeled
+    // press of the same key is recognized as a fresh press.
+    void noteScopeInputUnreachable(QObject* object, QEvent::Type type) {
+        auto* widget = qobject_cast<QWidget*>(object);
+        if (widget == nullptr || !widget->isWindow()) {
+            return;
+        }
+        QWidget* eventWindow = widget->window();
+        const bool isScopeWindow = std::any_of(
+            m_scopeWindows.cbegin(), m_scopeWindows.cend(),
+            [eventWindow](const RegisteredScope& scope) { return scope.window == eventWindow; });
+        // Every manager observes application-wide key presses, including those
+        // handled by another window. That window can lose the release when it
+        // closes, so invalidate inactive scopes even when the event is outside
+        // this manager. Hiding an ordinary child must not end a held key.
+        if (type == QEvent::Hide && isScopeWindow) {
+            for (const RegisteredScope& scope : m_scopeWindows) {
+                if (scope.window != nullptr && scope.window->isVisible()) {
+                    return;
+                }
+            }
+        } else {
+            for (const RegisteredScope& scope : m_scopeWindows) {
+                if (scope.window != nullptr && scope.window->isActiveWindow()) {
+                    return;
+                }
+            }
+        }
+        invalidateHeldKeys();
+        cancelHeldBindings(false);
+        // WindowDeactivate precedes activation of the next toolbar/tool window.
+        // Resolve the destination after Qt has completed that focus transition.
+        QMetaObject::invokeMethod(
+            &q,
+            [this] {
+                if (scopeForReceiver(QApplication::activeWindow()) == nullptr) {
+                    cancelReleaseActivations();
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
+    void removeScopes(QWidget* root = nullptr) {
+        m_scopeWindows.erase(std::remove_if(m_scopeWindows.begin(), m_scopeWindows.end(),
+                                            [root](const RegisteredScope& scope) {
+                                                if (scope.window.isNull() || scope.window == root) {
+                                                    QObject::disconnect(scope.destroyedConnection);
+                                                    return true;
+                                                }
+                                                return false;
+                                            }),
+                             m_scopeWindows.end());
+    }
+
+    [[nodiscard]] QWidget* scopeForReceiver(QObject* receiver) {
+        removeScopes();
+
+        auto* widget = qobject_cast<QWidget*>(receiver);
+        if (widget == nullptr) {
+            return nullptr;
+        }
+
+        QWidget* receiverWindow = widget->window();
+        if (receiverWindow == nullptr) {
+            return nullptr;
+        }
+
+        // The common case is a child widget of the registered top-level
+        // window. Keep the comparison on window() so ordinary child widgets
+        // do not require a native handle.
+        for (const RegisteredScope& scope : m_scopeWindows) {
+            if (scope.window != nullptr && scope.window->window() == receiverWindow) {
+                return scope.window.data();
+            }
+        }
+
+        // QtTool popups are independent top-level widgets. Their transient
+        // parent is the toolbar (and eventually the screenshot overlay), so
+        // walk that native ownership chain instead of treating every tool
+        // window as out of scope.
+        QWindow* candidate = receiverWindow->windowHandle();
+        QSet<QWindow*> visited;
+        while (candidate != nullptr && !visited.contains(candidate)) {
+            visited.insert(candidate);
+            for (const RegisteredScope& scope : m_scopeWindows) {
+                if (scope.window == nullptr) {
+                    continue;
+                }
+                QWindow* scopeHandle = scope.window->windowHandle();
+                if (scopeHandle != nullptr && scopeHandle == candidate) {
+                    return scope.window.data();
+                }
+            }
+            candidate = candidate->transientParent();
+        }
+
+        // Some platforms do not expose a QWindow transient parent until the
+        // first native show. Qt still retains the QObject parent relationship
+        // established by setParent(owner, Qt::Tool), so use it as a fallback.
+        for (QWidget* parent = receiverWindow->parentWidget(); parent != nullptr;
+             parent = parent->parentWidget()) {
+            for (const RegisteredScope& scope : m_scopeWindows) {
+                if (scope.window != nullptr && scope.window->window() == parent->window()) {
+                    return scope.window.data();
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] static bool scopeInputBlocked(QWidget* window) {
+        // Match Qt's full modal stack, including native transient ownership and
+        // nested window-modal dialogs. activeModalWidget() alone cannot tell
+        // whether a particular scope is blocked.
+        QWindow* handle = window != nullptr ? window->windowHandle() : nullptr;
+        return handle != nullptr && QGuiApplicationPrivate::instance()->isWindowBlocked(handle);
+    }
+
+    [[nodiscard]] bool inputSuspended() const {
+        if (!m_inputSuspensions.isEmpty()) {
+            return true;
+        }
+        bool hasScope = false;
+        // Retained overlays and lazy tool windows can stay registered while
+        // hidden. They must not make blocked visible scopes appear available.
+        for (const RegisteredScope& scope : m_scopeWindows) {
+            if (scope.window != nullptr && scope.window->isVisible()) {
+                hasScope = true;
+                if (!scopeInputBlocked(scope.window)) {
+                    return false;
+                }
+            }
+        }
+        return hasScope;
+    }
+
+    void invalidateHeldKeys() {
+        for (const quint64 key : m_heldKeys) {
+            ++m_keyStateRevisions[key];
+        }
+        m_unreleasedKeys.unite(m_heldKeys);
+        m_heldKeys.clear();
+    }
+
+    void cancelHeldBindings(bool cancelRelease = true) {
+        if (cancelRelease) {
+            cancelReleaseActivations();
+        }
+        struct PendingCancellation {
+            QPointer<QObject> owner;
+            std::function<void()> cancel;
+        };
+        QVector<PendingCancellation> pending;
+        for (RegisteredBinding& registered : m_bindings) {
+            if (!registered.activeReleaseBindings.isEmpty()) {
+                for (const auto& binding : registered.activeReleaseBindings) {
+                    applicationKeyState().releaseOwners.remove(shortcuts::shortcutKeyToken(
+                        binding, shortcuts::ShortcutPolicy::Application));
+                }
+                pending.push_back({registered.owner, registered.binding.cancel});
+                registered.activeReleaseBindings.clear();
+            }
+        }
+        // Detach every hold before calling clients: cancellation can suspend
+        // again or unregister bindings. Each surviving client must still reset.
+        for (const auto& item : pending) {
+            if (item.owner != nullptr && item.cancel) {
+                item.cancel();
+            }
+        }
+    }
+
+    void cancelReleaseActivations(BindingHandle handle = 0, QWidget* scope = nullptr) {
+        for (auto& pending : m_releaseActivations) {
+            if ((handle == 0 || pending.handle == handle) &&
+                (scope == nullptr || pending.scope == scope)) {
+                // Still drain this sequence if its release reaches us. A fresh
+                // physical press after interruption may replace the reservation.
+                pending.handle = 0;
+            }
+        }
+    }
+
+    void cancelPendingTaps(quint64 continuingKey = 0) {
+        for (auto it = m_releaseActivations.begin(); it != m_releaseActivations.end(); ++it) {
+            if (continuingKey != 0 && it.key() == continuingKey) {
+                continue;
+            }
+            const RegisteredBinding* registered = findBinding(it->handle);
+            if (registered != nullptr &&
+                registered->binding.activationTrigger == Binding::ActivationTrigger::Tap) {
+                it->handle = 0;
+            }
+        }
+    }
+
+    [[nodiscard]] RegisteredBinding* findBinding(BindingHandle handle) {
+        const auto binding =
+            std::find_if(m_bindings.begin(), m_bindings.end(),
+                         [handle](const RegisteredBinding& item) { return item.handle == handle; });
+        return binding != m_bindings.end() ? &*binding : nullptr;
+    }
+
+    [[nodiscard]] QVector<Candidate> candidates(const QKeyEvent& event) {
+        QVector<Candidate> result;
+        const bool staleAutoRepeat = isStaleAutoRepeat(event);
+        for (RegisteredBinding& registered : m_bindings) {
+            if (registered.owner == nullptr ||
+                (event.isAutoRepeat() && !staleAutoRepeat && !registered.binding.autoRepeat)) {
+                continue;
+            }
+            const auto match =
+                std::find_if(registered.binding.shortcutBindings.cbegin(),
+                             registered.binding.shortcutBindings.cend(),
+                             [&event, &registered](const auto& binding) {
+                                 return shortcuts::shortcutMatchesEvent(
+                                     binding, event, registered.binding.allowedAdditionalModifiers,
+                                     shortcuts::ShortcutPolicy::Application);
+                             });
+            if (match != registered.binding.shortcutBindings.cend()) {
+                result.push_back(Candidate{registered.handle, registered.binding.priority,
+                                           registered.order, *match});
+            }
+        }
+        sortCandidates(&result);
+        return result;
+    }
+
+    [[nodiscard]] QVector<Candidate> releaseCandidates(const QKeyEvent& event) {
+        QVector<Candidate> result;
+        if (event.isAutoRepeat()) {
+            return result;
+        }
+        for (RegisteredBinding& registered : m_bindings) {
+            if (registered.owner == nullptr || registered.activeReleaseBindings.isEmpty()) {
+                continue;
+            }
+            const auto match = std::find_if(
+                registered.activeReleaseBindings.cbegin(), registered.activeReleaseBindings.cend(),
+                [&event](const auto& binding) {
+                    return shortcuts::shortcutReleaseMatchesEvent(
+                        binding, event, shortcuts::ShortcutPolicy::Application);
+                });
+            if (match != registered.activeReleaseBindings.cend()) {
+                result.push_back(Candidate{registered.handle, registered.binding.priority,
+                                           registered.order, *match});
+            }
+        }
+        sortCandidates(&result);
+        return result;
+    }
+
+    static void sortCandidates(QVector<Candidate>* candidates) {
+        if (candidates == nullptr) {
+            return;
+        }
+        std::stable_sort(candidates->begin(), candidates->end(),
+                         [](const Candidate& left, const Candidate& right) {
+                             if (left.priority != right.priority) {
+                                 return left.priority > right.priority;
+                             }
+                             return left.order < right.order;
+                         });
+    }
+
+    WindowShortcutManager& q;
+    QList<RegisteredScope> m_scopeWindows;
+    QVector<RegisteredBinding> m_bindings;
+    QHash<quint64, PendingActivation> m_releaseActivations;
+    QSet<quint64> m_heldKeys;
+    QSet<quint64>& m_unreleasedKeys;
+    QHash<quint64, quint64>& m_keyStateRevisions;
+    BindingHandle m_nextHandle = 1;
+    quint64 m_nextOrder = 1;
+    InputSuspensionHandle m_nextSuspensionHandle = 1;
+    QSet<InputSuspensionHandle> m_inputSuspensions;
+#ifdef Q_OS_MACOS
+    std::unique_ptr<QAbstractNativeEventFilter> m_nativeInput;
+#endif
+};
+
+WindowShortcutManager::WindowShortcutManager(QObject* parent)
+    : QObject(parent), m_impl(std::make_unique<Impl>(*this)) {
+    if (QCoreApplication* application = QCoreApplication::instance()) {
+        application->installEventFilter(this);
+    }
+}
+
+WindowShortcutManager::~WindowShortcutManager() {
+    for (const auto& scope : m_impl->m_scopeWindows) {
+        disconnect(scope.destroyedConnection);
+    }
+    for (const auto& binding : m_impl->m_bindings) {
+        disconnect(binding.destroyedConnection);
+    }
+    auto& owners = applicationKeyState().releaseOwners;
+    for (auto it = owners.begin(); it != owners.end();) {
+        it = it.value() == this ? owners.erase(it) : std::next(it);
+    }
+    if (QCoreApplication* application = QCoreApplication::instance()) {
+        application->removeEventFilter(this);
+    }
+}
+
+void WindowShortcutManager::addScopeWindow(QWidget* window) {
+    if (window == nullptr) {
+        return;
+    }
+    QWidget* root = window->window();
+    const bool alreadyRegistered = std::any_of(
+        m_impl->m_scopeWindows.cbegin(), m_impl->m_scopeWindows.cend(),
+        [root](const Impl::RegisteredScope& existing) { return existing.window == root; });
+    if (alreadyRegistered) {
+        return;
+    }
+    const auto connection = connect(root, &QObject::destroyed, this, [this]() {
+        for (auto& pending : m_impl->m_releaseActivations) {
+            if (!pending.scope) {
+                pending.handle = 0;
+            }
+        }
+        m_impl->removeScopes();
+    });
+    m_impl->m_scopeWindows.push_back({root, connection});
+}
+
+void WindowShortcutManager::removeScopeWindow(QWidget* window) {
+    QWidget* root = window != nullptr ? window->window() : nullptr;
+    m_impl->cancelReleaseActivations(0, root);
+    m_impl->removeScopes(root);
+}
+
+WindowShortcutManager::InputSuspensionHandle WindowShortcutManager::suspendInput() {
+    const InputSuspensionHandle handle = m_impl->m_nextSuspensionHandle++;
+    m_impl->m_inputSuspensions.insert(handle);
+    m_impl->invalidateHeldKeys();
+    m_impl->cancelHeldBindings();
+    // Modal interactions (for example the native save dialog) move keyboard
+    // input outside the manager's visibility, so the release state of every
+    // held key can no longer be tracked reliably.
+    return handle;
+}
+
+void WindowShortcutManager::resumeInput(InputSuspensionHandle handle) {
+    if (m_impl->m_inputSuspensions.remove(handle) && !m_impl->inputSuspended()) {
+        // Presses observed inside modal interactions may lose their releases too.
+        m_impl->invalidateHeldKeys();
+    }
+}
+
+bool WindowShortcutManager::inputSuspended() const {
+    return m_impl->inputSuspended();
+}
+
+WindowShortcutManager::BindingHandle WindowShortcutManager::addBinding(QObject* owner,
+                                                                       Binding binding) {
+    if (owner == nullptr || !binding.activate ||
+        (binding.activationTrigger != Binding::ActivationTrigger::Press &&
+         (binding.release || binding.cancel || binding.autoRepeat)) ||
+        static_cast<bool>(binding.release) != static_cast<bool>(binding.cancel)) {
+        return 0;
+    }
+    if (binding.shortcutBindings.isEmpty()) {
+        binding.shortcutBindings = shortcutBindingsFromKeyCombinations(
+            binding.keyCombinations, binding.allowModifierOnlyControl);
+    } else {
+        binding.shortcutBindings =
+            normalizedBindings(binding.shortcutBindings, binding.allowModifierOnlyControl);
+    }
+    binding.keyCombinations.clear();
+
+    const BindingHandle handle = m_impl->m_nextHandle++;
+    const auto connection = connect(owner, &QObject::destroyed, this,
+                                    [this, handle]() { static_cast<void>(removeBinding(handle)); });
+    m_impl->m_bindings.push_back(Impl::RegisteredBinding{
+        handle, m_impl->m_nextOrder++, owner, std::move(binding), {}, connection});
+    return handle;
+}
+
+bool WindowShortcutManager::setShortcuts(BindingHandle handle,
+                                         const shortcuts::ShortcutBindingList& shortcuts) {
+    const auto binding = std::find_if(
+        m_impl->m_bindings.begin(), m_impl->m_bindings.end(),
+        [handle](const Impl::RegisteredBinding& item) { return item.handle == handle; });
+    if (binding == m_impl->m_bindings.end()) {
+        return false;
+    }
+    binding->binding.shortcutBindings =
+        normalizedBindings(shortcuts, binding->binding.allowModifierOnlyControl);
+    m_impl->cancelReleaseActivations(handle);
+    return true;
+}
+
+bool WindowShortcutManager::setKeyCombinations(BindingHandle handle,
+                                               const QList<QKeyCombination>& keyCombinations) {
+    const auto* binding = m_impl->findBinding(handle);
+    return binding != nullptr &&
+           setShortcuts(handle, shortcutBindingsFromKeyCombinations(
+                                    keyCombinations, binding->binding.allowModifierOnlyControl));
+}
+
+bool WindowShortcutManager::removeBinding(BindingHandle handle) {
+    m_impl->cancelReleaseActivations(handle);
+    if (const auto* registered = m_impl->findBinding(handle)) {
+        for (const auto& binding : registered->activeReleaseBindings) {
+            applicationKeyState().releaseOwners.remove(
+                shortcuts::shortcutKeyToken(binding, shortcuts::ShortcutPolicy::Application));
+        }
+        disconnect(registered->destroyedConnection);
+    }
+    const auto previousSize = m_impl->m_bindings.size();
+    m_impl->m_bindings.erase(std::remove_if(m_impl->m_bindings.begin(), m_impl->m_bindings.end(),
+                                            [handle](const Impl::RegisteredBinding& item) {
+                                                return item.handle == handle;
+                                            }),
+                             m_impl->m_bindings.end());
+    return m_impl->m_bindings.size() != previousSize;
+}
+
+shortcuts::ShortcutBindingList WindowShortcutManager::shortcutBindingsFromKeyCombinations(
+    const QList<QKeyCombination>& keyCombinations, bool allowModifierOnlyControl) {
+    shortcuts::ShortcutBindingList bindings;
+    for (const QKeyCombination combination : normalizedCombinations(keyCombinations)) {
+        if (combination.key() == Qt::Key_Shift &&
+            combination.keyboardModifiers() == Qt::ShiftModifier) {
+            bindings.push_back(shortcuts::ShortcutBinding{QStringLiteral("Shift")});
+            continue;
+        }
+        if (combination.key() == Qt::Key_Alt &&
+            combination.keyboardModifiers() == Qt::AltModifier) {
+            bindings.push_back(shortcuts::ShortcutBinding{QStringLiteral("Alt")});
+            continue;
+        }
+        if (allowModifierOnlyControl && combination.key() == Qt::Key_Control &&
+            combination.keyboardModifiers() == Qt::ControlModifier) {
+            bindings.push_back(shortcuts::ShortcutBinding{QStringLiteral("Ctrl")});
+            continue;
+        }
+        const QString portable = QKeySequence(combination).toString(QKeySequence::PortableText);
+        const shortcuts::ShortcutBinding binding = shortcuts::bindingFromPortableText(portable);
+        if (!binding.portableText.isEmpty()) {
+            bindings.push_back(binding);
+        }
+    }
+    return normalizedBindings(bindings, allowModifierOnlyControl);
+}
+
+QList<QKeyCombination> WindowShortcutManager::keyCombinationsFromBindings(
+    const shortcuts::ShortcutBindingList& shortcuts) {
+    QList<QKeyCombination> combinations;
+    combinations.reserve(shortcuts.size());
+    for (const shortcuts::ShortcutBinding& binding : shortcuts) {
+        if (binding.portableText.compare(QStringLiteral("Shift"), Qt::CaseInsensitive) == 0) {
+            combinations.push_back(QKeyCombination(Qt::ShiftModifier, Qt::Key_Shift));
+            continue;
+        }
+        if (binding.portableText.compare(QStringLiteral("Alt"), Qt::CaseInsensitive) == 0) {
+            combinations.push_back(QKeyCombination(Qt::AltModifier, Qt::Key_Alt));
+            continue;
+        }
+        const QKeySequence sequence =
+            QKeySequence::fromString(binding.portableText, QKeySequence::PortableText);
+        if (sequence.count() == 1) {
+            combinations.push_back(sequence[0]);
+        }
+    }
+    return normalizedCombinations(combinations);
+}
+
+bool WindowShortcutManager::focusAcceptsTextInput(QWidget* focusWidget) {
+    for (QWidget* current = focusWidget; current != nullptr; current = current->parentWidget()) {
+        if (auto* spinBox = qobject_cast<QAbstractSpinBox*>(current)) {
+            return !spinBox->isReadOnly();
+        }
+        if (auto* lineEdit = qobject_cast<QLineEdit*>(current)) {
+            return !lineEdit->isReadOnly();
+        }
+        if (auto* textEdit = qobject_cast<QTextEdit*>(current)) {
+            return !textEdit->isReadOnly();
+        }
+        if (auto* plainTextEdit = qobject_cast<QPlainTextEdit*>(current)) {
+            return !plainTextEdit->isReadOnly();
+        }
+    }
+    return false;
+}
+
+bool WindowShortcutManager::eventFilter(QObject* watched, QEvent* event) {
+    if (event == nullptr) {
+        return QObject::eventFilter(watched, event);
+    }
+    if (event->type() == QEvent::WindowBlocked || event->type() == QEvent::WindowUnblocked) {
+        if (std::any_of(m_impl->m_scopeWindows.cbegin(), m_impl->m_scopeWindows.cend(),
+                        [watched](const auto& scope) { return scope.window == watched; })) {
+            m_impl->invalidateHeldKeys();
+            if (event->type() == QEvent::WindowBlocked) {
+                m_impl->cancelHeldBindings();
+            }
+        }
+        return false;
+    }
+    if (event->type() == QEvent::Hide || event->type() == QEvent::WindowDeactivate) {
+        if (event->type() == QEvent::WindowDeactivate) {
+            m_impl->cancelPendingTaps();
+        }
+        if (event->type() == QEvent::Hide) {
+            if (auto* widget = qobject_cast<QWidget*>(watched); widget && widget->isWindow()) {
+                m_impl->cancelReleaseActivations(0, widget);
+            }
+        }
+        m_impl->noteScopeInputUnreachable(watched, event->type());
+        return QObject::eventFilter(watched, event);
+    }
+    if (event->type() == QEvent::ApplicationDeactivate) {
+        m_impl->invalidateHeldKeys();
+        m_impl->cancelHeldBindings();
+        return false;
+    }
+    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick ||
+        event->type() == QEvent::Wheel) {
+        m_impl->cancelPendingTaps();
+    }
+    if (event->type() != QEvent::ShortcutOverride && event->type() != QEvent::KeyPress &&
+        event->type() != QEvent::KeyRelease) {
+        return QObject::eventFilter(watched, event);
+    }
+    // QWidgetWindow forwards native input to the focused QWidget. Consuming
+    // that first delivery would bypass the scope and Qt's widget bookkeeping.
+    if (qobject_cast<QWindow*>(watched)) {
+        return false;
+    }
+
+    auto* keyEvent = static_cast<QKeyEvent*>(event);
+    QWidget* scopeWindow = m_impl->scopeForReceiver(watched);
+    const quint64 keyToken =
+        shortcuts::eventKeyToken(*keyEvent, shortcuts::ShortcutPolicy::Application);
+    const bool keyRelease = event->type() == QEvent::KeyRelease;
+    if (event->type() == QEvent::KeyPress) {
+        m_impl->cancelPendingTaps(keyToken);
+    }
+    auto& releaseOwners = applicationKeyState().releaseOwners;
+    if (const auto owner = releaseOwners.value(keyToken); owner && owner != this) {
+        const auto pending = owner->m_impl->m_releaseActivations.constFind(keyToken);
+        if (event->type() == QEvent::KeyPress && !keyEvent->isAutoRepeat() &&
+            pending != owner->m_impl->m_releaseActivations.cend() && pending->handle == 0) {
+            owner->m_impl->m_releaseActivations.remove(keyToken);
+            releaseOwners.remove(keyToken);
+        } else {
+            return false;
+        }
+    }
+    auto pending = m_impl->m_releaseActivations.find(keyToken);
+    if (pending != m_impl->m_releaseActivations.end()) {
+        if (pending->handle == 0 && event->type() == QEvent::KeyPress &&
+            !keyEvent->isAutoRepeat()) {
+            m_impl->m_releaseActivations.erase(pending);
+            releaseOwners.remove(keyToken);
+        } else {
+            event->accept();
+            if (!keyRelease || keyEvent->isAutoRepeat()) {
+                return true;
+            }
+            const auto activation = *pending;
+            m_impl->m_releaseActivations.erase(pending);
+            releaseOwners.remove(keyToken);
+            m_impl->noteKeyRelease(*keyEvent);
+            auto* registered = m_impl->findBinding(activation.handle);
+            if (registered == nullptr || registered->owner == nullptr || !activation.scope ||
+                !activation.scope->isVisible() || m_impl->inputSuspended() ||
+                m_impl->scopeInputBlocked(activation.scope) || scopeWindow == nullptr ||
+                m_impl->scopeInputBlocked(scopeWindow)) {
+                return true;
+            }
+            const QPointer<WindowShortcutManager> guard(this);
+            const QPointer<QObject> owner = registered->owner;
+            const auto eligible = registered->binding.canActivate;
+            const auto activate = registered->binding.activate;
+            const ActivationContext context{watched, QApplication::focusWidget(), keyEvent,
+                                            activation.scope};
+            if ((!eligible || eligible(context)) && guard && owner &&
+                m_impl->findBinding(activation.handle)) {
+                static_cast<void>(activate(context));
+            }
+            // Activation may have destroyed this manager and the event receiver.
+            return true;
+        }
+    }
+    if (keyRelease) {
+        m_impl->noteKeyRelease(*keyEvent);
+    } else if (event->type() == QEvent::KeyPress && !keyEvent->isAutoRepeat()) {
+        m_impl->noteKeyPress(*keyEvent);
+    }
+    QVector<Impl::Candidate> candidates =
+        keyRelease ? m_impl->releaseCandidates(*keyEvent) : m_impl->candidates(*keyEvent);
+    bool heldRepeat = false;
+    if (!keyRelease || keyEvent->isAutoRepeat()) {
+        for (const auto& registered : m_impl->m_bindings) {
+            if (std::any_of(registered.activeReleaseBindings.cbegin(),
+                            registered.activeReleaseBindings.cend(),
+                            [keyEvent](const auto& binding) {
+                                return shortcuts::shortcutReleaseMatchesEvent(
+                                    binding, *keyEvent, shortcuts::ShortcutPolicy::Application);
+                            })) {
+                const auto repeat = std::find_if(
+                    candidates.cbegin(), candidates.cend(),
+                    [&](const auto& candidate) { return candidate.handle == registered.handle; });
+                if (registered.binding.autoRepeat && repeat != candidates.cend()) {
+                    // A repeating held action keeps ownership of the sequence. Only
+                    // its original binding may receive repeats, until physical release.
+                    candidates = {*repeat};
+                    heldRepeat = true;
+                    break;
+                }
+                event->accept();
+                return true;
+            }
+        }
+    }
+    if (m_impl->inputSuspended() || m_impl->scopeInputBlocked(scopeWindow)) {
+        return QObject::eventFilter(watched, event);
+    }
+
+    const bool receiverInScope = scopeWindow != nullptr;
+    const ActivationContext context{watched, QApplication::focusWidget(), keyEvent, scopeWindow};
+    const auto candidateAllowedForReceiver = [this, receiverInScope,
+                                              &context](BindingHandle handle) {
+        if (receiverInScope) {
+            return true;
+        }
+        Impl::RegisteredBinding* registered = m_impl->findBinding(handle);
+        if (registered == nullptr || registered->owner == nullptr) {
+            return false;
+        }
+        const auto canActivateOutsideScope = registered->binding.canActivateOutsideScope;
+        return canActivateOutsideScope && canActivateOutsideScope(context) &&
+               m_impl->findBinding(handle) != nullptr;
+    };
+    if (event->type() == QEvent::ShortcutOverride) {
+        for (const Impl::Candidate& candidate : candidates) {
+            if (!candidateAllowedForReceiver(candidate.handle)) {
+                continue;
+            }
+            Impl::RegisteredBinding* registered = m_impl->findBinding(candidate.handle);
+            if (registered == nullptr || registered->owner == nullptr) {
+                continue;
+            }
+            const auto canActivate = registered->binding.canActivate;
+            if ((!canActivate || canActivate(context)) &&
+                m_impl->findBinding(candidate.handle) != nullptr) {
+                event->accept();
+                return true;
+            }
+        }
+        if (heldRepeat) {
+            event->accept();
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+    if (keyRelease) {
+        if (!keyEvent->isAutoRepeat()) {
+            releaseOwners.remove(keyToken);
+        }
+        // Once a held binding is armed, accept its physical release even if
+        // focus moved to another top-level widget in the same process.
+        bool handled = false;
+        for (const Impl::Candidate& candidate : candidates) {
+            Impl::RegisteredBinding* registered = m_impl->findBinding(candidate.handle);
+            if (registered == nullptr || registered->owner == nullptr) {
+                continue;
+            }
+
+            const auto previousSize = registered->activeReleaseBindings.size();
+            registered->activeReleaseBindings.erase(
+                std::remove_if(registered->activeReleaseBindings.begin(),
+                               registered->activeReleaseBindings.end(),
+                               [keyEvent](const auto& binding) {
+                                   return shortcuts::shortcutReleaseMatchesEvent(
+                                       binding, *keyEvent, shortcuts::ShortcutPolicy::Application);
+                               }),
+                registered->activeReleaseBindings.end());
+            if (registered->activeReleaseBindings.size() == previousSize) {
+                continue;
+            }
+            if (!registered->activeReleaseBindings.isEmpty()) {
+                handled = true;
+                continue;
+            }
+
+            const auto release = registered->binding.release;
+            const QPointer<WindowShortcutManager> guard(this);
+            if (release && release(context)) {
+                handled = true;
+            }
+            if (!guard) {
+                event->accept();
+                return true;
+            }
+        }
+        if (handled) {
+            event->accept();
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+    for (const Impl::Candidate& candidate : candidates) {
+        if (!candidateAllowedForReceiver(candidate.handle)) {
+            continue;
+        }
+        Impl::RegisteredBinding* registered = m_impl->findBinding(candidate.handle);
+        if (registered == nullptr || registered->owner == nullptr) {
+            continue;
+        }
+        const auto canActivate = registered->binding.canActivate;
+        if (canActivate && !canActivate(context)) {
+            continue;
+        }
+        registered = m_impl->findBinding(candidate.handle);
+        if (registered == nullptr || registered->owner == nullptr) {
+            continue;
+        }
+        const auto activate = registered->binding.activate;
+        const bool recovered = m_impl->isStaleAutoRepeat(*keyEvent);
+        if (activate && keyEvent->isAutoRepeat()) {
+            m_impl->noteKeyPress(*keyEvent);
+        }
+        if (registered->binding.activationTrigger != Binding::ActivationTrigger::Press) {
+            m_impl->m_releaseActivations.insert(keyToken, {candidate.handle, scopeWindow});
+            releaseOwners.insert(keyToken, this);
+            event->accept();
+            return true;
+        }
+        const quint64 pressRevision = m_impl->m_keyStateRevisions.value(keyToken);
+        // Arm before entering client code so a synchronous modal dialog,
+        // deactivation, or physical release can end this hold immediately.
+        const bool armed = registered->binding.release &&
+                           !registered->activeReleaseBindings.contains(candidate.binding);
+        if (armed) {
+            registered->activeReleaseBindings.push_back(candidate.binding);
+            releaseOwners.insert(keyToken, this);
+        }
+        const QPointer<WindowShortcutManager> guard(this);
+        const bool activated = activate && activate(context);
+        if (!guard) {
+            event->accept();
+            return true;
+        }
+        if (!activated) {
+            registered = m_impl->findBinding(candidate.handle);
+            if (armed && registered != nullptr) {
+                registered->activeReleaseBindings.removeAll(candidate.binding);
+                releaseOwners.remove(keyToken);
+            }
+            // A declining handler must not consume another manager's recovery
+            // evidence. Do not roll back any newer input/lifecycle transition
+            // that happened reentrantly inside the callback.
+            if (recovered && m_impl->m_keyStateRevisions.value(keyToken) == pressRevision) {
+                m_impl->m_heldKeys.remove(keyToken);
+                m_impl->m_unreleasedKeys.insert(keyToken);
+                ++m_impl->m_keyStateRevisions[keyToken];
+            }
+        }
+        if (activated) {
+            event->accept();
+            return true;
+        }
+    }
+    if (heldRepeat) {
+        event->accept();
+        return true;
+    }
+    return QObject::eventFilter(watched, event);
+}
+
+} // namespace snow_shot::presentation

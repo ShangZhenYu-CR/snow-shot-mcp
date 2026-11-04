@@ -1,0 +1,381 @@
+#pragma once
+
+#include "snow_draw_engine_qt/snow_canvas_types.h"
+
+#include <variant>
+#include <type_traits>
+
+namespace snow_canvas_style_limits {
+inline constexpr double minimumFontSize = 6.0;
+inline constexpr double maximumTextFontSize = 256.0;
+inline constexpr double maximumBadgeFontSize = 512.0;
+inline constexpr double maximumWatermarkFontSize = 512.0;
+} // namespace snow_canvas_style_limits
+
+// Explicit user intent. Display synchronization and programmatic setters do not create edits.
+enum SnowCanvasWatermarkProperty : quint32 {
+    SnowCanvasWatermarkColor = 1u << 0,
+    SnowCanvasWatermarkText = 1u << 1,
+    SnowCanvasWatermarkTemplate = 1u << 2,
+    SnowCanvasWatermarkFontSize = 1u << 3,
+    SnowCanvasWatermarkFontFamily = 1u << 4,
+    SnowCanvasWatermarkAngle = 1u << 5,
+    SnowCanvasWatermarkGap = 1u << 6,
+    SnowCanvasWatermarkOpacity = 1u << 7,
+};
+enum SnowCanvasSpotlightProperty : quint32 {
+    SnowCanvasSpotlightColor = 1u << 0,
+    SnowCanvasSpotlightOpacity = 1u << 1,
+};
+
+struct SnowCanvasShapeEdit {
+    SnowCanvasShapeStyle style;
+    quint32 properties = 0;
+    SnowCanvasShapeKind kind = SnowCanvasShapeKind::Rectangle;
+};
+struct SnowCanvasTextEdit {
+    SnowCanvasTextStyle style;
+    quint32 properties = 0;
+};
+struct SnowCanvasSerialNumberEdit {
+    SnowCanvasSerialNumberStyle style;
+    quint32 properties = 0;
+};
+struct SnowCanvasFilterEdit {
+    SnowCanvasFilterStyle style;
+    quint32 properties = 0;
+    bool pen = false;
+    bool bothFamilies = false;
+};
+struct SnowCanvasWatermarkEdit {
+    SnowCanvasWatermarkConfig style;
+    quint32 properties = 0;
+};
+struct SnowCanvasSpotlightEdit {
+    SnowCanvasSpotlightConfig style;
+    quint32 properties = 0;
+};
+struct SnowCanvasBrushEraserEdit {
+    SnowCanvasBrushEraserStyle style;
+    quint32 properties = SnowCanvasBrushEraserStylePropertyStrokeWidth;
+};
+struct SnowCanvasDistanceEdit {
+    SnowCanvasDistanceStyle style;
+    quint32 properties = 0;
+};
+// Routing is independent of remembering preferences: every successful user edit
+// merges its explicit properties into the corresponding creation style.
+enum class SnowCanvasStyleEditTarget { Creation, Selection };
+struct SnowCanvasBracketStyleEdit {
+    SnowCanvasBracketStyle style;
+    quint32 properties = 0;
+    SnowCanvasStyleEditTarget target = SnowCanvasStyleEditTarget::Creation;
+};
+struct SnowCanvasAngleStyleEdit {
+    SnowCanvasAngleStyle style;
+    quint32 properties = 0;
+    SnowCanvasStyleEditTarget target = SnowCanvasStyleEditTarget::Creation;
+};
+struct SnowCanvasMagnifierEdit {
+    SnowCanvasMagnifierStyle style;
+    quint32 properties = 0;
+    SnowCanvasStyleEditTarget target = SnowCanvasStyleEditTarget::Creation;
+};
+using SnowCanvasStyleEdit =
+    std::variant<SnowCanvasShapeEdit, SnowCanvasTextEdit, SnowCanvasSerialNumberEdit,
+                 SnowCanvasFilterEdit, SnowCanvasWatermarkEdit, SnowCanvasSpotlightEdit,
+                 SnowCanvasBrushEraserEdit, SnowCanvasDistanceEdit, SnowCanvasAngleStyleEdit,
+                 SnowCanvasBracketStyleEdit, SnowCanvasMagnifierEdit>;
+
+inline quint32 snowCanvasCreationStyleProperties(const SnowCanvasStyleEdit& edit) {
+    return std::visit(
+        [](const auto& patch) -> quint32 {
+            using T = std::decay_t<decltype(patch)>;
+            if constexpr (std::is_same_v<T, SnowCanvasSerialNumberEdit>)
+                return patch.properties & ~SnowCanvasSerialNumberStyleMixedNumber;
+            else
+                return patch.properties;
+        },
+        edit);
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasBracketStyle& target,
+                                 const SnowCanvasBracketStyle& value, quint32 properties) {
+    if (properties & 1u)
+        target.stroke = value.stroke;
+    if (properties & 2u)
+        target.strokeWidth = value.strokeWidth;
+}
+inline void snowCanvasMergeStyle(SnowCanvasAngleStyle& target, const SnowCanvasAngleStyle& value,
+                                 quint32 properties) {
+    if (properties & static_cast<quint32>(SnowCanvasAngleStyleProperty::Stroke))
+        target.stroke = value.stroke;
+    if (properties & static_cast<quint32>(SnowCanvasAngleStyleProperty::StrokeWidth))
+        target.strokeWidth = value.strokeWidth;
+    if (properties & static_cast<quint32>(SnowCanvasAngleStyleProperty::Type))
+        target.angleType = value.angleType;
+    if (properties & static_cast<quint32>(SnowCanvasAngleStyleProperty::Unit))
+        target.unit = value.unit;
+    if (properties & static_cast<quint32>(SnowCanvasAngleStyleProperty::DecimalPlaces))
+        target.decimalPlaces = value.decimalPlaces;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasMagnifierStyle& target,
+                                 const SnowCanvasMagnifierStyle& value, quint32 properties) {
+    if (properties & SnowCanvasMagnifierStylePropertyShape)
+        target.shape = value.shape;
+    if (properties & SnowCanvasMagnifierStylePropertyStrokeColor)
+        target.stroke = value.stroke;
+    if (properties & SnowCanvasMagnifierStylePropertyStrokeWidth)
+        target.strokeWidth = value.strokeWidth;
+    if (properties & SnowCanvasMagnifierStylePropertyFactor)
+        target.factor = value.factor;
+    if (properties & SnowCanvasMagnifierStylePropertyConnectionType)
+        target.connectionType = value.connectionType;
+    if (properties & SnowCanvasMagnifierStylePropertySourceOutline)
+        target.sourceOutline = value.sourceOutline;
+    if (properties & SnowCanvasMagnifierStylePropertyLeaderArrowhead)
+        target.leaderArrowhead = value.leaderArrowhead;
+    if (properties & SnowCanvasMagnifierStylePropertyCornerRadius)
+        target.cornerRadii = value.cornerRadii;
+    if (properties & SnowCanvasMagnifierStylePropertyArrowRatio)
+        target.arrowRatio = value.arrowRatio;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasDistanceStyle& target,
+                                 const SnowCanvasDistanceStyle& value, quint32 properties) {
+    if (properties & SnowCanvasDistanceStylePropertyStrokeColor)
+        target.stroke = value.stroke;
+    if (properties & SnowCanvasDistanceStylePropertyStrokeWidth)
+        target.strokeWidth = value.strokeWidth;
+    if (properties & SnowCanvasDistanceStylePropertyFactor)
+        target.factor = value.factor;
+    if (properties & SnowCanvasDistanceStylePropertyUnit)
+        target.unit = value.unit;
+    if (properties & SnowCanvasDistanceStylePropertyDecimalPlaces)
+        target.decimalPlaces = value.decimalPlaces;
+    if (properties & SnowCanvasDistanceStylePropertyEndpointScale)
+        target.endpointScale = value.endpointScale;
+    if (properties & SnowCanvasDistanceStylePropertyEndpointStyle)
+        target.endpointStyle = value.endpointStyle;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasShapeStyle& target, const SnowCanvasShapeStyle& value,
+                                 quint32 properties) {
+    if ((properties & SnowCanvasShapeStylePropertyFillColor) != 0)
+        target.fill = value.fill;
+    if ((properties & SnowCanvasShapeStylePropertyFillStyle) != 0)
+        target.fillStyle = value.fillStyle;
+    if ((properties & SnowCanvasShapeStylePropertyStrokeColor) != 0)
+        target.stroke = value.stroke;
+    if ((properties & SnowCanvasShapeStylePropertyStrokeWidth) != 0)
+        target.strokeWidth = value.strokeWidth;
+    if ((properties & SnowCanvasShapeStylePropertyCornerRadius) != 0)
+        target.cornerRadii = value.cornerRadii;
+    if ((properties & SnowCanvasShapeStylePropertyStartArrowhead) != 0)
+        target.startArrowhead = value.startArrowhead;
+    if ((properties & SnowCanvasShapeStylePropertyEndArrowhead) != 0)
+        target.endArrowhead = value.endArrowhead;
+    if ((properties & SnowCanvasShapeStylePropertyStrokeStyle) != 0)
+        target.strokeStyle = value.strokeStyle;
+    if ((properties & SnowCanvasShapeStylePropertyStrokeRenderingStyle) != 0)
+        target.strokeRenderingStyle = value.strokeRenderingStyle;
+    if ((properties & SnowCanvasShapeStylePropertyArrowShaftType) != 0)
+        target.arrowShaftType = value.arrowShaftType;
+    if ((properties & SnowCanvasShapeStylePropertyArrowOutlineColor) != 0)
+        target.arrowOutlineColor = value.arrowOutlineColor;
+    if ((properties & SnowCanvasShapeStylePropertyArrowOutlineWidth) != 0)
+        target.arrowOutlineWidth = value.arrowOutlineWidth;
+    if ((properties & SnowCanvasShapeStylePropertyArrowRatio) != 0)
+        target.arrowRatio = value.arrowRatio;
+    if ((properties & SnowCanvasShapeStylePropertyArrowType) != 0)
+        target.arrowType = value.arrowType;
+    if ((properties & SnowCanvasShapeStylePropertyOpacity) != 0)
+        target.opacity = value.opacity;
+    if ((properties & SnowCanvasShapeStylePropertyShape) != 0)
+        target.shape = value.shape;
+    if ((properties & SnowCanvasShapeStylePropertyBrushMode) != 0)
+        target.brushMode = value.brushMode;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasTextStyle& target, const SnowCanvasTextStyle& value,
+                                 quint32 properties) {
+    if ((properties & SnowCanvasTextStyleMixedColor) != 0)
+        target.color = value.color;
+    if ((properties & SnowCanvasTextStyleMixedFontSize) != 0)
+        target.fontSize = value.fontSize;
+    if ((properties & SnowCanvasTextStyleMixedFontFamily) != 0)
+        target.fontFamily = value.fontFamily;
+    if ((properties & SnowCanvasTextStyleMixedFill) != 0)
+        target.fill = value.fill;
+    if ((properties & SnowCanvasTextStyleMixedFillStyle) != 0)
+        target.fillStyle = value.fillStyle;
+    if ((properties & SnowCanvasTextStyleMixedStroke) != 0)
+        target.stroke = value.stroke;
+    if ((properties & SnowCanvasTextStyleMixedStrokeWidth) != 0)
+        target.strokeWidth = value.strokeWidth;
+    if ((properties & SnowCanvasTextStyleMixedCornerRadii) != 0)
+        target.cornerRadii = value.cornerRadii;
+    if ((properties & SnowCanvasTextStyleMixedHorizontalAlign) != 0)
+        target.horizontalAlign = value.horizontalAlign;
+    if ((properties & SnowCanvasTextStyleMixedVerticalAlign) != 0)
+        target.verticalAlign = value.verticalAlign;
+    if ((properties & SnowCanvasTextStyleMixedOpacity) != 0)
+        target.opacity = value.opacity;
+    if ((properties & SnowCanvasTextStyleMixedBold) != 0)
+        target.bold = value.bold;
+    if ((properties & SnowCanvasTextStyleMixedItalic) != 0)
+        target.italic = value.italic;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasSerialNumberStyle& target,
+                                 const SnowCanvasSerialNumberStyle& value, quint32 properties) {
+    if ((properties & SnowCanvasSerialNumberStyleMixedNumber) != 0)
+        target.number = value.number;
+    if ((properties & SnowCanvasSerialNumberStyleMixedColor) != 0)
+        target.color = value.color;
+    if ((properties & SnowCanvasSerialNumberStyleMixedFill) != 0)
+        target.fill = value.fill;
+    if ((properties & SnowCanvasSerialNumberStyleMixedFillStyle) != 0)
+        target.fillStyle = value.fillStyle;
+    if ((properties & SnowCanvasSerialNumberStyleMixedFontSize) != 0)
+        target.fontSize = value.fontSize;
+    if ((properties & SnowCanvasSerialNumberStyleMixedFontFamily) != 0)
+        target.fontFamily = value.fontFamily;
+    if ((properties & SnowCanvasSerialNumberStyleMixedStrokeWidth) != 0)
+        target.strokeWidth = value.strokeWidth;
+    if ((properties & SnowCanvasSerialNumberStyleMixedStrokeStyle) != 0)
+        target.strokeStyle = value.strokeStyle;
+    if ((properties & SnowCanvasSerialNumberStyleMixedOpacity) != 0)
+        target.opacity = value.opacity;
+    if ((properties & SnowCanvasSerialNumberStyleMixedNumericType) != 0)
+        target.numericType = value.numericType;
+    if ((properties & SnowCanvasSerialNumberStyleMixedType) != 0)
+        target.type = value.type;
+    if ((properties & SnowCanvasSerialNumberStyleMixedStrokeRenderingStyle) != 0)
+        target.strokeRenderingStyle = value.strokeRenderingStyle;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasFilterStyle& target, const SnowCanvasFilterStyle& value,
+                                 quint32 properties) {
+    if ((properties & SnowCanvasFilterStylePropertyType) != 0)
+        target.type = value.type;
+    if ((properties & SnowCanvasFilterStylePropertyStrength) != 0)
+        target.strength = value.strength;
+    if ((properties & SnowCanvasFilterStylePropertyOpacity) != 0)
+        target.opacity = value.opacity;
+    if ((properties & SnowCanvasFilterStylePropertyStrokeWidth) != 0)
+        target.strokeWidth = value.strokeWidth;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasWatermarkConfig& target,
+                                 const SnowCanvasWatermarkConfig& value, quint32 properties) {
+    if ((properties & SnowCanvasWatermarkColor) != 0)
+        target.color = value.color;
+    if ((properties & SnowCanvasWatermarkText) != 0)
+        target.text = value.text;
+    if ((properties & SnowCanvasWatermarkTemplate) != 0)
+        target.templateValue = value.templateValue;
+    if ((properties & SnowCanvasWatermarkTemplate) != 0)
+        target.templateApplicationTime = value.templateApplicationTime;
+    if ((properties & SnowCanvasWatermarkFontSize) != 0)
+        target.fontSize = value.fontSize;
+    if ((properties & SnowCanvasWatermarkFontFamily) != 0)
+        target.fontFamily = value.fontFamily;
+    if ((properties & SnowCanvasWatermarkAngle) != 0)
+        target.angle = value.angle;
+    if ((properties & SnowCanvasWatermarkGap) != 0)
+        target.gap = value.gap;
+    if ((properties & SnowCanvasWatermarkOpacity) != 0)
+        target.opacity = value.opacity;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasSpotlightConfig& target,
+                                 const SnowCanvasSpotlightConfig& value, quint32 properties) {
+    if ((properties & SnowCanvasSpotlightColor) != 0)
+        target.color = value.color;
+    if ((properties & SnowCanvasSpotlightOpacity) != 0)
+        target.opacity = value.opacity;
+}
+
+inline void snowCanvasMergeStyle(SnowCanvasBrushEraserStyle& target,
+                                 const SnowCanvasBrushEraserStyle& value, quint32 properties) {
+    if ((properties & SnowCanvasBrushEraserStylePropertyStrokeWidth) != 0)
+        target.strokeWidth = value.strokeWidth;
+}
+
+inline void snowCanvasMergeStyleEdit(SnowCanvasStyleDefaults& defaults,
+                                     const SnowCanvasStyleEdit& edit) {
+    std::visit(
+        [&](const auto& patch) {
+            using T = std::decay_t<decltype(patch)>;
+            if constexpr (std::is_same_v<T, SnowCanvasShapeEdit>) {
+                SnowCanvasShapeStyle* target = nullptr;
+                switch (patch.kind) {
+                case SnowCanvasShapeKind::Rectangle:
+                    target = &defaults.rectangle;
+                    break;
+                case SnowCanvasShapeKind::SpeechBubble:
+                    target = &defaults.speechBubble;
+                    break;
+                case SnowCanvasShapeKind::Arrow:
+                    target = &defaults.arrow;
+                    break;
+                case SnowCanvasShapeKind::Line:
+                    target = &defaults.line;
+                    break;
+                case SnowCanvasShapeKind::FreeDraw:
+                    target = &defaults.freeDraw;
+                    break;
+                case SnowCanvasShapeKind::RectangleHighlight:
+                    target = &defaults.rectangleHighlight;
+                    break;
+                case SnowCanvasShapeKind::PenHighlight:
+                    target = &defaults.penHighlight;
+                    break;
+                case SnowCanvasShapeKind::Spotlight:
+                    if ((patch.properties & SnowCanvasShapeStylePropertyShape) != 0)
+                        defaults.spotlightShape = patch.style.shape;
+                    if ((patch.properties & SnowCanvasShapeStylePropertyCornerRadius) != 0)
+                        defaults.spotlightCornerRadii = patch.style.cornerRadii;
+                    break;
+                }
+                if (target != nullptr)
+                    snowCanvasMergeStyle(*target, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasDistanceEdit>) {
+                snowCanvasMergeStyle(defaults.distance, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasAngleStyleEdit>) {
+                snowCanvasMergeStyle(defaults.angle, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasBracketStyleEdit>) {
+                snowCanvasMergeStyle(defaults.bracket, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasMagnifierEdit>) {
+                snowCanvasMergeStyle(defaults.magnifier, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasTextEdit>) {
+                snowCanvasMergeStyle(defaults.text, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasSerialNumberEdit>) {
+                // The next number is owned by the document session, not a style preference.
+                snowCanvasMergeStyle(defaults.serialNumber, patch.style,
+                                     snowCanvasCreationStyleProperties(edit));
+            } else if constexpr (std::is_same_v<T, SnowCanvasFilterEdit>) {
+                if (patch.pen || patch.bothFamilies)
+                    snowCanvasMergeStyle(defaults.penFilter, patch.style, patch.properties);
+                if (!patch.pen || patch.bothFamilies)
+                    snowCanvasMergeStyle(defaults.rectangleFilter, patch.style,
+                                         patch.bothFamilies
+                                             ? patch.properties &
+                                                   ~SnowCanvasFilterStylePropertyStrokeWidth
+                                             : patch.properties);
+                if ((patch.properties & SnowCanvasFilterStylePropertyStrength) != 0) {
+                    defaults.penFilter.strength = patch.style.strength;
+                    defaults.rectangleFilter.strength = patch.style.strength;
+                }
+            } else if constexpr (std::is_same_v<T, SnowCanvasWatermarkEdit>) {
+                snowCanvasMergeStyle(defaults.watermark, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasSpotlightEdit>) {
+                snowCanvasMergeStyle(defaults.spotlight, patch.style, patch.properties);
+            } else if constexpr (std::is_same_v<T, SnowCanvasBrushEraserEdit>) {
+                snowCanvasMergeStyle(defaults.brushEraser, patch.style, patch.properties);
+            }
+        },
+        edit);
+}

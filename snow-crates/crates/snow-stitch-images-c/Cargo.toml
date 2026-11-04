@@ -1,0 +1,27 @@
+[package]
+name = "snow-stitch-images-c"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+snow-memory = { path = "../snow-memory" }
+snow-core = { path = "../snow-core" }
+png = { workspace = true, optional = true }
+snow-stitch-images = { path = "../snow-stitch-images", default-features = false }
+tempfile = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rayon.workspace = true
+
+[features]
+default = ["png-export"]
+png-export = ["dep:png", "dep:tempfile"]
+perf-instrumentation = ["snow-stitch-images/perf-instrumentation"]
+
+[[example]]
+name = "memory_png_benchmark"
+required-features = ["png-export"]

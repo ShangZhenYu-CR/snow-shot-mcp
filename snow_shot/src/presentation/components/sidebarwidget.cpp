@@ -1,0 +1,511 @@
+#include "snow_shot/presentation/components/sidebarwidget.h"
+#include "snow_shot/presentation/components/applicationsearchwidget.h"
+#include "snow_shot/storage/settingsadapters.h"
+#include "snow_shot/storage/applicationstorage.h"
+
+#include <QEvent>
+#include <QItemSelectionModel>
+#include <QPalette>
+#include <QSize>
+#include <QSizePolicy>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QVariant>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
+
+#include "antd_icons.h"
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/presentation/settings/settingsregistry.h"
+#include "widgets/button.h"
+#include "widgets/navigation_menu.h"
+#include "widgets/scroll_area.h"
+
+namespace {
+using adqt::widgets::AdNavigationMenu;
+namespace outlined_icons = adqt::icons::antd::outlined;
+
+constexpr int SIDEBAR_EXPANDED_WIDTH = 220;
+constexpr int SIDEBAR_COLLAPSED_WIDTH = 80;
+constexpr int COLLAPSE_TRIGGER_HEIGHT = 48;
+constexpr int COLLAPSE_TRIGGER_ICON_SIZE = 18;
+
+void applyWindowSurface(QWidget* widget, const QColor& color, bool fillBase = false) {
+    if (widget == nullptr) {
+        return;
+    }
+
+    QPalette palette = widget->palette();
+    palette.setColor(QPalette::Window, color);
+    if (fillBase) {
+        palette.setColor(QPalette::Base, color);
+    }
+    widget->setPalette(palette);
+}
+
+QStandardItem* createActionItem(const QString& stableId, const QString& label,
+                                const adqt::icons::IconRef& icon = adqt::icons::IconRef(),
+                                bool selectable = true) {
+    auto* item = new QStandardItem(label);
+    item->setEditable(false);
+    item->setSelectable(selectable);
+    item->setData(label, Qt::DisplayRole);
+    item->setData(label, Qt::ToolTipRole);
+    item->setData(stableId, AdNavigationMenu::StableIdRole);
+    item->setData(static_cast<int>(AdNavigationMenu::NodeKind::Action),
+                  AdNavigationMenu::NodeKindRole);
+    if (adqt::icons::isValid(icon)) {
+        item->setData(QVariant::fromValue(icon), Qt::DecorationRole);
+    }
+    return item;
+}
+
+QModelIndex findIndexByStableId(const QAbstractItemModel* model, const QString& stableId,
+                                const QModelIndex& parent = QModelIndex()) {
+    if (model == nullptr || stableId.isEmpty()) {
+        return QModelIndex();
+    }
+
+    const int rowCount = model->rowCount(parent);
+    for (int row = 0; row < rowCount; ++row) {
+        const QModelIndex index = model->index(row, 0, parent);
+        if (!index.isValid()) {
+            continue;
+        }
+
+        if (index.data(AdNavigationMenu::StableIdRole).toString() == stableId) {
+            return index;
+        }
+
+        if (const QModelIndex child = findIndexByStableId(model, stableId, index);
+            child.isValid()) {
+            return child;
+        }
+    }
+
+    return QModelIndex();
+}
+
+void expandAncestors(AdNavigationMenu* menu, const QModelIndex& index) {
+    if (menu == nullptr || !index.isValid()) {
+        return;
+    }
+
+    for (QModelIndex parent = index.parent(); parent.isValid(); parent = parent.parent()) {
+        menu->setExpanded(parent, true);
+    }
+}
+
+void selectMenuIndex(AdNavigationMenu* menu, QItemSelectionModel* selectionModel,
+                     const QModelIndex& index, bool revealAncestors) {
+    if (menu == nullptr || selectionModel == nullptr || !index.isValid()) {
+        return;
+    }
+
+    if (revealAncestors) {
+        expandAncestors(menu, index);
+    }
+    selectionModel->setCurrentIndex(index, QItemSelectionModel::NoUpdate);
+    selectionModel->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    menu->setCurrentIndex(index);
+}
+} // namespace
+
+QString SidebarWidget::currentRoute() const {
+    if (!m_currentRoute.isEmpty()) {
+        return m_currentRoute;
+    }
+
+    const auto& catalog = m_registry.catalog();
+    const auto* page = catalog.page(catalog.defaultLocation().pageId);
+    return normalizeRouteKey(page != nullptr ? page->route : QStringLiteral("/"));
+}
+
+bool SidebarWidget::isCollapsed() const {
+    return m_isCollapsed;
+}
+
+void SidebarWidget::setCurrentRoute(const QString& routeKey) {
+    applyRouteSelection(routeKey);
+}
+
+void SidebarWidget::setCollapsed(bool collapsed) {
+    const bool changed = m_isCollapsed != collapsed;
+    m_isCollapsed = collapsed;
+
+    syncCollapsedPresentation();
+
+    if (m_menu != nullptr) {
+        m_menu->setCollapsed(m_isCollapsed);
+    }
+
+    if (changed) {
+        snow_shot::storage::InterfaceSettings().setSidebarCollapsed(m_isCollapsed);
+        emit collapsedChanged(m_isCollapsed);
+    }
+}
+
+QString SidebarWidget::normalizeRouteKey(const QString& routeKey) const {
+    if (m_leafRoutes.contains(routeKey)) {
+        return routeKey;
+    }
+
+    const auto& catalog = m_registry.catalog();
+    const auto* defaultPage = catalog.page(catalog.defaultLocation().pageId);
+    QString defaultRoute = defaultPage != nullptr ? defaultPage->route : QStringLiteral("/");
+    if (m_leafRoutes.contains(defaultRoute)) {
+        return defaultRoute;
+    }
+
+    if (!m_leafRoutes.isEmpty()) {
+        return m_leafRoutes.constFirst();
+    }
+
+    return defaultRoute;
+}
+
+void SidebarWidget::rebuildNavigationModel() {
+    if (m_menu == nullptr || m_menuModel == nullptr) {
+        return;
+    }
+
+    QHash<QString, bool> expansion;
+    for (int row = 0; row < m_menuModel->rowCount(); ++row) {
+        const auto index = m_menuModel->index(row, 0);
+        if (m_menuModel->rowCount(index) > 0) {
+            expansion.insert(index.data(AdNavigationMenu::StableIdRole).toString(),
+                             m_menu->isExpanded(index));
+        }
+    }
+    m_menu->collapseAll();
+    m_menuModel->clear();
+
+    m_leafRoutes.clear();
+    const auto appendPage =
+        [this](QStandardItem* parent,
+               const snow_shot::presentation::settings::SettingsNavigationPageDefinition&
+                   navigationPage) {
+            const auto* page = m_registry.catalog().page(navigationPage.pageId);
+            if (page == nullptr
+#if SNOW_SHOT_ENABLE_EXTENDED_FEATURES
+                || (page->id == QStringLiteral("translation") &&
+                    !snow_shot::storage::ExtendedFeaturesSettings().translationPageEnabled())
+#endif
+            ) {
+                return;
+            }
+            m_leafRoutes.push_back(page->route);
+            const adqt::icons::IconRef icon = parent == nullptr && navigationPage.iconFactory
+                                                  ? navigationPage.iconFactory()
+                                                  : adqt::icons::IconRef();
+            const QString title = navigationPage.title.isValid() ? navigationPage.title.translated()
+                                                                 : page->title.translated();
+            QStandardItem* item = createActionItem(page->route, title, icon);
+            item->setData(page->title.translated(), Qt::ToolTipRole);
+            item->setData(page->description.translated(), Qt::AccessibleDescriptionRole);
+            if (parent != nullptr) {
+                parent->appendRow(item);
+            } else {
+                m_menuModel->appendRow(item);
+            }
+        };
+
+    for (const auto& node : m_registry.navigation()) {
+        if (const auto* navigationPage =
+                std::get_if<snow_shot::presentation::settings::SettingsNavigationPageDefinition>(
+                    &node)) {
+            appendPage(nullptr, *navigationPage);
+            continue;
+        }
+        const auto* group =
+            std::get_if<snow_shot::presentation::settings::SettingsNavigationGroupDefinition>(
+                &node);
+        if (group == nullptr) {
+            continue;
+        }
+        auto* groupItem = createActionItem(
+            group->id, group->title.translated(),
+            group->iconFactory ? group->iconFactory() : adqt::icons::IconRef(), false);
+        for (const auto& navigationPage : group->pages) {
+            appendPage(groupItem, navigationPage);
+        }
+        m_menuModel->appendRow(groupItem);
+    }
+
+    m_menu->setModel(m_menuModel);
+    m_menu->setSelectionModel(m_menuSelectionModel);
+    m_menu->setCurrentIndex(QModelIndex());
+    for (int row = 0; row < m_menuModel->rowCount(); ++row) {
+        const auto index = m_menuModel->index(row, 0);
+        if (m_menuModel->rowCount(index) > 0) {
+            m_menu->setExpanded(
+                index,
+                expansion.value(index.data(AdNavigationMenu::StableIdRole).toString(), true));
+        }
+    }
+}
+
+void SidebarWidget::applyRouteSelection(const QString& routeKey, bool revealAncestors) {
+    if (m_menu == nullptr || m_menuModel == nullptr || m_menuSelectionModel == nullptr) {
+        m_currentRoute.clear();
+        return;
+    }
+
+    const QString resolvedRouteKey = normalizeRouteKey(routeKey);
+    const QModelIndex targetIndex = findIndexByStableId(m_menuModel, resolvedRouteKey);
+    if (!targetIndex.isValid()) {
+        m_currentRoute.clear();
+        return;
+    }
+
+    selectMenuIndex(m_menu, m_menuSelectionModel, targetIndex, revealAncestors);
+    m_currentRoute = resolvedRouteKey;
+}
+
+void SidebarWidget::applyTheme(const snow_shot::presentation::styles::ThemeColorScheme& scheme) {
+    if (m_globalSearch != nullptr) {
+        m_globalSearch->applyTheme(scheme);
+        m_searchButton->setFixedSize(scheme.metricAlias.controlHeight,
+                                     scheme.metricAlias.controlHeight);
+        m_searchContainer->layout()->setContentsMargins(
+            scheme.metricAlias.paddingSM, scheme.metricAlias.paddingXS,
+            scheme.metricAlias.paddingSM, scheme.metricAlias.paddingXXS);
+    }
+    if (m_menu == nullptr) {
+        return;
+    }
+
+    if (!m_skinActive) {
+        // Keep the original theme path free of skin token and opacity work.
+        const QColor background = m_menu->resolvedColorTokens().itemBackground;
+        applyWindowSurface(this, background, true);
+        applyWindowSurface(m_menu, background);
+        applyWindowSurface(m_collapseTrigger, background);
+        update();
+        return;
+    }
+
+    // The sidebar supplies one translucent surface. Its menu, scroll viewport,
+    // and collapse trigger must not composite the same mask a second time.
+    const QColor background = AdNavigationMenu::resolveColorTokens(this).itemBackground;
+    QColor maskedBackground = background;
+    if (m_skinMaskOpacity != 1.0) {
+        maskedBackground.setAlphaF(background.alphaF() * static_cast<float>(m_skinMaskOpacity));
+    }
+    QPalette sidebarPalette = palette();
+    sidebarPalette.setColor(QPalette::Window, maskedBackground);
+    sidebarPalette.setColor(QPalette::Base, background);
+    setPalette(sidebarPalette);
+    update();
+}
+
+void SidebarWidget::setSkinChildrenTransparent(bool transparent) {
+    auto menuTokens = m_menu->componentTokens();
+    if (transparent) {
+        menuTokens.colors.shared.itemBackground = QColor(Qt::transparent);
+        menuTokens.colors.shared.subMenuItemBackground = QColor(Qt::transparent);
+        applyWindowSurface(m_menu, Qt::transparent);
+        applyWindowSurface(m_collapseTrigger, Qt::transparent);
+    } else {
+        menuTokens.colors.shared.itemBackground.reset();
+        menuTokens.colors.shared.subMenuItemBackground.reset();
+    }
+    m_menu->setComponentTokens(menuTokens);
+    m_menu->setAutoFillBackground(!transparent);
+    m_collapseTrigger->setAutoFillBackground(!transparent);
+    if (m_menuScroll != nullptr) {
+        if (transparent) {
+            applyWindowSurface(m_menuScroll, Qt::transparent);
+        } else {
+            // Restore inherited palette roles so future ordinary theme changes
+            // retain the exact original scroll surface without extra updates.
+            m_menuScroll->setPalette(QPalette());
+        }
+        m_menuScroll->setAutoFillBackground(transparent ? false
+                                                        : m_originalScrollAutoFillBackground);
+        if (QWidget* viewport = m_menuScroll->viewport(); viewport != nullptr) {
+            if (transparent) {
+                applyWindowSurface(viewport, Qt::transparent, true);
+            } else {
+                viewport->setPalette(QPalette());
+            }
+            viewport->setAutoFillBackground(transparent ? false
+                                                        : m_originalViewportAutoFillBackground);
+        }
+    }
+}
+
+void SidebarWidget::setSkinMaskOpacity(qreal opacity, bool skinActive) {
+    const qreal normalized = std::isfinite(opacity) ? std::clamp(opacity, 0.0, 1.0) : 1.0;
+    const bool active = skinActive || normalized < 1.0;
+    if (m_skinMaskOpacity == normalized && m_skinActive == active) {
+        return;
+    }
+    const bool activeChanged = m_skinActive != active;
+    m_skinMaskOpacity = normalized;
+    m_skinActive = active;
+    if (activeChanged) {
+        setSkinChildrenTransparent(active);
+    }
+    applyTheme(snow_shot::presentation::styles::ThemeManager::instance().themeColorScheme());
+}
+
+SidebarWidget::SidebarWidget(const snow_shot::presentation::settings::SettingsRegistry& registry,
+                             QWidget* parent)
+    : QFrame(parent), m_registry(registry) {
+    setAutoFillBackground(true);
+
+    auto* sidebarLayout = new QVBoxLayout(this);
+    sidebarLayout->setContentsMargins(0, 0, 0, 0);
+    sidebarLayout->setSpacing(0);
+
+    const auto& metric =
+        snow_shot::presentation::styles::ThemeManager::instance().themeColorScheme().metricAlias;
+    m_searchContainer = new QWidget(this);
+    m_searchContainer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    auto* searchLayout = new QVBoxLayout(m_searchContainer);
+    searchLayout->setSpacing(0);
+    m_globalSearch = new ApplicationSearchWidget(registry, metric, m_searchContainer);
+    m_globalSearch->setObjectName(QStringLiteral("globalTopSearchBar"));
+    m_globalSearch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    searchLayout->addWidget(m_globalSearch);
+    m_searchButton = new adqt::widgets::AdButton(m_searchContainer);
+    m_searchButton->setObjectName(QStringLiteral("sidebarSearchButton"));
+    m_searchButton->setButtonStyle(adqt::widgets::AdButton::ButtonStyle::Text);
+    m_searchButton->setAccentRole(adqt::widgets::AdButton::AccentRole::Neutral);
+    m_searchButton->setIconRef(outlined_icons::Search());
+    searchLayout->addWidget(m_searchButton, 0, Qt::AlignHCenter);
+    sidebarLayout->addWidget(m_searchContainer);
+    connect(m_globalSearch, &ApplicationSearchWidget::locationActivated, this,
+            &SidebarWidget::locationRequested);
+    connect(m_searchButton, &adqt::widgets::AdButton::clicked, this, [this] {
+        setCollapsed(false);
+        m_globalSearch->setFocus(Qt::ShortcutFocusReason);
+    });
+
+    m_menu = new AdNavigationMenu(this);
+    m_menu->setMode(AdNavigationMenu::Mode::Inline);
+    m_menu->setAutoFillBackground(true);
+    auto menuTokens = m_menu->componentTokens();
+    // The fixed search container owns the gap so it cannot scroll out of view.
+    menuTokens.metrics.rootPaddingBlockStart = 0;
+    m_menu->setComponentTokens(menuTokens);
+    m_menu->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    m_menuModel = new QStandardItemModel(m_menu);
+    m_menuSelectionModel = new QItemSelectionModel(m_menuModel, m_menu);
+
+    rebuildNavigationModel();
+    auto* menuScroll = new adqt::widgets::AdScrollArea(this);
+    m_menuScroll = menuScroll;
+    menuScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    menuScroll->setContentWidget(m_menu);
+    m_originalScrollAutoFillBackground = menuScroll->autoFillBackground();
+    m_originalViewportAutoFillBackground = menuScroll->viewport()->autoFillBackground();
+    sidebarLayout->addWidget(menuScroll, 1);
+
+    m_collapseTrigger = new QFrame(this);
+    m_collapseTrigger->setObjectName(QStringLiteral("sidebarCollapseTrigger"));
+    m_collapseTrigger->setAutoFillBackground(true);
+    m_collapseTrigger->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_collapseTrigger->setFixedHeight(COLLAPSE_TRIGGER_HEIGHT);
+
+    auto* collapseTriggerLayout = new QVBoxLayout(m_collapseTrigger);
+    collapseTriggerLayout->setContentsMargins(0, 0, 0, 0);
+    collapseTriggerLayout->setSpacing(0);
+
+    m_collapseButton = new adqt::widgets::AdButton(m_collapseTrigger);
+    m_collapseButton->setObjectName(QStringLiteral("sidebarCollapseButton"));
+    m_collapseButton->setButtonStyle(adqt::widgets::AdButton::ButtonStyle::Text);
+    m_collapseButton->setAccentRole(adqt::widgets::AdButton::AccentRole::Neutral);
+    m_collapseButton->setShape(adqt::widgets::AdButton::Shape::Rectangle);
+    m_collapseButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_collapseButton->setFixedHeight(COLLAPSE_TRIGGER_HEIGHT);
+    m_collapseButton->setIconSize(QSize(COLLAPSE_TRIGGER_ICON_SIZE, COLLAPSE_TRIGGER_ICON_SIZE));
+    m_collapseButton->setCursor(Qt::PointingHandCursor);
+    collapseTriggerLayout->addWidget(m_collapseButton);
+    sidebarLayout->addWidget(m_collapseTrigger);
+
+    const auto& themeManager = snow_shot::presentation::styles::ThemeManager::instance();
+    connect(&themeManager, &snow_shot::presentation::styles::ThemeManager::themeChanged, this,
+            &SidebarWidget::applyTheme);
+    applyTheme(themeManager.themeColorScheme());
+
+    connect(m_collapseButton, &adqt::widgets::AdButton::clicked, this,
+            [this]() { setCollapsed(!m_isCollapsed); });
+
+    connect(m_menu, &AdNavigationMenu::activated, this, [this](const QModelIndex& index) {
+        if (!index.isValid() || m_menuModel == nullptr || m_menuModel->rowCount(index) > 0) {
+            return;
+        }
+
+        const QString routeKey = index.data(AdNavigationMenu::StableIdRole).toString();
+        if (!m_leafRoutes.contains(routeKey)) {
+            return;
+        }
+
+        applyRouteSelection(routeKey);
+        emit routeSelected(routeKey);
+    });
+
+    const auto& catalog = m_registry.catalog();
+    const auto* defaultPage = catalog.page(catalog.defaultLocation().pageId);
+    setCurrentRoute(defaultPage != nullptr ? defaultPage->route : QStringLiteral("/"));
+    setCollapsed(snow_shot::storage::InterfaceSettings().sidebarCollapsed());
+#if SNOW_SHOT_ENABLE_EXTENDED_FEATURES
+    connect(&snow_shot::storage::ApplicationStorage::instance().configuration(),
+            &snow_shot::storage::ConfigurationStore::valueChanged, this,
+            [this](const QString& key, const QJsonValue&) {
+                if (key != QStringLiteral("extended_features/translation_page_enabled")) {
+                    return;
+                }
+                const QString route =
+                    m_currentRoute == QStringLiteral("/tools/translation") &&
+                            !snow_shot::storage::ExtendedFeaturesSettings().translationPageEnabled()
+                        ? QStringLiteral("/settings/text-recognition-translation")
+                        : m_currentRoute;
+                rebuildNavigationModel();
+                applyRouteSelection(route, route != m_currentRoute);
+            });
+#endif
+}
+
+void SidebarWidget::changeEvent(QEvent* event) {
+    QFrame::changeEvent(event);
+    if (event->type() != QEvent::LanguageChange) {
+        return;
+    }
+
+    const QString route = m_currentRoute;
+    rebuildNavigationModel();
+    applyRouteSelection(route);
+    syncCollapsedPresentation();
+}
+
+void SidebarWidget::syncCollapsedPresentation() {
+    if (m_globalSearch != nullptr) {
+        const QString searchText = tr("Search Function");
+        m_globalSearch->setPlaceholderText(searchText);
+        m_globalSearch->setVisible(!m_isCollapsed);
+        m_searchButton->setVisible(m_isCollapsed);
+        m_searchButton->setToolTip(searchText);
+        m_searchButton->setAccessibleName(searchText);
+    }
+    if (m_menu != nullptr) {
+        const int width = m_isCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
+        setFixedWidth(width);
+    }
+
+    if (m_collapseButton == nullptr) {
+        return;
+    }
+
+    const bool expanding = m_isCollapsed;
+    m_collapseButton->setIconRef(expanding ? outlined_icons::MenuUnfold()
+                                           : outlined_icons::MenuFold());
+    const QString actionText = expanding ? tr("Expand navigation") : tr("Collapse navigation");
+    m_collapseButton->setToolTip(actionText);
+    m_collapseButton->setAccessibleName(actionText);
+}

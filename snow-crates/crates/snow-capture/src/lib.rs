@@ -1,0 +1,87 @@
+#![allow(clippy::too_many_arguments)]
+
+pub mod backend;
+pub mod capture_session;
+pub mod color_effect;
+pub mod convert;
+mod cursor_compositor;
+pub mod cursor_snapshot;
+pub mod error;
+pub mod exclusions;
+pub mod frame;
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod frame_pages;
+#[cfg(windows)]
+pub mod gpu;
+pub mod monitor;
+pub mod packed_pixels;
+mod platform;
+pub mod region;
+pub mod streaming;
+pub mod system;
+pub mod timing;
+pub mod window;
+
+use error::CaptureResult;
+use frame::Frame;
+
+#[derive(Clone)]
+pub enum CaptureTarget {
+    PrimaryMonitor,
+
+    Monitor(monitor::MonitorId),
+
+    /// Capture a top-level window by native window handle.
+    ///
+    /// On the DXGI duplication backend, the window's monitor is captured
+    /// and the result is cropped to the window's desktop bounds.  WGC
+    /// captures the window directly. GDI captures the window directly
+    /// via native Win32 window rendering.
+    Window(window::WindowId),
+
+    /// Capture a rectangular region in virtual desktop coordinates.
+    /// The region may span multiple monitors. The layout is snapshotted
+    /// once at session creation via [`MonitorLayout`](region::MonitorLayout).
+    Region(region::CaptureRegion),
+}
+
+pub use backend::{CaptureWorkload, WgcUpdateMode};
+pub use capture_session::{CaptureSession, CaptureTargetInfo};
+pub use frame::{
+    CaptureEvent, CapturePixelFormat, CapturedFrame, ColorSpace, DirtyRect, FrameMetadata,
+};
+pub use monitor::MonitorId;
+pub use region::{CaptureRegion, MonitorLayout};
+pub use streaming::{
+    CaptureStream, CaptureStreamConfig, CaptureStreamStats, CaptureStreamStatsSnapshot,
+};
+pub use system::{CaptureOptions, CaptureSystem, CaptureSystemBuilder};
+#[cfg(feature = "stage-timing")]
+pub use timing::StageTiming;
+pub use window::WindowId;
+
+pub fn capture_once(target: &CaptureTarget) -> CaptureResult<Frame> {
+    let system = CaptureSystem::builder().build()?;
+    let mut session = system.open_session(target.clone(), CaptureOptions::default())?;
+    session.capture()
+}
+
+#[cfg(feature = "stage-timing")]
+pub mod pixel_counters;
+
+pub(crate) fn admit_raster(width: u32, height: u32) -> CaptureResult<()> {
+    if snow_core::raster_admission::allows(width, height) {
+        Ok(())
+    } else {
+        Err(error::CaptureError::InvalidConfig(
+            "raster admission rejected".into(),
+        ))
+    }
+}
+
+pub mod capabilities;
+#[cfg(target_os = "macos")]
+pub mod native;
+
+pub mod tuning;
+pub use tuning::BackendTuning;

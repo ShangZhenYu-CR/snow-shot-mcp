@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""Stage and verify macOS OCR runtimes and optional bundled models."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / 'snow_shot/packaging/snow-shot-ocr-asset-manifest.json'
+RUNTIME_FILES = ('snow-ocr-process',)
+ARM64_HEADER = bytes.fromhex('cffaedfe0c000001')
+X64_HEADER = bytes.fromhex('cffaedfe07000001')
+ARCHITECTURES = {
+    'arm64': dict(header=ARM64_HEADER, slice='arm64', worker='aarch64', label='ARM64'),
+    'x64': dict(header=X64_HEADER, slice='x86_64', worker='x86_64', label='x64'),
+}
+
+
+def run(*args):
+    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=60).strip()
+
+
+def descriptor(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return dict(name=path.name, size=path.stat().st_size, sha256=digest.hexdigest())
+
+
+def valid(path, expected):
+    return (path.is_file() and not path.is_symlink()
+            and path.stat().st_size == expected['size']
+            and descriptor(path)['sha256'] == expected['sha256'])
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode()
+    if path.exists() and path.read_bytes() == data:
+        return
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(data)
+            output.close()
+            temporary.chmod(0o644)
+            temporary.replace(path)
+        finally:
+            output.close()
+            temporary.unlink(missing_ok=True)
+
+
+def fetch(expected, destination):
+    if valid(destination, expected):
+        return
+    url = expected['url']
+    if not url.startswith('https://'):
+        raise ValueError('OCR models require HTTPS')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Unique partial files let independent build trees share the artifact cache.
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+        partial = Path(output.name)
+        try:
+            print(f'Downloading {expected["name"]}', flush=True)
+            with urllib.request.urlopen(url, timeout=120) as response:
+                if not response.url.startswith('https://'):
+                    raise ValueError('OCR model redirect must use HTTPS')
+                shutil.copyfileobj(response, output)
+            output.close()
+            if not valid(partial, expected):
+                raise ValueError(f'OCR model integrity check failed: {expected["name"]}')
+            partial.replace(destination)
+        finally:
+            output.close()
+            partial.unlink(missing_ok=True)
+
+
+def copy_changed(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == destination.resolve():
+        return
+    if not valid(destination, descriptor(source)):
+        shutil.copy2(source, destination)
+
+
+def stage_native_dependencies(worker, library_directory, runtime):
+    """Supply the worker's Crashpad dependency closure for build-tree execution.
+
+    macdeployqt moves the used closure to Frameworks during installation; these
+    development copies are removed before the final bundle is sealed.
+    """
+    pending = [worker.resolve()]
+    visited = set()
+    names = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        identities = run('/usr/bin/otool', '-D', str(current)).splitlines()[1:]
+        for line in run('/usr/bin/otool', '-L', str(current)).splitlines()[1:]:
+            dependency = line.strip().split(' (compatibility')[0]
+            if dependency in identities or dependency.startswith(('/usr/lib/', '/System/Library/')):
+                continue
+            if dependency.startswith('@rpath/'):
+                source = library_directory / dependency[len('@rpath/'):]
+            elif dependency.startswith('@loader_path/'):
+                source = current.parent / dependency[len('@loader_path/'):]
+            else:
+                source = Path(dependency)
+            if not source.is_file() or source.suffix != '.dylib':
+                raise ValueError(f'Cannot stage OCR native dependency: {dependency}')
+            copy_changed(source, runtime / source.name)
+            names.add(source.name)
+            pending.append(source.resolve())
+    # Reconcile the previous closure instead of retaining dependencies of an
+    # older worker. Current dependencies have already been verified and staged.
+    remove_development_libraries(runtime, retained=names)
+
+
+def remove_development_libraries(runtime, retained=()):
+    bundled_models_directory(runtime)
+    marker = runtime / 'assets/ocr/development-libraries.json'
+    names = json.loads(marker.read_text()) if marker.exists() else []
+    for name in names:
+        if Path(name).name != name or not name.endswith('.dylib') or name in RUNTIME_FILES:
+            raise ValueError('Invalid development library inventory')
+    retained = set(retained)
+    names = set(names) - retained
+    # The former runtime itself was staged separately from its dependency
+    # inventory. Remove it even when the old inventory is absent.
+    names.add('libonnxruntime.dylib')
+    staged_libraries = {runtime.resolve() / name for name in names}
+    # CMake may stage versioned dylib symlinks alongside the temporary files.
+    # Remove links before their targets so the signed bundle has no dangling code.
+    staged_links = [path for path in runtime.iterdir()
+                    if path.is_symlink() and path.resolve() in staged_libraries]
+    for path in staged_links:
+        path.unlink()
+    for name in names:
+        (runtime / name).unlink(missing_ok=True)
+    if retained:
+        atomic_json(marker, sorted(retained))
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def deploy_native_libraries(app, library_directory):
+    """Resolve the pinned native closure before macdeployqt handles Qt itself.
+
+    CMake removes build rpaths on install. macdeployqt's -libpath search does
+    not resolve every third-party @rpath load, so make those loads explicit and
+    relocatable before invoking it.
+    """
+    runtime = app / 'Contents/MacOS'
+    # Resolve the live binaries from the supplied library directory. Stale
+    # development copies must not become independent deployment roots.
+    remove_development_libraries(runtime)
+    frameworks = app / 'Contents/Frameworks'
+    frameworks.mkdir(parents=True, exist_ok=True)
+    pending = [p for directory in (runtime, frameworks) for p in directory.iterdir()
+               if p.is_file() and not p.is_symlink()
+               and p.read_bytes()[:4] == bytes.fromhex('cffaedfe')]
+    visited = set()
+    copied = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        identities = run('/usr/bin/otool', '-D', str(current)).splitlines()[1:]
+        for line in run('/usr/bin/otool', '-L', str(current)).splitlines()[1:]:
+            dependency = line.strip().split(' (compatibility')[0]
+            if dependency in identities or dependency.startswith(('/usr/lib/', '/System/Library/')):
+                continue
+            # Qt deployment owns its framework/plugin closure.
+            if '.framework/' in dependency:
+                continue
+            name = Path(dependency).name
+            source = library_directory / name
+            destination = frameworks / name
+            if source.is_file():
+                if name not in copied:
+                    copy_changed(source, destination)
+                    run('/usr/bin/install_name_tool', '-id', '@rpath/' + name, str(destination))
+                    copied.add(name)
+                    pending.append(destination)
+            elif not destination.is_file():
+                raise ValueError(f'Cannot deploy native dependency of {current}: {dependency}')
+            relative = '@loader_path/' + os.path.relpath(destination, current.parent)
+            if dependency != relative:
+                run('/usr/bin/install_name_tool', '-change', dependency, relative, str(current))
+        loads = run('/usr/bin/otool', '-l', str(current)).splitlines()
+        for i, line in enumerate(loads):
+            if line.strip() == 'cmd LC_RPATH':
+                value = loads[i + 2].strip().split(' (offset')[0].removeprefix('path ')
+                if not value.startswith(('@loader_path', '@executable_path', '/usr/lib/', '/System/Library/')):
+                    run('/usr/bin/install_name_tool', '-delete_rpath', value, str(current))
+
+
+def require_real_directory(path):
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise ValueError(f'Invalid bundled resource directory: {path}')
+
+
+def validate_bundle_directories(app):
+    for relative in ('Contents', 'Contents/MacOS', 'Contents/Resources'):
+        require_real_directory(app / relative)
+
+
+def remove_legacy_shutter_audio(app):
+    # macOS plays the embedded Qt resource. Remove the obsolete loose copy from
+    # reused stages, then prune only empty directories and their runtime links.
+    for name in ('MacOS', 'Resources'):
+        directory = app / 'Contents' / name / 'audios'
+        if not directory.exists():
+            continue
+        (directory / 'camera_shutter.mp3').unlink(missing_ok=True)
+        if not any(directory.iterdir()):
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                directory.rmdir()
+
+
+def prepare_bundle(app, library_directory=None, runtime_only=False):
+    """Seal data as resources while preserving executable-relative lookup paths.
+
+    codesign interprets regular files inside MacOS as nested code. Directory
+    symlinks preserve executable-relative resource lookup without signing model
+    files or JSON as executable code.
+    """
+    validate_bundle_directories(app)
+    if runtime_only:
+        directories = [app / 'Contents' / name for name in ('MacOS', 'Resources')]
+        for directory in directories:
+            bundled_models_directory(directory)
+        # Remove both payloads before merging resources. A stale destination
+        # models link must never let copytree write into an external cache.
+        for directory in directories:
+            remove_bundled_models(directory)
+    for name in ('assets', 'audios'):
+        source = app / 'Contents/MacOS' / name
+        destination = app / 'Contents/Resources' / name
+        if source.is_symlink():
+            if (source.readlink() != Path('../Resources') / name
+                    or destination.is_symlink() or not destination.is_dir()):
+                raise ValueError(f'Invalid bundled resource link: {source}')
+            continue
+        require_real_directory(destination)
+        if not source.exists():
+            continue
+        if not source.is_dir() or destination.is_symlink():
+            raise ValueError(f'Invalid bundled resource directory: {source}')
+        if name == 'audios':
+            # Neither copytree nor copy2 may follow a stale audio-file link
+            # into an external directory while merging a reused stage.
+            for directory in (source, destination):
+                obsolete = directory / 'camera_shutter.mp3'
+                if obsolete.is_symlink():
+                    obsolete.unlink()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+            shutil.rmtree(source)
+        else:
+            source.rename(destination)
+        source.symlink_to(Path('../Resources') / name, target_is_directory=True)
+    remove_legacy_shutter_audio(app)
+    if runtime_only:
+        verify_no_bundled_models(app / 'Contents/Resources')
+    if library_directory is not None:
+        deploy_native_libraries(app, library_directory)
+    else:
+        remove_development_libraries(app / 'Contents/MacOS')
+
+
+def stage_models(manifest, cache, destination, all_models=False):
+    for model in manifest['models']:
+        if not all_models and model['type'] != 'small':
+            continue
+        for item in model['files']:
+            cached = cache / ('ocr-models-' + model['id']) / item['name']
+            fetch(item, cached)
+            bundled = destination / model['id'] / item['name']
+            copy_changed(cached, bundled)
+            bundled.chmod(0o644)
+        atomic_json(destination / model['id'] / '.complete.json',
+                    dict(schema=1, component=model['id']))
+
+
+def runtime_manifest(source, runtime, arch='arm64'):
+    architecture = ARCHITECTURES[arch]
+    version = source['runtime']['version']
+    runtime_files = RUNTIME_FILES
+    for name in runtime_files:
+        path = runtime / name
+        with path.open('rb') as binary:
+            header = binary.read(32)
+        if len(header) != 32 or header[:8] != architecture['header']:
+            raise ValueError(f'Expected a thin {architecture["label"]} Mach-O binary: {path}')
+    if not os.access(runtime / RUNTIME_FILES[0], os.X_OK):
+        raise ValueError('The OCR worker is not executable')
+    expected = f'snow-ocr-process {version} macos-{architecture["worker"]} protocol 7'
+    if run(str(runtime / RUNTIME_FILES[0]), '--version') != expected:
+        raise ValueError('The OCR worker version/protocol does not match the application')
+    return dict(schema=3, default_model='small', runtime=dict(
+        version=version, platform=f'macos-{arch}', delivery='bundled', protocol=7,
+        executable=RUNTIME_FILES[0],
+        files=[descriptor(runtime / n) for n in runtime_files]),
+        models=source['models'])
+
+
+def bundled_models_directory(runtime):
+    """Validate every package-owned parent before touching the model subtree."""
+    require_real_directory(runtime)
+    assets = runtime / 'assets'
+    is_bundle_directory = runtime.name in ('MacOS', 'Resources') and runtime.parent.name == 'Contents'
+    if is_bundle_directory:
+        validate_bundle_directories(runtime.parent.parent)
+    if assets.is_symlink():
+        if (not is_bundle_directory or runtime.name != 'MacOS'
+                or assets.readlink() != Path('../Resources/assets')):
+            raise ValueError(f'Invalid bundled resource link: {assets}')
+        assets = runtime.parent / 'Resources/assets'
+        if assets.is_symlink() or not assets.is_dir():
+            raise ValueError(f'Invalid bundled resource link: {assets}')
+    require_real_directory(assets)
+    require_real_directory(assets / 'ocr')
+    return assets / 'ocr/models'
+
+
+def remove_bundled_models(runtime):
+    """Make reused Mini staging trees model-free without touching the cache."""
+    directory = bundled_models_directory(runtime)
+    if directory.is_symlink() or directory.is_file():
+        directory.unlink()
+    elif directory.exists():
+        shutil.rmtree(directory)
+
+
+def verify_no_bundled_models(runtime):
+    directory = bundled_models_directory(runtime)
+    if directory.exists() or directory.is_symlink():
+        raise ValueError(f'Runtime-only OCR package must not contain bundled models: {directory}')
+
+
+def finalize(source, runtime, runtime_only=False, arch='arm64'):
+    if runtime_only:
+        verify_no_bundled_models(runtime)
+    manifest = runtime_manifest(source, runtime, arch)
+    atomic_json(runtime / 'assets/ocr/asset-manifest.json', manifest)
+
+
+def verify_assets(source, runtime, runtime_only=False, arch='arm64'):
+    if runtime_only:
+        verify_no_bundled_models(runtime)
+    actual = json.loads((runtime / 'assets/ocr/asset-manifest.json').read_text())
+    if actual != runtime_manifest(source, runtime, arch):
+        raise ValueError('Bundled OCR manifest does not match finalized runtime bytes')
+    if runtime_only:
+        return actual
+    small = next(m for m in source['models'] if m['type'] == 'small')
+    directory = runtime / 'assets/ocr/models' / small['id']
+    for item in small['files']:
+        if not valid(directory / item['name'], item):
+            raise ValueError(f'Missing or corrupt bundled model: {item["name"]}')
+    if json.loads((directory / '.complete.json').read_text()) != dict(schema=1, component=small['id']):
+        raise ValueError('Invalid bundled model completion marker')
+    return actual
+
+
+def verify_bundle(app, arch='arm64'):
+    """Reject unresolved Mach-O loads and build-machine paths, including LC_RPATH."""
+    executable_root = app / 'Contents/MacOS'
+    architecture = ARCHITECTURES[arch]
+    target_slice = architecture['slice']
+    checked = []
+    for path in sorted(app.rglob('*')):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with path.open('rb') as source:
+            magic = source.read(4)
+        if magic not in (bytes.fromhex('cffaedfe'), bytes.fromhex('cafebabe'),
+                         bytes.fromhex('cafebabf')):
+            continue
+        if target_slice not in run('/usr/bin/lipo', '-archs', str(path)).split():
+            raise ValueError(f'Non-{architecture["label"]} bundle dependency: {path}')
+        loads = run('/usr/bin/otool', '-arch', target_slice, '-l', str(path)).splitlines()
+        rpaths = []
+        for i, line in enumerate(loads):
+            if line.strip() == 'cmd LC_RPATH':
+                rpaths.append(loads[i + 2].strip().split(' (offset')[0].removeprefix('path '))
+            if line.strip().startswith('minos '):
+                minimum = tuple(int(part) for part in line.split()[1].split('.'))
+                if minimum > (15, 0, 0)[:len(minimum)]:
+                    raise ValueError(f'Bundle dependency requires newer than macOS 15: {path}')
+        def expand(value):
+            return Path(value.replace('@loader_path', str(path.parent))
+                        .replace('@executable_path', str(executable_root)))
+        for value in rpaths:
+            if not value.startswith(('@loader_path', '@executable_path', '/usr/lib', '/System/Library')):
+                raise ValueError(f'Non-relocatable rpath in {path}: {value}')
+            if value.startswith('@') and not expand(value).resolve().is_relative_to(app.resolve()):
+                raise ValueError(f'Bundle rpath escapes the app in {path}: {value}')
+        dependencies = run('/usr/bin/otool', '-arch', target_slice, '-L', str(path)).splitlines()[1:]
+        ids = run('/usr/bin/otool', '-arch', target_slice, '-D', str(path)).splitlines()[1:]
+        for line in dependencies:
+            dependency = line.strip().split(' (compatibility')[0]
+            if dependency in ids or dependency.startswith(('/usr/lib/', '/System/Library/')):
+                continue
+            if dependency.startswith('@rpath/'):
+                suffix = dependency[len('@rpath/'):]
+                candidates = [expand(p) / suffix for p in rpaths]
+                candidates.append(app / 'Contents/Frameworks' / suffix)
+            elif dependency.startswith(('@loader_path/', '@executable_path/')):
+                candidates = [expand(dependency)]
+            else:
+                raise ValueError(f'Non-relocatable dependency in {path}: {dependency}')
+            if not any(p.is_file() and p.resolve().is_relative_to(app.resolve()) for p in candidates):
+                raise ValueError(f'Unresolved dependency in {path}: {dependency}')
+        checked.append(str(path.relative_to(app)))
+    run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(app))
+    return checked
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('stage', 'finalize', 'verify', 'fetch-models', 'prepare-bundle'))
+    parser.add_argument('--arch', choices=ARCHITECTURES, default='arm64')
+    parser.add_argument('--manifest', type=Path, default=MANIFEST)
+    parser.add_argument('--runtime-dir', type=Path)
+    parser.add_argument('--cache', type=Path, default=ROOT / 'artifacts')
+    parser.add_argument('--worker', type=Path)
+    parser.add_argument('--library-dir', type=Path)
+    parser.add_argument('--model-root', type=Path)
+    parser.add_argument('--app', type=Path)
+    parser.add_argument('--report', type=Path)
+    parser.add_argument('--deployed', action='store_true',
+                        help='Finalize after macdeployqt has moved dependencies into Frameworks')
+    parser.add_argument('--runtime-only', action='store_true',
+                        help='Package the OCR runtime without bundled models')
+    args = parser.parse_args()
+    if args.runtime_only and args.command == 'fetch-models':
+        parser.error('--runtime-only cannot be used with fetch-models')
+    if args.command == 'prepare-bundle':
+        if args.app is None:
+            parser.error('--app is required')
+        prepare_bundle(args.app.resolve(), args.library_dir, args.runtime_only)
+        return
+    source = json.loads(args.manifest.read_text())
+    if args.command == 'fetch-models':
+        if args.model_root is None:
+            parser.error('--model-root is required')
+        stage_models(source, args.cache, args.model_root, all_models=True)
+        return
+    if args.runtime_dir is None:
+        parser.error('--runtime-dir is required')
+    if args.runtime_only:
+        bundled_models_directory(args.runtime_dir.absolute())
+    runtime = args.runtime_dir.resolve()
+    if args.command == 'stage':
+        if args.worker is None:
+            parser.error('--worker is required')
+        copy_changed(args.worker, runtime / RUNTIME_FILES[0])
+        if args.library_dir is not None:
+            stage_native_dependencies(args.worker, args.library_dir, runtime)
+        else:
+            remove_development_libraries(runtime)
+        if args.runtime_only:
+            remove_bundled_models(runtime)
+        else:
+            stage_models(source, args.cache, runtime / 'assets/ocr/models')
+        finalize(source, runtime, args.runtime_only, args.arch)
+    elif args.command == 'finalize':
+        if args.deployed:
+            remove_development_libraries(runtime)
+        finalize(source, runtime, args.runtime_only, args.arch)
+    else:
+        manifest = verify_assets(source, runtime, args.runtime_only, args.arch)
+        binaries = verify_bundle(args.app.resolve(), args.arch) if args.app else []
+        if args.report:
+            atomic_json(args.report, dict(platform=f'macos-{args.arch}', runtime=manifest['runtime'],
+                        bundled_model=None if args.runtime_only else manifest['default_model'],
+                        verified_binaries=binaries,
+                        signature='ad-hoc' if args.app else None))
+        print(f'Verified macOS {ARCHITECTURES[args.arch]["label"]} OCR assets'
+              + (' and app bundle' if args.app else ''))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        sys.exit(f'macOS OCR packaging failed: {error}')

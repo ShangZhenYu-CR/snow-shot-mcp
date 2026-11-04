@@ -1,0 +1,448 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="zh_CN" sourcelanguage="en_US">
+    <context>
+        <name>OcrTextOptions</name>
+        <message>
+            <source>Full-width</source>
+            <translation>全角</translation>
+        </message>
+        <message>
+            <source>Half-width</source>
+            <translation>半角</translation>
+        </message>
+        <message>
+            <source>Keep line breaks</source>
+            <translation>保留换行</translation>
+        </message>
+        <message>
+            <source>None</source>
+            <translation>无</translation>
+        </message>
+        <message>
+            <source>Remove line breaks</source>
+            <translation>移除换行</translation>
+        </message>
+        <message>
+            <source>Smart Typesetting</source>
+            <translation>智能排版</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotImageConversionController</name>
+        <message>
+            <source>Cancel</source>
+            <translation>取消</translation>
+        </message>
+        <message>
+            <source>Image conversion failed</source>
+            <translation>图像转换失败</translation>
+        </message>
+        <message>
+            <source>Image conversion settings</source>
+            <translation>图像转换设置</translation>
+        </message>
+        <message>
+            <source>Model configuration changed. Retry to use the updated settings</source>
+            <translation>模型配置已更改。请重试以使用更新后的设置</translation>
+        </message>
+        <message>
+            <source>No vision models are available</source>
+            <translation>没有可用的视觉模型</translation>
+        </message>
+        <message>
+            <source>OK</source>
+            <translation>确定</translation>
+        </message>
+        <message>
+            <source>Retry</source>
+            <translation>重试</translation>
+        </message>
+        <message>
+            <source>The image conversion service is unavailable</source>
+            <translation>图像转换服务不可用</translation>
+        </message>
+        <message>
+            <source>The image could not be prepared for conversion</source>
+            <translation>无法准备待转换的图像</translation>
+        </message>
+        <message>
+            <source>The model returned no usable content</source>
+            <translation>模型未返回可用内容</translation>
+        </message>
+        <message>
+            <source>Unable to load vision models</source>
+            <translation>无法加载视觉模型</translation>
+        </message>
+        <message>
+            <source>Vision Model</source>
+            <translation>视觉模型</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotImageConversionView</name>
+        <message>
+            <source>Copy</source>
+            <translation>复制</translation>
+        </message>
+        <message>
+            <source>HTML preview</source>
+            <translation>HTML 预览</translation>
+        </message>
+        <message>
+            <source>Incomplete result: %1</source>
+            <translation>结果不完整：%1</translation>
+        </message>
+        <message>
+            <source>Markdown preview</source>
+            <translation>Markdown 预览</translation>
+        </message>
+        <message>
+            <source>Retry</source>
+            <translation>重试</translation>
+        </message>
+        <message>
+            <source>Select All</source>
+            <translation>全选</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotOcrController</name>
+        <message>
+            <source>Barcode recognition components are missing or damaged</source>
+            <translation>条码识别组件缺失或已损坏</translation>
+        </message>
+        <message>
+            <source>Barcode recognition failed</source>
+            <translation>条码识别失败</translation>
+        </message>
+        <message>
+            <source>Select an area to recognize</source>
+            <translation>选择要识别的区域</translation>
+        </message>
+        <message>
+            <source>Text recognition components could not be prepared</source>
+            <translation>无法准备文本识别组件</translation>
+        </message>
+        <message>
+            <source>Text recognition failed</source>
+            <translation>文本识别失败</translation>
+        </message>
+        <message>
+            <source>The bundled text recognition runtime is damaged or incompatible. Reinstall Snow Shot for this Mac</source>
+            <translation>内置文字识别运行时已损坏或不兼容。请重新安装适用于此 Mac 的 Snow Shot</translation>
+        </message>
+        <message>
+            <source>The packaged text recognition runtime is missing or damaged. Repair or reinstall Snow Shot from Microsoft Store</source>
+            <translation>软件包中的文字识别运行时缺失或已损坏。请通过 Microsoft Store 修复或重新安装 Snow Shot</translation>
+        </message>
+        <message>
+            <source>The text recognition component could not be started: %1</source>
+            <translation>无法启动文本识别组件：%1</translation>
+        </message>
+        <message>
+            <source>Unable to open the recognized link</source>
+            <translation>无法打开识别出的链接</translation>
+        </message>
+        <message>
+            <source>Unable to read the selected screenshot</source>
+            <translation>无法读取所选屏幕截图</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotRecognitionSessionController</name>
+        <message>
+            <source>Barcode recognition failed</source>
+            <translation>条码识别失败</translation>
+        </message>
+        <message>
+            <source>Barcode recognition is unavailable</source>
+            <translation>条码识别服务不可用</translation>
+        </message>
+        <message>
+            <source>Barcode recognition request could not be prepared</source>
+            <translation>无法准备条码识别请求</translation>
+        </message>
+        <message>
+            <source>Converting to HTML</source>
+            <translation>正在转换为 HTML</translation>
+        </message>
+        <message>
+            <source>Converting to Markdown</source>
+            <translation>正在转换为 Markdown</translation>
+        </message>
+        <message>
+            <source>LaTeX recognition failed</source>
+            <translation>LaTeX 识别失败</translation>
+        </message>
+        <message>
+            <source>LaTeX recognition is unavailable for screenshots larger than 4K</source>
+            <translation>超过 4K 的截图无法使用 LaTeX 识别</translation>
+        </message>
+        <message>
+            <source>LaTeX recognition request could not be prepared</source>
+            <translation>无法准备 LaTeX 识别请求</translation>
+        </message>
+        <message>
+            <source>LaTeX recognition service is unavailable</source>
+            <translation>LaTeX 识别服务不可用</translation>
+        </message>
+        <message>
+            <source>Model configuration changed. Retry to use the updated settings</source>
+            <translation>模型配置已更改。请重试以使用更新后的设置</translation>
+        </message>
+        <message>
+            <source>No barcode was recognized</source>
+            <translation>未识别到条码</translation>
+        </message>
+        <message>
+            <source>No table cells were recognized</source>
+            <translation>未识别到表格单元格</translation>
+        </message>
+        <message>
+            <source>Preparing text recognition components</source>
+            <translation>正在准备文本识别组件</translation>
+        </message>
+        <message>
+            <source>Preparing text recognition components (%1%)</source>
+            <translation>正在准备文本识别组件（%1%）</translation>
+        </message>
+        <message>
+            <source>Recognition service changed. Retry to use the updated settings</source>
+            <translation>识别服务已更改。请重试以使用更新后的设置</translation>
+        </message>
+        <message>
+            <source>Recognizing LaTeX formula</source>
+            <translation>正在识别 LaTeX 公式</translation>
+        </message>
+        <message>
+            <source>Recognizing barcode</source>
+            <translation>正在识别条码</translation>
+        </message>
+        <message>
+            <source>Recognizing table</source>
+            <translation>正在识别表格</translation>
+        </message>
+        <message>
+            <source>Recognizing text</source>
+            <translation>正在识别文本</translation>
+        </message>
+        <message>
+            <source>Snow Shot's visual understanding model is unavailable. Choose another model or retry</source>
+            <translation>Snow Shot 的视觉理解模型不可用。请选择其他模型或重试</translation>
+        </message>
+        <message>
+            <source>Some text could not be translated</source>
+            <translation>部分文字未能翻译</translation>
+        </message>
+        <message>
+            <source>Some text could not be translated: %1</source>
+            <translation>部分文字未能翻译：%1</translation>
+        </message>
+        <message>
+            <source>Table recognition failed</source>
+            <translation>表格识别失败</translation>
+        </message>
+        <message>
+            <source>Table recognition is unavailable for screenshots larger than 4K</source>
+            <translation>超过 4K 的截图无法使用表格识别</translation>
+        </message>
+        <message>
+            <source>Table recognition request could not be prepared</source>
+            <translation>无法准备表格识别请求</translation>
+        </message>
+        <message>
+            <source>Table recognition service is unavailable</source>
+            <translation>表格识别服务不可用</translation>
+        </message>
+        <message>
+            <source>Text recognition failed</source>
+            <translation>文本识别失败</translation>
+        </message>
+        <message>
+            <source>Text recognition is unavailable for screenshots larger than 4K</source>
+            <translation>超过 4K 的截图无法进行文本识别</translation>
+        </message>
+        <message>
+            <source>Text recognition request could not be prepared</source>
+            <translation>无法准备文本识别请求</translation>
+        </message>
+        <message>
+            <source>The selected recognition model is unavailable. Choose another model or retry</source>
+            <translation>所选识别模型不可用。请选择其他模型或重试</translation>
+        </message>
+        <message>
+            <source>Translation failed</source>
+            <translation>翻译失败</translation>
+        </message>
+        <message>
+            <source>Translation service is unavailable</source>
+            <translation>翻译服务不可用</translation>
+        </message>
+        <message>
+            <source>Unable to copy translation results</source>
+            <translation>无法复制翻译结果</translation>
+        </message>
+        <message>
+            <source>Unable to load Snow Shot vision models</source>
+            <translation>无法加载 Snow Shot 视觉模型</translation>
+        </message>
+        <message>
+            <source>Unable to read the selected screenshot</source>
+            <translation>无法读取所选屏幕截图</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotRecognitionWindow</name>
+        <message>
+            <source>Barcode recognition result</source>
+            <translation>条码识别结果</translation>
+        </message>
+        <message>
+            <source>Copy</source>
+            <translation>复制</translation>
+        </message>
+        <message>
+            <source>Cut</source>
+            <translation>剪切</translation>
+        </message>
+        <message>
+            <source>Delete</source>
+            <translation>删除</translation>
+        </message>
+        <message>
+            <source>Formula preview limit exceeded</source>
+            <translation>公式预览超出限制</translation>
+        </message>
+        <message>
+            <source>Formula renderer is unavailable</source>
+            <translation>公式渲染器不可用</translation>
+        </message>
+        <message>
+            <source>LaTeX formula preview</source>
+            <translation>LaTeX 公式预览</translation>
+        </message>
+        <message>
+            <source>LaTeX formula source</source>
+            <translation>LaTeX 公式源码</translation>
+        </message>
+        <message>
+            <source>No formula to preview</source>
+            <translation>没有可预览的公式</translation>
+        </message>
+        <message>
+            <source>Original image preview</source>
+            <translation>原始图像预览</translation>
+        </message>
+        <message>
+            <source>Paste</source>
+            <translation>粘贴</translation>
+        </message>
+        <message>
+            <source>Rendering formula...</source>
+            <translation>正在渲染公式...</translation>
+        </message>
+        <message>
+            <source>Retry</source>
+            <translation>重试</translation>
+        </message>
+        <message>
+            <source>Retry recognition</source>
+            <translation>重试识别</translation>
+        </message>
+        <message>
+            <source>Select All</source>
+            <translation>全选</translation>
+        </message>
+        <message>
+            <source>Unable to preview this formula. Check the LaTeX source</source>
+            <translation>无法预览此公式。请检查 LaTeX 源码</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotTableConversionController</name>
+        <message>
+            <source>No table cells were recognized</source>
+            <translation>未识别到表格单元格</translation>
+        </message>
+        <message>
+            <source>Table recognition failed</source>
+            <translation>表格识别失败</translation>
+        </message>
+        <message>
+            <source>Table recognition request could not be prepared</source>
+            <translation>无法准备表格识别请求</translation>
+        </message>
+        <message>
+            <source>Table recognition service is unavailable</source>
+            <translation>表格识别服务不可用</translation>
+        </message>
+        <message>
+            <source>The model returned no usable table after correction</source>
+            <translation>修正后模型仍未返回可用的表格</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotTableEditor</name>
+        <message>
+            <source>Clear cell contents</source>
+            <translation>清空单元格内容</translation>
+        </message>
+        <message>
+            <source>Clear contents</source>
+            <translation>清空内容</translation>
+        </message>
+        <message>
+            <source>Copy</source>
+            <translation>复制</translation>
+        </message>
+        <message>
+            <source>Cut</source>
+            <translation>剪切</translation>
+        </message>
+        <message>
+            <source>Delete</source>
+            <translation>删除</translation>
+        </message>
+        <message>
+            <source>Edit cell</source>
+            <translation>编辑单元格</translation>
+        </message>
+        <message>
+            <source>Merge cells</source>
+            <translation>合并单元格</translation>
+        </message>
+        <message>
+            <source>Paste</source>
+            <translation>粘贴</translation>
+        </message>
+        <message>
+            <source>Paste cells</source>
+            <translation>粘贴单元格</translation>
+        </message>
+        <message>
+            <source>Recognized table editor</source>
+            <translation>识别结果表格编辑器</translation>
+        </message>
+        <message>
+            <source>Reset table</source>
+            <translation>重置表格</translation>
+        </message>
+        <message>
+            <source>Select All</source>
+            <translation>全选</translation>
+        </message>
+        <message>
+            <source>Select the complete merged cell before pasting into this area</source>
+            <translation>请先选择完整的合并单元格，再粘贴到此区域</translation>
+        </message>
+        <message>
+            <source>Split cells</source>
+            <translation>拆分单元格</translation>
+        </message>
+        <message>
+            <source>The pasted cells do not fit inside the recognized table</source>
+            <translation>粘贴的单元格超出识别表格范围</translation>
+        </message>
+    </context>
+</TS>

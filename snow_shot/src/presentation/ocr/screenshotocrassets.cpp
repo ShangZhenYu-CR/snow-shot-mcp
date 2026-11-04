@@ -1,0 +1,1167 @@
+#include "snow_shot/platform/applicationqos.h"
+#include "snow_shot/app/distribution.h"
+#include "snow_shot/runtime/runtimeactivitytracker.h"
+#include "snow_shot/presentation/screenshotocrassets.h"
+#include "snow_shot/platform/minizippath.h"
+#include "screenshotocrprotocol.h"
+
+#include <QCryptographicHash>
+#include <QCoreApplication>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QEvent>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLockFile>
+#include <QNetworkAccessManager>
+#include <QNetworkProxy>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QPointer>
+#include <QSaveFile>
+#include <QThread>
+#include <QTimer>
+#include <QUrl>
+#include <QUuid>
+
+#include <mz.h>
+#include <mz_strm.h>
+#include <mz_zip.h>
+#include <mz_zip_rw.h>
+
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
+
+#include <algorithm>
+#include <optional>
+#include <mutex>
+
+namespace {
+constexpr auto kManifestName = "asset-manifest.json";
+#if defined(Q_OS_MACOS) && defined(Q_PROCESSOR_ARM_64)
+constexpr auto kPlatform = "macos-arm64";
+#elif defined(Q_OS_MACOS) && defined(Q_PROCESSOR_X86_64)
+constexpr auto kPlatform = "macos-x64";
+#elif defined(Q_OS_WIN) && defined(Q_PROCESSOR_ARM_64)
+constexpr auto kPlatform = "windows-arm64";
+#else
+constexpr auto kPlatform = "windows-x64";
+#endif
+constexpr auto kInterruptedError = "OCR asset preparation was interrupted";
+constexpr int kShutdownJoinTimeoutMs = 10'000;
+
+// The asset worker polls this between phases. ~Impl() stops the worker with
+// requestInterruption() plus quit(); quit() alone only reaches waits that run
+// inside an event loop, so hash, extraction, and cache-lock phases must check
+// the flag themselves.
+bool interruptionRequested() {
+    const QThread* thread = QThread::currentThread();
+    return thread != nullptr && thread->isInterruptionRequested();
+}
+
+struct FileDescriptor {
+    QString name;
+    QUrl url;
+    qint64 size = -1;
+    QByteArray sha256;
+};
+
+struct ModelDescriptor {
+    ScreenshotOcrModelType type = ScreenshotOcrModelType::Small;
+    QString id;
+    QString detector;
+    QString recognizer;
+    QString dictionary;
+    QList<FileDescriptor> files;
+};
+
+struct Descriptor {
+    bool bundled = false;
+    QString executable;
+    QString runtimeVersion;
+    QString platform;
+    FileDescriptor runtimeArchive;
+    QList<FileDescriptor> runtimeFiles;
+    ScreenshotOcrModelType defaultModel = ScreenshotOcrModelType::Small;
+    QList<ModelDescriptor> models;
+};
+
+struct ModelContract {
+    const char* id;
+    const char* detector;
+    const char* recognizer;
+    const char* dictionary;
+};
+
+ModelContract modelContract(ScreenshotOcrModelType type) {
+    switch (type) {
+    case ScreenshotOcrModelType::ExtraSmall:
+        return {"ppocrv6-tiny-cd609a1", "PP-OCRv6_det_tiny.onnx", "PP-OCRv6_rec_tiny.onnx",
+                "ppocrv6_tiny_dict.txt"};
+    case ScreenshotOcrModelType::Small:
+        return {"ppocrv6-small-463ea9f", "PP-OCRv6_det_small.onnx", "PP-OCRv6_rec_small.onnx",
+                "ppocrv6_dict.txt"};
+    case ScreenshotOcrModelType::Medium:
+        return {"ppocrv6-medium-f5063c6", "PP-OCRv6_det_medium.onnx", "PP-OCRv6_rec_medium.onnx",
+                "ppocrv6_dict.txt"};
+    }
+    return {};
+}
+
+std::optional<ScreenshotOcrModelType> parseModelType(const QString& value) {
+    if (value == QStringLiteral("extra_small"))
+        return ScreenshotOcrModelType::ExtraSmall;
+    if (value == QStringLiteral("small"))
+        return ScreenshotOcrModelType::Small;
+    if (value == QStringLiteral("medium"))
+        return ScreenshotOcrModelType::Medium;
+    return std::nullopt;
+}
+
+QString formatError(const QString& context, const QString& detail = {}) {
+    return detail.isEmpty() ? context : QStringLiteral("%1: %2").arg(context, detail);
+}
+
+bool safeRelativePath(const QString& path) {
+    const QString normalized = QDir::fromNativeSeparators(path);
+    if (normalized.isEmpty() || normalized.startsWith(u'/') ||
+        normalized.contains(QStringLiteral("//")) || normalized.contains(QChar(u'\0')) ||
+        QDir::isAbsolutePath(normalized)) {
+        return false;
+    }
+    const QStringList parts = normalized.split(u'/');
+    return std::all_of(parts.cbegin(), parts.cend(), [](const QString& part) {
+        return !part.isEmpty() && part != QStringLiteral(".") && part != QStringLiteral("..") &&
+               !part.contains(QChar(u':'));
+    });
+}
+
+QByteArray sha256File(const QString& path, QString* error) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error != nullptr)
+            *error = file.errorString();
+        return {};
+    }
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    // Hash in bounded chunks so model-sized files stay interruptible.
+    char buffer[256 * 1024];
+    while (true) {
+        if (interruptionRequested()) {
+            if (error != nullptr)
+                *error = QString::fromLatin1(kInterruptedError);
+            return {};
+        }
+        const qint64 count = file.read(buffer, sizeof(buffer));
+        if (count < 0) {
+            if (error != nullptr)
+                *error = file.errorString();
+            return {};
+        }
+        if (count == 0)
+            break;
+        hash.addData(QByteArrayView(buffer, count));
+    }
+    return hash.result();
+}
+
+bool validateFileMetadata(const QString& path, const FileDescriptor& descriptor, QString* error) {
+    const QFileInfo info(path);
+    if (!info.isFile() || info.isSymLink()) {
+        if (error != nullptr)
+            *error = QStringLiteral("missing file %1").arg(descriptor.name);
+        return false;
+    }
+    if (descriptor.size < 0 || info.size() != descriptor.size) {
+        if (error != nullptr) {
+            *error = QStringLiteral("invalid size for %1 (expected %2, got %3)")
+                         .arg(descriptor.name)
+                         .arg(descriptor.size)
+                         .arg(info.size());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool verifyFile(const QString& path, const FileDescriptor& descriptor, QString* error) {
+    if (!validateFileMetadata(path, descriptor, error))
+        return false;
+    QString hashError;
+    const QByteArray actual = sha256File(path, &hashError);
+    if (actual.isEmpty() || actual != descriptor.sha256) {
+        if (error != nullptr) {
+            *error = hashError.isEmpty()
+                         ? QStringLiteral("invalid SHA-256 for %1").arg(descriptor.name)
+                         : formatError(QStringLiteral("could not hash %1").arg(descriptor.name),
+                                       hashError);
+        }
+        return false;
+    }
+    return true;
+}
+
+std::optional<FileDescriptor> parseFile(const QJsonObject& object, bool requireUrl,
+                                        QString* error) {
+    FileDescriptor result;
+    result.name = object.value(QStringLiteral("name")).toString();
+    result.size = object.value(QStringLiteral("size")).toInteger(-1);
+    const QByteArray encodedSha256 =
+        object.value(QStringLiteral("sha256")).toString().toLatin1().toLower();
+    result.sha256 = QByteArray::fromHex(encodedSha256);
+    result.url = QUrl(object.value(QStringLiteral("url")).toString());
+    if (!safeRelativePath(result.name) || result.size <= 0 || encodedSha256.size() != 64 ||
+        result.sha256.size() != 32 || result.sha256.toHex() != encodedSha256 ||
+        (requireUrl && (!result.url.isValid() || result.url.scheme() != QStringLiteral("https")))) {
+        if (error != nullptr)
+            *error = QStringLiteral("invalid OCR asset file descriptor");
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<Descriptor> loadDescriptor(const QString& root, QString* error) {
+    QFile file(QDir(root).filePath(QString::fromLatin1(kManifestName)));
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error != nullptr)
+            *error =
+                formatError(QStringLiteral("OCR asset manifest is missing"), file.errorString());
+        return std::nullopt;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        if (error != nullptr)
+            *error = formatError(QStringLiteral("OCR asset manifest is invalid"),
+                                 parseError.errorString());
+        return std::nullopt;
+    }
+    const QJsonObject rootObject = document.object();
+    const QJsonObject runtime = rootObject.value(QStringLiteral("runtime")).toObject();
+    Descriptor result;
+    result.runtimeVersion = runtime.value(QStringLiteral("version")).toString();
+    result.platform = runtime.value(QStringLiteral("platform")).toString();
+#ifdef Q_OS_MACOS
+    result.bundled = true;
+#endif
+    result.executable = result.bundled
+                            ? QStringLiteral("snow-ocr-process")
+                            : QStringLiteral("snow-ocr-process-%1-%2.exe")
+                                  .arg(result.runtimeVersion, QString::fromLatin1(kPlatform));
+    const auto defaultModel =
+        parseModelType(rootObject.value(QStringLiteral("default_model")).toString());
+    if (rootObject.value(QStringLiteral("schema")).toInt() != (result.bundled ? 3 : 2) ||
+        result.runtimeVersion != QString::fromLatin1(snow_shot::ocr::protocol::kRuntimeVersion) ||
+        result.platform != QString::fromLatin1(kPlatform) || !defaultModel.has_value() ||
+        *defaultModel != ScreenshotOcrModelType::Small) {
+        if (error != nullptr)
+            *error = QStringLiteral("unsupported OCR asset manifest version");
+        return std::nullopt;
+    }
+    result.defaultModel = *defaultModel;
+    if (result.bundled) {
+        if (runtime.value(QStringLiteral("delivery")).toString() != QStringLiteral("bundled") ||
+            runtime.value(QStringLiteral("protocol")).toInt() !=
+                snow_shot::ocr::protocol::kProtocolVersion ||
+            runtime.value(QStringLiteral("executable")).toString() != result.executable ||
+            runtime.contains(QStringLiteral("archive"))) {
+            if (error != nullptr)
+                *error = QStringLiteral("incompatible bundled OCR runtime");
+            return std::nullopt;
+        }
+    } else {
+        auto archive = parseFile(runtime.value(QStringLiteral("archive")).toObject(), true, error);
+        if (!archive.has_value())
+            return std::nullopt;
+        result.runtimeArchive = std::move(*archive);
+    }
+    const auto parseFiles = [&](const QJsonArray& values, bool requireUrl,
+                                QList<FileDescriptor>* destination) {
+        for (const QJsonValue& value : values) {
+            auto parsed = parseFile(value.toObject(), requireUrl, error);
+            if (!parsed.has_value())
+                return false;
+            if (std::any_of(destination->cbegin(), destination->cend(), [&](const auto& existing) {
+                    return existing.name.compare(parsed->name, Qt::CaseInsensitive) == 0;
+                })) {
+                if (error != nullptr)
+                    *error = QStringLiteral("duplicate OCR asset descriptor");
+                return false;
+            }
+            destination->push_back(std::move(*parsed));
+        }
+        return true;
+    };
+    if (!parseFiles(runtime.value(QStringLiteral("files")).toArray(), false,
+                    &result.runtimeFiles) ||
+        result.runtimeFiles.size() != (result.bundled ? 1 : 2)) {
+        if (error != nullptr && error->isEmpty())
+            *error = QStringLiteral("incomplete OCR asset manifest");
+        return std::nullopt;
+    }
+    const auto contains = [](const QList<FileDescriptor>& files, const QString& name) {
+        return std::any_of(files.cbegin(), files.cend(),
+                           [&](const auto& item) { return item.name == name; });
+    };
+    if (!contains(result.runtimeFiles, result.executable) ||
+        (!result.bundled &&
+         !contains(result.runtimeFiles, QStringLiteral("runtime-manifest.json")))) {
+        if (error != nullptr)
+            *error = QStringLiteral("OCR asset manifest has unexpected contents");
+        return std::nullopt;
+    }
+    const QJsonArray models = rootObject.value(QStringLiteral("models")).toArray();
+    if (models.size() != 3) {
+        if (error != nullptr)
+            *error = QStringLiteral("incomplete OCR asset manifest");
+        return std::nullopt;
+    }
+    QSet<int> modelTypes;
+    QSet<QString> modelIds;
+    for (const QJsonValue& value : models) {
+        if (!value.isObject()) {
+            if (error != nullptr)
+                *error = QStringLiteral("invalid OCR model descriptor");
+            return std::nullopt;
+        }
+        const QJsonObject object = value.toObject();
+        const auto type = parseModelType(object.value(QStringLiteral("type")).toString());
+        if (!type.has_value()) {
+            if (error != nullptr)
+                *error = QStringLiteral("unsupported OCR model type");
+            return std::nullopt;
+        }
+        ModelDescriptor model;
+        model.type = *type;
+        model.id = object.value(QStringLiteral("id")).toString();
+        model.detector = object.value(QStringLiteral("detector")).toString();
+        model.recognizer = object.value(QStringLiteral("recognizer")).toString();
+        model.dictionary = object.value(QStringLiteral("dictionary")).toString();
+        const ModelContract contract = modelContract(model.type);
+        if (modelTypes.contains(static_cast<int>(model.type)) || modelIds.contains(model.id) ||
+            model.id != QString::fromLatin1(contract.id) ||
+            model.detector != QString::fromLatin1(contract.detector) ||
+            model.recognizer != QString::fromLatin1(contract.recognizer) ||
+            model.dictionary != QString::fromLatin1(contract.dictionary) ||
+            !parseFiles(object.value(QStringLiteral("files")).toArray(), true, &model.files) ||
+            model.files.size() != 3 || !contains(model.files, model.detector) ||
+            !contains(model.files, model.recognizer) || !contains(model.files, model.dictionary)) {
+            if (error != nullptr && error->isEmpty())
+                *error = QStringLiteral("invalid OCR model descriptor");
+            return std::nullopt;
+        }
+        modelTypes.insert(static_cast<int>(model.type));
+        modelIds.insert(model.id);
+        result.models.push_back(std::move(model));
+    }
+    if (modelTypes.size() != 3) {
+        if (error != nullptr)
+            *error = QStringLiteral("incomplete OCR asset manifest");
+        return std::nullopt;
+    }
+    return result;
+}
+
+const ModelDescriptor* modelDescriptor(const Descriptor& descriptor, ScreenshotOcrModelType type) {
+    const auto found =
+        std::find_if(descriptor.models.cbegin(), descriptor.models.cend(),
+                     [type](const ModelDescriptor& model) { return model.type == type; });
+    return found == descriptor.models.cend() ? nullptr : &*found;
+}
+
+QString runtimeDirectory(const QString& root, const Descriptor& descriptor) {
+    if (descriptor.bundled)
+        return root;
+    return QDir(root).filePath(
+        QStringLiteral("runtimes/%1/%2").arg(descriptor.runtimeVersion, descriptor.platform));
+}
+
+QString modelDirectory(const QString& root, const ModelDescriptor& model) {
+    return QDir(root).filePath(QStringLiteral("models/%1").arg(model.id));
+}
+
+bool validateCompletionMarker(const QString& directory, const QString& component, QString* error) {
+    QFile marker(QDir(directory).filePath(QStringLiteral(".complete.json")));
+    if (!marker.open(QIODevice::ReadOnly)) {
+        if (error != nullptr)
+            *error = QStringLiteral("missing completion marker for %1").arg(component);
+        return false;
+    }
+    const QJsonDocument document = QJsonDocument::fromJson(marker.readAll());
+    const QJsonObject object = document.object();
+    if (!document.isObject() || object.value(QStringLiteral("schema")).toInt() != 1 ||
+        object.value(QStringLiteral("component")).toString() != component) {
+        if (error != nullptr)
+            *error = QStringLiteral("invalid completion marker for %1").arg(component);
+        return false;
+    }
+    return true;
+}
+
+bool validateComponent(const QString& directory, const QList<FileDescriptor>& files,
+                       const QString& component, bool requireMarker, QString* error) {
+    // Installed assets were hashed before publication. Startup checks their metadata
+    // and completion marker without rereading the full runtime and model payloads.
+    const bool filesValid =
+        std::all_of(files.cbegin(), files.cend(), [&](const FileDescriptor& file) {
+            return validateFileMetadata(QDir(directory).filePath(file.name), file, error);
+        });
+    return filesValid && (!requireMarker || validateCompletionMarker(directory, component, error));
+}
+
+bool verifyComponentIntegrity(const QString& directory, const QList<FileDescriptor>& files,
+                              QString* error) {
+    return std::all_of(files.cbegin(), files.cend(), [&](const FileDescriptor& file) {
+        return verifyFile(QDir(directory).filePath(file.name), file, error);
+    });
+}
+
+bool validateBundledRuntime(const QString& directory, const Descriptor& descriptor,
+                            QString* error) {
+    if (!validateComponent(directory, descriptor.runtimeFiles, descriptor.runtimeVersion, false,
+                           error) ||
+        !QFileInfo(QDir(directory).filePath(descriptor.executable)).isExecutable()) {
+        return false;
+    }
+#ifdef Q_OS_MACOS
+    // Bundled runtimes use thin, little-endian Mach-O files matching the app.
+    // Check both binaries before launching, rather than relying on Rosetta or dyld.
+#if defined(Q_PROCESSOR_ARM_64)
+    const QByteArray expectedHeader = QByteArray::fromHex("cffaedfe0c000001");
+#else
+    const QByteArray expectedHeader = QByteArray::fromHex("cffaedfe07000001");
+#endif
+    for (const auto& item : descriptor.runtimeFiles) {
+        QFile file(QDir(directory).filePath(item.name));
+        if (!file.open(QIODevice::ReadOnly))
+            return false;
+        const QByteArray header = file.read(32);
+        if (header.size() != 32 || header.first(8) != expectedHeader) {
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
+ScreenshotOcrResolvedAssets resolved(const QString& runtimeRoot, const QString& modelRoot,
+                                     const Descriptor& descriptor, const ModelDescriptor& model,
+                                     bool offline) {
+    ScreenshotOcrResolvedAssets result;
+    result.modelType = model.type;
+    result.modelId = model.id;
+    result.runtimeVersion = descriptor.runtimeVersion;
+    result.runtimeDirectory = runtimeDirectory(runtimeRoot, descriptor);
+    result.processPath = QDir(result.runtimeDirectory).filePath(descriptor.executable);
+    const QString models = modelDirectory(modelRoot, model);
+    result.detectorModelPath = QDir(models).filePath(model.detector);
+    result.recognizerModelPath = QDir(models).filePath(model.recognizer);
+    result.dictionaryPath = QDir(models).filePath(model.dictionary);
+    result.offline = offline;
+    return result;
+}
+
+bool writeCompletionMarker(const QString& directory, const QString& component, QString* error) {
+    QJsonObject object{{QStringLiteral("schema"), 1}, {QStringLiteral("component"), component}};
+    QSaveFile marker(QDir(directory).filePath(QStringLiteral(".complete.json")));
+    if (!marker.open(QIODevice::WriteOnly) ||
+        marker.write(QJsonDocument(object).toJson(QJsonDocument::Compact)) < 0 ||
+        !marker.commit()) {
+        if (error != nullptr)
+            *error = marker.errorString();
+        return false;
+    }
+    return true;
+}
+
+bool promoteDirectory(const QString& staging, const QString& destination, QString* error) {
+    const QFileInfo destinationInfo(destination);
+    QDir parent(destinationInfo.dir());
+    if (!parent.mkpath(QStringLiteral("."))) {
+        if (error != nullptr)
+            *error = QStringLiteral("could not create OCR component directory");
+        return false;
+    }
+    if (destinationInfo.exists() && !QDir(destination).removeRecursively()) {
+        if (error != nullptr)
+            *error = QStringLiteral("could not replace invalid OCR component");
+        return false;
+    }
+    if (!parent.rename(staging, destination)) {
+        if (error != nullptr)
+            *error = QStringLiteral("could not activate OCR component");
+        return false;
+    }
+    return true;
+}
+
+class CacheLock {
+  public:
+    explicit CacheLock(const QString& path) {
+#ifdef Q_OS_WIN
+        const QByteArray digest =
+            QCryptographicHash::hash(QFileInfo(path).absoluteFilePath().toLower().toUtf8(),
+                                     QCryptographicHash::Sha256)
+                .toHex();
+        const QString name =
+            QStringLiteral("Local\\SnowShotOcrAssets-%1").arg(QString::fromLatin1(digest.left(32)));
+        m_handle = CreateMutexW(nullptr, FALSE, reinterpret_cast<LPCWSTR>(name.utf16()));
+        if (m_handle != nullptr) {
+            // Wait in short slices so an interruption request (app shutdown)
+            // is honored instead of blocking for the whole lock timeout.
+            QElapsedTimer deadline;
+            deadline.start();
+            while (true) {
+                const DWORD result = WaitForSingleObject(m_handle, 200);
+                if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
+                    m_locked = true;
+                    break;
+                }
+                if (result != WAIT_TIMEOUT || deadline.elapsed() >= 120000 ||
+                    interruptionRequested()) {
+                    break;
+                }
+            }
+        }
+#else
+        if (!QDir().mkpath(path))
+            return;
+        m_lock = std::make_unique<QLockFile>(QDir(path).filePath(QStringLiteral(".assets.lock")));
+        // A long download must not make a live owner's lock stale. QLockFile
+        // still recovers locks whose owning process has exited.
+        m_lock->setStaleLockTime(0);
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!interruptionRequested() && deadline.elapsed() < 120000) {
+            if (m_lock->tryLock(0)) {
+                m_locked = true;
+                break;
+            }
+            if (m_lock->error() != QLockFile::LockFailedError)
+                break;
+            QThread::msleep(50);
+        }
+#endif
+    }
+    ~CacheLock() {
+#ifdef Q_OS_WIN
+        if (m_locked)
+            ReleaseMutex(m_handle);
+        if (m_handle != nullptr)
+            CloseHandle(m_handle);
+#endif
+    }
+    [[nodiscard]] bool locked() const {
+        return m_locked;
+    }
+
+  private:
+#ifdef Q_OS_WIN
+    HANDLE m_handle = nullptr;
+#else
+    std::unique_ptr<QLockFile> m_lock;
+#endif
+    bool m_locked = false;
+};
+
+bool configureProxy(QNetworkAccessManager* manager, const QString& proxyUrl, QString* error) {
+    if (proxyUrl.trimmed().isEmpty())
+        return true;
+    const QUrl url(proxyUrl);
+    if (!url.isValid() || url.host().isEmpty() || url.port() <= 0) {
+        if (error != nullptr)
+            *error = QStringLiteral("invalid OCR download proxy");
+        return false;
+    }
+    QNetworkProxy proxy(url.scheme().startsWith(QStringLiteral("socks"), Qt::CaseInsensitive)
+                            ? QNetworkProxy::Socks5Proxy
+                            : QNetworkProxy::HttpProxy,
+                        url.host(), static_cast<quint16>(url.port()), url.userName(),
+                        url.password());
+    manager->setProxy(proxy);
+    return true;
+}
+
+using Progress = std::function<void(qint64, qint64)>;
+
+bool downloadOnce(QNetworkAccessManager* manager, const FileDescriptor& descriptor,
+                  const QString& destination, const Progress& progress, QString* error,
+                  bool* transient) {
+    *transient = false;
+    if (interruptionRequested()) {
+        if (error != nullptr)
+            *error = QString::fromLatin1(kInterruptedError);
+        return false;
+    }
+    if (descriptor.url.scheme() != QStringLiteral("https")) {
+        if (error != nullptr)
+            *error = QStringLiteral("insecure OCR download URL rejected");
+        return false;
+    }
+    QFile file(destination);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (error != nullptr)
+            *error = file.errorString();
+        return false;
+    }
+    QNetworkRequest request(descriptor.url);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QNetworkRequest::NoLessSafeRedirectPolicy);
+    request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SnowShot/ocr-assets"));
+    request.setRawHeader("Referer", "https://www.modelscope.cn/");
+    QNetworkReply* reply = manager->get(request);
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    timeout.setInterval(120000);
+    bool stalled = false;
+    // Inactivity timeout: every received chunk restarts the window, so slow
+    // but healthy downloads of model-sized files are not cut off by a fixed
+    // total-time cap; only a connection that stops delivering data aborts.
+    QObject::connect(&timeout, &QTimer::timeout, reply, [&]() {
+        stalled = true;
+        reply->abort();
+    });
+    QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() {
+        timeout.start();
+        const QByteArray bytes = reply->readAll();
+        if (file.write(bytes) != bytes.size())
+            reply->abort();
+    });
+    QObject::connect(reply, &QNetworkReply::downloadProgress, &loop, progress);
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    timeout.start();
+    loop.exec();
+    const QByteArray remaining = reply->readAll();
+    const bool wrote = remaining.isEmpty() || file.write(remaining) == remaining.size();
+    file.flush();
+    file.close();
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    const QUrl finalUrl = reply->url();
+    const auto networkError = reply->error();
+    const QString networkErrorText = reply->errorString();
+    reply->deleteLater();
+    *transient = stalled || networkError == QNetworkReply::TimeoutError ||
+                 networkError == QNetworkReply::TemporaryNetworkFailureError ||
+                 networkError == QNetworkReply::RemoteHostClosedError || status == 408 ||
+                 status == 429 || status >= 500;
+    if (!wrote || networkError != QNetworkReply::NoError || status < 200 || status >= 300 ||
+        finalUrl.scheme() != QStringLiteral("https")) {
+        if (error != nullptr) {
+            *error = !wrote ? QStringLiteral("could not write OCR download")
+                            : formatError(QStringLiteral("OCR download failed"), networkErrorText);
+        }
+        QFile::remove(destination);
+        return false;
+    }
+    if (!verifyFile(destination, descriptor, error)) {
+        QFile::remove(destination);
+        return false;
+    }
+    return true;
+}
+
+bool download(QNetworkAccessManager* manager, const FileDescriptor& descriptor,
+              const QString& destination, const Progress& progress, QString* error) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (interruptionRequested()) {
+            if (error != nullptr)
+                *error = QString::fromLatin1(kInterruptedError);
+            return false;
+        }
+        bool transient = false;
+        if (downloadOnce(manager, descriptor, destination, progress, error, &transient))
+            return true;
+        if (!transient)
+            break;
+    }
+    return false;
+}
+
+bool extractRuntime(const QString& archive, const QString& staging,
+                    const QList<FileDescriptor>& allowlist, QString* error) {
+    void* reader = mz_zip_reader_create();
+    const QByteArray archivePath = snow_shot::platform::minizipPath(archive);
+    if (reader == nullptr || mz_zip_reader_open_file(reader, archivePath.constData()) != MZ_OK) {
+        if (error != nullptr)
+            *error = QStringLiteral("could not open OCR runtime archive");
+        if (reader != nullptr)
+            mz_zip_reader_delete(&reader);
+        return false;
+    }
+    QHash<QString, FileDescriptor> expected;
+    for (const auto& descriptor : allowlist)
+        expected.insert(descriptor.name, descriptor);
+    QSet<QString> seen;
+    bool ok = mz_zip_reader_goto_first_entry(reader) == MZ_OK;
+    while (ok) {
+        mz_zip_file* info = nullptr;
+        if (mz_zip_reader_entry_get_info(reader, &info) != MZ_OK || info == nullptr ||
+            info->filename == nullptr) {
+            if (error != nullptr)
+                *error = QStringLiteral("invalid OCR runtime archive entry");
+            ok = false;
+            break;
+        }
+        const QString name = QDir::fromNativeSeparators(QString::fromUtf8(info->filename));
+        const quint32 unixMode = static_cast<quint32>(info->external_fa >> 16);
+        const bool specialUnixType =
+            (unixMode & 0170000U) != 0U && (unixMode & 0170000U) != 0100000U;
+        const bool reparseLike = (info->external_fa & 0x0400U) != 0U;
+        if (!safeRelativePath(name) || !expected.contains(name) || seen.contains(name) ||
+            name.endsWith(u'/') || specialUnixType || reparseLike ||
+            info->uncompressed_size != expected.value(name).size) {
+            if (error != nullptr) {
+                *error =
+                    QStringLiteral("unsafe or unexpected OCR runtime archive entry: %1").arg(name);
+            }
+            ok = false;
+            break;
+        }
+        seen.insert(name);
+        const QString outputPath = QDir(staging).filePath(name);
+        if (!QDir().mkpath(QFileInfo(outputPath).dir().absolutePath()) ||
+            mz_zip_reader_entry_open(reader) != MZ_OK) {
+            if (error != nullptr)
+                *error = QStringLiteral("could not extract OCR runtime");
+            ok = false;
+            break;
+        }
+        QFile output(outputPath);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            ok = false;
+        char buffer[64 * 1024];
+        while (ok) {
+            if (interruptionRequested()) {
+                if (error != nullptr)
+                    *error = QString::fromLatin1(kInterruptedError);
+                ok = false;
+                break;
+            }
+            const int32_t count = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
+            if (count < 0) {
+                ok = false;
+                break;
+            }
+            if (count == 0)
+                break;
+            if (output.write(buffer, count) != count) {
+                ok = false;
+                break;
+            }
+        }
+        output.close();
+        if (mz_zip_reader_entry_close(reader) != MZ_OK)
+            ok = false;
+        if (!ok || !verifyFile(outputPath, expected.value(name), error)) {
+            ok = false;
+            break;
+        }
+        const int32_t next = mz_zip_reader_goto_next_entry(reader);
+        if (next == MZ_END_OF_LIST)
+            break;
+        ok = next == MZ_OK;
+    }
+    mz_zip_reader_close(reader);
+    mz_zip_reader_delete(&reader);
+    if (ok && seen.size() != expected.size()) {
+        if (error != nullptr)
+            *error = QStringLiteral("OCR runtime archive is incomplete");
+        ok = false;
+    }
+    return ok;
+}
+
+} // namespace
+
+QString screenshotOcrModelTypeValue(ScreenshotOcrModelType type) {
+    switch (type) {
+    case ScreenshotOcrModelType::ExtraSmall:
+        return QStringLiteral("extra_small");
+    case ScreenshotOcrModelType::Small:
+        return QStringLiteral("small");
+    case ScreenshotOcrModelType::Medium:
+        return QStringLiteral("medium");
+    }
+    return QStringLiteral("small");
+}
+
+ScreenshotOcrModelType screenshotOcrModelTypeFromValue(const QString& value) {
+    const auto parsed = parseModelType(value.trimmed().toLower());
+    return parsed.value_or(ScreenshotOcrModelType::Small);
+}
+
+bool ScreenshotOcrResolvedAssets::valid() const {
+    return !modelId.isEmpty() && !runtimeVersion.isEmpty() && QFileInfo(processPath).isFile() &&
+           QFileInfo(detectorModelPath).isFile() && QFileInfo(recognizerModelPath).isFile() &&
+           QFileInfo(dictionaryPath).isFile();
+}
+
+class ScreenshotOcrAssets::Impl final {
+  public:
+    Impl(ScreenshotOcrAssets* owner, Options options)
+        : m_owner(owner), m_options(std::move(options)) {}
+    ~Impl() {
+        if (m_thread == nullptr)
+            return;
+        m_thread->requestInterruption();
+        m_thread->quit();
+        // Every worker phase polls the interruption flag, so this normally
+        // returns within milliseconds. The deadline only makes a wedged
+        // worker observable; blocking remains the safe fallback because the
+        // worker captures this object and must not be terminated or abandoned.
+        if (!m_thread->wait(kShutdownJoinTimeoutMs)) {
+            qWarning() << "the OCR asset worker is still running after" << kShutdownJoinTimeoutMs
+                       << "ms; waiting for it to finish";
+            m_thread->wait();
+        }
+        delete m_thread;
+    }
+
+    void prepare() {
+        // The worker's queued finished handler exclusively owns thread cleanup.
+        // A retry can arrive from failed() after the worker function returned
+        // but before that handler runs, so replacing the pointer here would let
+        // the old handler delete the new worker.
+        if (m_thread != nullptr) {
+            m_prepareRequested = true;
+            return;
+        }
+        m_prepareRequested = false;
+        setStatus({ScreenshotOcrAssetPhase::Verifying, QStringLiteral("assets")});
+        const Options options = m_options;
+        const quint64 generation = m_generation;
+        QPointer<ScreenshotOcrAssets> owner(m_owner);
+        m_thread = QThread::create(
+            snow_shot::runtime::trackRuntimeWork([this, owner, options, generation]() {
+                QString error;
+                ScreenshotOcrResolvedAssets assets;
+                const bool success = acquire(options, generation, &assets, &error);
+                if (owner == nullptr)
+                    return;
+                // Networking and ZIP work above owns thread-local Qt objects.
+                // Destroy their deferred-delete queue before the worker exits.
+                QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+                QMetaObject::invokeMethod(
+                    owner,
+                    snow_shot::runtime::trackRuntimeWork(
+                        [this, owner, generation, success, assets, error]() {
+                            if (owner == nullptr || generation != m_generation)
+                                return;
+                            if (success) {
+                                setStatus({assets.offline ? ScreenshotOcrAssetPhase::ReadyOffline
+                                                          : ScreenshotOcrAssetPhase::ReadyCached,
+                                           QStringLiteral("assets")});
+                                emit owner->ready(assets);
+                            } else {
+                                setStatus({ScreenshotOcrAssetPhase::Failed,
+                                           QStringLiteral("assets"), 0, 0, error});
+                                emit owner->failed(error);
+                            }
+                        }),
+                    Qt::QueuedConnection);
+            }));
+        QObject::connect(m_thread, &QThread::finished, m_owner, [this]() {
+            if (m_thread == nullptr)
+                return;
+            m_thread->wait();
+            delete m_thread;
+            m_thread = nullptr;
+            if (m_prepareRequested)
+                prepare();
+        });
+        snow_shot::platform::configureApplicationQoSThread(m_thread);
+        m_thread->start();
+    }
+
+    void setProxyUrl(const QString& value) {
+        m_options.proxyUrl = value;
+    }
+
+    void setModelType(ScreenshotOcrModelType value) {
+        if (m_options.modelType == value)
+            return;
+        m_options.modelType = value;
+        ++m_generation;
+        setStatus({ScreenshotOcrAssetPhase::Unchecked, QStringLiteral("assets")});
+    }
+
+  private:
+    void setStatus(ScreenshotOcrAssetStatus status) {
+        ScreenshotOcrAssetStatus current;
+        {
+            std::lock_guard lock(m_statusMutex);
+            m_status = std::move(status);
+            current = m_status;
+        }
+        emit m_owner->statusChanged(current);
+    }
+
+    void progress(quint64 generation, const QString& component, qint64 received, qint64 total) {
+        QPointer<ScreenshotOcrAssets> owner(m_owner);
+        QMetaObject::invokeMethod(
+            m_owner,
+            [this, owner, generation, component, received, total]() {
+                if (owner != nullptr && generation == m_generation) {
+                    setStatus({ScreenshotOcrAssetPhase::Downloading, component, received, total});
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
+    bool acquire(const Options& options, quint64 generation, ScreenshotOcrResolvedAssets* assets,
+                 QString* error) {
+        const auto cancelled = [error]() {
+            if (!interruptionRequested())
+                return false;
+            if (error != nullptr)
+                *error = QString::fromLatin1(kInterruptedError);
+            return true;
+        };
+        if (cancelled())
+            return false;
+        auto descriptor = loadDescriptor(options.offlineRoot, error);
+        const bool requireBundledRuntime =
+            options.requireBundledRuntime || snow_shot::app::distribution::isStoreManaged();
+        if (!descriptor.has_value()) {
+            if (requireBundledRuntime)
+                *error = QStringLiteral("store_runtime_invalid");
+#ifdef Q_OS_MACOS
+            *error = QStringLiteral("bundled_runtime_invalid");
+#endif
+            return false;
+        }
+        const ModelDescriptor* model = modelDescriptor(*descriptor, options.modelType);
+        if (model == nullptr) {
+            *error = QStringLiteral("selected OCR model is unavailable");
+            return false;
+        }
+        QString validationError;
+        const QString offlineRuntimeRoot =
+            descriptor->bundled
+                ? (options.bundledRuntimeRoot.isEmpty()
+                       ? QDir::cleanPath(
+                             QDir(options.offlineRoot).absoluteFilePath(QStringLiteral("../..")))
+                       : options.bundledRuntimeRoot)
+                : options.offlineRoot;
+        const bool offlineRuntime =
+            descriptor->bundled
+                ? validateBundledRuntime(offlineRuntimeRoot, *descriptor, &validationError)
+                : validateComponent(runtimeDirectory(offlineRuntimeRoot, *descriptor),
+                                    descriptor->runtimeFiles, descriptor->runtimeVersion, true,
+                                    &validationError);
+        if (requireBundledRuntime &&
+            (!offlineRuntime ||
+             !verifyComponentIntegrity(runtimeDirectory(offlineRuntimeRoot, *descriptor),
+                                       descriptor->runtimeFiles, &validationError))) {
+            *error = QStringLiteral("store_runtime_invalid");
+            return false;
+        }
+        if (descriptor->bundled && !offlineRuntime) {
+            *error = QStringLiteral("bundled_runtime_invalid");
+            return false;
+        }
+        const bool offlineModel =
+            validateComponent(modelDirectory(options.offlineRoot, *model), model->files, model->id,
+                              true, &validationError);
+        if (offlineRuntime && offlineModel) {
+            *assets = resolved(offlineRuntimeRoot, options.offlineRoot, *descriptor, *model, true);
+            return true;
+        }
+        if (options.cacheRoot.trimmed().isEmpty()) {
+            *error = QStringLiteral("OCR component storage is unavailable");
+            return false;
+        }
+        CacheLock lock(options.cacheRoot);
+        if (cancelled())
+            return false;
+        if (!lock.locked()) {
+            *error = QStringLiteral("timed out waiting for OCR component storage");
+            return false;
+        }
+        bool cachedRuntime = !requireBundledRuntime && !descriptor->bundled &&
+                             validateComponent(runtimeDirectory(options.cacheRoot, *descriptor),
+                                               descriptor->runtimeFiles, descriptor->runtimeVersion,
+                                               true, &validationError);
+        bool cachedModel = validateComponent(modelDirectory(options.cacheRoot, *model),
+                                             model->files, model->id, true, &validationError);
+        const QString stagingRoot = QDir(options.cacheRoot).filePath(QStringLiteral(".staging"));
+        if (!QDir().mkpath(stagingRoot)) {
+            *error = QStringLiteral("OCR component storage is read-only");
+            return false;
+        }
+        // Clear abandoned transfers before staging a replacement. Retain cached
+        // components, including those used by earlier application versions.
+        cleanup(options.cacheRoot);
+        if (cancelled())
+            return false;
+        if (!offlineModel && !cachedModel &&
+            !ensureModel(options, *descriptor, *model, generation, stagingRoot, error)) {
+            return false;
+        }
+        cachedModel = cachedModel ||
+                      (!offlineModel && validateComponent(modelDirectory(options.cacheRoot, *model),
+                                                          model->files, model->id, true, error));
+        if (cancelled())
+            return false;
+        if (!offlineRuntime && !cachedRuntime &&
+            !ensureRuntime(options, *descriptor, generation, stagingRoot, error)) {
+            return false;
+        }
+        cachedRuntime =
+            cachedRuntime ||
+            (!offlineRuntime &&
+             validateComponent(runtimeDirectory(options.cacheRoot, *descriptor),
+                               descriptor->runtimeFiles, descriptor->runtimeVersion, true, error));
+        if ((!offlineRuntime && !cachedRuntime) || (!offlineModel && !cachedModel))
+            return false;
+        if (cancelled())
+            return false;
+        const QString runtimeRoot = offlineRuntime ? offlineRuntimeRoot : options.cacheRoot;
+        const QString modelRoot = offlineModel ? options.offlineRoot : options.cacheRoot;
+        const auto result = resolved(runtimeRoot, modelRoot, *descriptor, *model, false);
+
+        cleanup(options.cacheRoot);
+        *assets = result;
+        return true;
+    }
+
+    bool ensureModel(const Options& options, const Descriptor& descriptor,
+                     const ModelDescriptor& model, quint64 generation, const QString& stagingRoot,
+                     QString* error) {
+        Q_UNUSED(descriptor);
+        const QString destination = modelDirectory(options.cacheRoot, model);
+        if (validateComponent(destination, model.files, model.id, true, error))
+            return true;
+        const QString staging =
+            QDir(stagingRoot)
+                .filePath(
+                    QStringLiteral("model-%1").arg(QUuid::createUuid().toString(QUuid::Id128)));
+        QDir().mkpath(staging);
+        QNetworkAccessManager manager;
+        if (!configureProxy(&manager, options.proxyUrl, error))
+            return false;
+        for (const FileDescriptor& file : model.files) {
+            if (interruptionRequested()) {
+                QDir(staging).removeRecursively();
+                if (error != nullptr)
+                    *error = QString::fromLatin1(kInterruptedError);
+                return false;
+            }
+            progress(generation, QStringLiteral("models"), 0, file.size);
+            const QString destinationPath = QDir(staging).filePath(file.name);
+            const bool acquired =
+                options.downloadOverride
+                    ? options.downloadOverride(file.url.toString(), destinationPath, error) &&
+                          verifyFile(destinationPath, file, error)
+                    : download(
+                          &manager, file, destinationPath,
+                          [this, generation](qint64 received, qint64 total) {
+                              progress(generation, QStringLiteral("models"), received, total);
+                          },
+                          error);
+            if (!acquired) {
+                QDir(staging).removeRecursively();
+                return false;
+            }
+        }
+        if (!writeCompletionMarker(staging, model.id, error) ||
+            !promoteDirectory(staging, destination, error)) {
+            QDir(staging).removeRecursively();
+            return false;
+        }
+        return true;
+    }
+
+    bool ensureRuntime(const Options& options, const Descriptor& descriptor, quint64 generation,
+                       const QString& stagingRoot, QString* error) {
+        const QString destination = runtimeDirectory(options.cacheRoot, descriptor);
+        if (validateComponent(destination, descriptor.runtimeFiles, descriptor.runtimeVersion, true,
+                              error))
+            return true;
+        const QString token = QUuid::createUuid().toString(QUuid::Id128);
+        const QString archive =
+            QDir(stagingRoot).filePath(QStringLiteral("runtime-%1.zip").arg(token));
+        const QString staging = QDir(stagingRoot).filePath(QStringLiteral("runtime-%1").arg(token));
+        if (!QDir().mkpath(staging)) {
+            *error = QStringLiteral("could not create OCR runtime staging directory");
+            return false;
+        }
+        QNetworkAccessManager manager;
+        if (interruptionRequested()) {
+            if (error != nullptr)
+                *error = QString::fromLatin1(kInterruptedError);
+            QFile::remove(archive);
+            QDir(staging).removeRecursively();
+            return false;
+        }
+        const bool downloaded =
+            options.downloadOverride
+                ? options.downloadOverride(descriptor.runtimeArchive.url.toString(), archive,
+                                           error) &&
+                      verifyFile(archive, descriptor.runtimeArchive, error)
+                : configureProxy(&manager, options.proxyUrl, error) &&
+                      download(
+                          &manager, descriptor.runtimeArchive, archive,
+                          [this, generation](qint64 received, qint64 total) {
+                              progress(generation, QStringLiteral("runtime"), received, total);
+                          },
+                          error);
+        if (downloaded && interruptionRequested()) {
+            if (error != nullptr)
+                *error = QString::fromLatin1(kInterruptedError);
+            QFile::remove(archive);
+            QDir(staging).removeRecursively();
+            return false;
+        }
+        const bool extracted =
+            downloaded && (options.extractOverride
+                               ? options.extractOverride(archive, staging, error)
+                               : extractRuntime(archive, staging, descriptor.runtimeFiles, error));
+        if (!downloaded || !extracted ||
+            !verifyComponentIntegrity(staging, descriptor.runtimeFiles, error) ||
+            !writeCompletionMarker(staging, descriptor.runtimeVersion, error) ||
+            !promoteDirectory(staging, destination, error)) {
+            QFile::remove(archive);
+            QDir(staging).removeRecursively();
+            return false;
+        }
+        QFile::remove(archive);
+        return true;
+    }
+
+    static void cleanup(const QString& root) {
+        // Retired models and older runtimes remain available to previous app versions.
+        // Only unfinished transfers are transient; switching to V6 needs no cache migration.
+        QDir(QDir(root).filePath(QStringLiteral(".staging"))).removeRecursively();
+        QDir().mkpath(QDir(root).filePath(QStringLiteral(".staging")));
+    }
+
+    ScreenshotOcrAssets* m_owner = nullptr;
+    Options m_options;
+    mutable std::mutex m_statusMutex;
+    ScreenshotOcrAssetStatus m_status;
+    QThread* m_thread = nullptr;
+    quint64 m_generation = 0;
+    bool m_prepareRequested = false;
+};
+
+ScreenshotOcrAssets::ScreenshotOcrAssets(Options options, QObject* parent)
+    : QObject(parent), m_impl(std::make_unique<Impl>(this, std::move(options))) {}
+
+ScreenshotOcrAssets::~ScreenshotOcrAssets() = default;
+
+void ScreenshotOcrAssets::prepare() {
+    m_impl->prepare();
+}
+void ScreenshotOcrAssets::setProxyUrl(const QString& proxyUrl) {
+    m_impl->setProxyUrl(proxyUrl);
+}
+void ScreenshotOcrAssets::setModelType(ScreenshotOcrModelType modelType) {
+    m_impl->setModelType(modelType);
+}

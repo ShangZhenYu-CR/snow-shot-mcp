@@ -1,0 +1,98 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTIMAGECONVERSIONCONTROLLER_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTIMAGECONVERSIONCONTROLLER_H
+
+#include "snow_shot/presentation/screenshotimageconversion.h"
+#include "snow_shot/app/edition.h"
+
+#include <QTimer>
+
+class QWidget;
+namespace adqt::widgets {
+class AdModal;
+}
+
+#if SNOW_SHOT_ENABLE_IMAGE_CONVERSION
+class ScreenshotImageConversionController final : public QObject {
+    Q_OBJECT
+  public:
+    enum class State { Idle, LoadingModels, Converting, Completed, Failed };
+    explicit ScreenshotImageConversionController(QObject* parent = nullptr);
+    ~ScreenshotImageConversionController() override;
+    void setProvider(SnowShotApiClient* provider);
+    // The caller owns target identity through key; image is used for requests and retries.
+    void activate(QString key, QImage image, SnowShotImageConversionFormat format);
+    void deactivate();
+    void invalidate();
+    void retry();
+    void openSettings(QWidget* owner);
+    void seed(const QString& key, const QVector<ScreenshotImageConversionEntry>& entries);
+    [[nodiscard]] QVector<ScreenshotImageConversionEntry> entries(const QString& key) const;
+
+    [[nodiscard]] State state() const {
+        return m_state;
+    }
+    [[nodiscard]] bool busy() const {
+        return m_state == State::LoadingModels || m_state == State::Converting;
+    }
+    [[nodiscard]] bool active() const {
+        return m_active;
+    }
+    // The displayed request keeps its model identity even if the saved selection changes.
+    [[nodiscard]] QString activeModel() const {
+        return m_active ? m_requestModel : QString{};
+    }
+    [[nodiscard]] QString source() const {
+        return m_source;
+    }
+    [[nodiscard]] QString error() const {
+        return m_error;
+    }
+    [[nodiscard]] SnowShotImageConversionFormat format() const {
+        return m_format;
+    }
+
+  signals:
+    void changed();
+    void resultsChanged();
+
+  private:
+    void bindProviderSignals();
+    void start(bool refreshModels);
+    void startWithModels(const QVector<SnowShotChatModel>& models);
+    void fail(const QString& message);
+    void cancelRequests();
+    void reset(bool discardCache);
+    bool notifyChanged();
+    bool notifyResultsChanged();
+    [[nodiscard]] bool entryMatchesProvider(const ScreenshotImageConversionEntry& entry) const;
+    bool restoreCachedResult(const QString& model);
+    void cacheResult(const QString& key, ScreenshotImageConversionEntry entry);
+    void trimCache();
+    struct CacheEntry {
+        QString key;
+        ScreenshotImageConversionEntry result;
+    };
+    QPointer<SnowShotApiClient> m_api;
+    QPointer<adqt::widgets::AdModal> m_modal;
+    QVector<CacheEntry> m_cache;
+    QTimer m_previewTimer;
+    QString m_key;
+    QString m_requestModel;
+    QImage m_image;
+    QString m_source;
+    QString m_error;
+    SnowShotImageConversionFormat m_format = SnowShotImageConversionFormat::Markdown;
+    State m_state = State::Idle;
+    bool m_active = false;
+    bool m_refreshConversion = false;
+    bool m_destroying = false;
+    quint64 m_providerGeneration = 0;
+    quint64 m_generation = 0;
+    SnowShotApiClient::RequestToken m_modelsToken = 0;
+    SnowShotApiClient::RequestToken m_conversionToken = 0;
+    SnowShotApiClient::RequestToken m_settingsToken = 0;
+};
+
+#endif // SNOW_SHOT_ENABLE_IMAGE_CONVERSION
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTIMAGECONVERSIONCONTROLLER_H

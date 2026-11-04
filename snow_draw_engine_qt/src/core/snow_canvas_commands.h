@@ -1,0 +1,160 @@
+#pragma once
+
+#include "snow_canvas_ffi_handles.h"
+#include "snow_draw_engine.h"
+
+#include <QByteArray>
+
+#include <cstdint>
+#include <vector>
+
+namespace snow_canvas_commands {
+
+struct MutationResult {
+    bool success = false;
+    ScopedChangedViewportList changedViewports;
+};
+
+struct PairedMutationResult {
+    bool success = false;
+    ScopedChangedViewportList firstChangedViewports;
+    ScopedChangedViewportList secondChangedViewports;
+};
+
+struct CreateSerialNumberTextResult {
+    bool success = false;
+    ScopedChangedViewportList changedViewports;
+    SnowElementId textId{};
+    bool hasTextId = false;
+};
+
+struct CommitTextRequest {
+    SnowElementId elementId{};
+    bool hasExistingElement = false;
+    double centerX = 0.0;
+    double centerY = 0.0;
+    const char* utf8Data = nullptr;
+    std::uint32_t utf8Len = 0;
+    SnowTextLayoutSize measuredLayout{1.0, 1.0, 0.0, 0.0};
+    SnowTextStyle style{};
+    bool autoResize = false;
+    bool updateDefaultStyle = false;
+    SnowElementId arrowId{};
+    SnowElementId bubbleId{};
+    double minimumGraphemeWidth = 1.0;
+    double textInkReserve = 0.0;
+
+    SnowTextCommitDraft toAbi() const;
+};
+
+struct ActiveTextDraftPresentationRequest {
+    SnowElementId elementId{};
+    bool hasExistingElement = false;
+    double centerX = 0.0;
+    double centerY = 0.0;
+    double width = 1.0;
+    double height = 1.0;
+    double rotation = 0.0;
+    double contentWidth = 0.0;
+    double contentHeight = 0.0;
+    const char* utf8Data = nullptr;
+    std::uint32_t utf8Len = 0;
+    SnowTextStyle style{};
+    bool autoResize = false;
+
+    SnowElementId arrowId{};
+    SnowElementId bubbleId{};
+    double minimumGraphemeWidth = 1.0;
+    double textInkReserve = 0.0;
+    SnowActiveTextDraftPresentation toAbi() const;
+};
+
+struct ProcessInputResult {
+    bool success = false;
+    ScopedChangedViewportList changedViewports;
+    SnowInteractionOutput output{};
+};
+
+struct TextResizeMeasurementResult {
+    bool success = false;
+    bool active = false;
+    SnowTextElementInfo info{};
+};
+
+MutationResult setActiveTool(SnowRuntime runtime, SnowViewport viewport, SnowActiveTool tool);
+MutationResult undo(SnowRuntime runtime);
+MutationResult redo(SnowRuntime runtime);
+MutationResult resetEditingState(SnowRuntime runtime, SnowViewport viewport);
+MutationResult selectElement(SnowRuntime runtime, SnowViewport viewport, SnowElementId id);
+MutationResult clearSelection(SnowRuntime runtime, SnowViewport viewport);
+MutationResult deleteSelected(SnowRuntime runtime, SnowViewport viewport);
+MutationResult deleteAllElements(SnowRuntime runtime, SnowViewport viewport);
+MutationResult duplicateSelected(SnowRuntime runtime, SnowViewport viewport, double offsetX,
+                                 double offsetY);
+MutationResult insertDrawTemplate(SnowRuntime runtime, SnowViewport viewport,
+                                  const QByteArray& payload, double centerX, double centerY);
+MutationResult reorderSelected(SnowRuntime runtime, SnowViewport viewport, std::uint32_t action);
+MutationResult alignSelected(SnowRuntime runtime, SnowViewport viewport, std::uint32_t alignment);
+MutationResult setSelectedOpacity(SnowRuntime runtime, SnowViewport viewport, double opacity);
+MutationResult adjustSelectedSerialNumbers(SnowRuntime runtime, SnowViewport viewport,
+                                           std::int64_t delta);
+CreateSerialNumberTextResult createSerialNumberText(SnowRuntime runtime, SnowViewport viewport,
+                                                    const SnowTextLayoutSize& layout);
+MutationResult commitText(SnowRuntime runtime, SnowViewport viewport,
+                          const CommitTextRequest& request);
+ProcessInputResult processInput(SnowRuntime runtime, SnowViewport viewport,
+                                const SnowInputEvent& event);
+ProcessInputResult processPointerMoveBatch(SnowRuntime runtime, SnowViewport viewport,
+                                           const std::vector<SnowInputEvent>& events);
+TextResizeMeasurementResult activeTextResizeMeasurement(SnowRuntime runtime, SnowViewport viewport);
+MutationResult applyActiveTextResizeMeasurement(SnowRuntime runtime, SnowViewport viewport,
+                                                const SnowTextLayoutSize& layout);
+MutationResult setActiveTextDraftPresentation(SnowRuntime runtime, SnowViewport viewport,
+                                              const ActiveTextDraftPresentationRequest& request);
+MutationResult clearActiveTextDraftPresentation(SnowRuntime runtime, SnowViewport viewport);
+MutationResult setDistanceStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                     const SnowDistanceStyle& style, std::uint32_t properties);
+MutationResult setAngleStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                  const SnowAngleStyle& style, std::uint32_t properties);
+MutationResult setBracketStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                    const SnowBracketStyle& style, std::uint32_t properties);
+MutationResult setMagnifierStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                      const SnowMagnifierStyle& style, std::uint32_t properties,
+                                      bool creationDefaults);
+MutationResult adjustAngleValue(SnowRuntime runtime, SnowViewport viewport, double deltaRadians);
+MutationResult setDistancePixelScale(SnowRuntime runtime, SnowViewport viewport, double scaleX,
+                                     double scaleY);
+MutationResult setShapeStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                  const SnowShapeStyle& style, std::uint32_t properties,
+                                  SnowShapeKind kind);
+MutationResult setWatermarkConfig(SnowRuntime runtime, SnowViewport viewport,
+                                  const SnowWatermarkConfig& config);
+MutationResult setSpotlightConfig(SnowRuntime runtime, SnowViewport viewport,
+                                  const SnowSpotlightConfig& config);
+MutationResult setFilterStyle(SnowRuntime runtime, SnowViewport viewport,
+                              const SnowFilterStyle& style, std::uint32_t properties);
+MutationResult setFilterCreationStyle(SnowRuntime runtime, SnowViewport viewport,
+                                      const SnowFilterStyle& style, std::uint32_t properties,
+                                      SnowActiveTool tool);
+MutationResult setBrushEraserCreationStyle(SnowRuntime runtime, SnowViewport viewport,
+                                           const SnowBrushEraserStyle& style,
+                                           std::uint32_t properties);
+MutationResult setTextStyle(SnowRuntime runtime, SnowViewport viewport, const SnowTextStyle& style,
+                            std::uint32_t properties,
+                            const std::vector<SnowTextLayoutOverride>& layouts = {});
+MutationResult setTextCreationStyle(SnowRuntime runtime, SnowViewport viewport,
+                                    const SnowTextStyle& style, std::uint32_t properties);
+MutationResult setSerialNumberStylePatch(SnowRuntime runtime, SnowViewport viewport,
+                                         const SnowSerialNumberStyle& style,
+                                         std::uint32_t properties);
+MutationResult setSerialNumberStyle(SnowRuntime runtime, SnowViewport viewport,
+                                    const SnowSerialNumberStyle& style);
+PairedMutationResult setSnapConfig(SnowRuntime runtime, SnowViewport viewport,
+                                   SnowSnapConfig config);
+MutationResult setSnapGuideTargets(SnowRuntime runtime, SnowViewport viewport,
+                                   const double* verticalXs, size_t verticalCount,
+                                   const double* horizontalYs, size_t horizontalCount);
+PairedMutationResult setGridConfig(SnowRuntime runtime, SnowViewport viewport,
+                                   SnowGridConfig config);
+
+} // namespace snow_canvas_commands

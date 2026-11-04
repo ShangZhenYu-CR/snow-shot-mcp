@@ -1,0 +1,1077 @@
+use crate::dirty_regions::clip_dirty_region;
+use crate::item_conversions::text_paint_geometry_from_display_item;
+use snow_draw_engine_core::{
+    ColorRgba8, DrawRect, Point, SnapGuideAxis, SnapGuideKind,
+    arrow::{ArrowType, Arrowhead, StrokeStyle},
+    rotated_rect_extents,
+};
+use snow_draw_engine_display::{
+    DirtyRegion, DisplayRectangleShape, FrameView, OverlayDisplayItem, SceneDisplayItem,
+    SerialNumberConnectorDisplayItem, SnapGuideDisplayItem, TextDisplayItem,
+};
+use snow_draw_engine_document::{
+    ArrowData, FillStyle, LinearElementKind, RectangleData, arrow_bounds, arrow_is_degenerate,
+    text_paint_bounds,
+};
+
+pub(crate) fn rect_bounds(rect: RectangleData) -> DrawRect {
+    snow_draw_engine_document::rect_paint_bounds(&rect)
+}
+
+pub(crate) fn bounds_visible(bounds: DrawRect, viewport: (f64, f64, f64, f64)) -> bool {
+    bounds.max_x >= viewport.0
+        && bounds.min_x <= viewport.2
+        && bounds.max_y >= viewport.1
+        && bounds.min_y <= viewport.3
+}
+
+pub(crate) fn overlay_item_visible(item: &OverlayDisplayItem, frame_view: FrameView) -> bool {
+    overlay_display_item_bounds(item, frame_view)
+        .and_then(|bounds| clip_dirty_region(bounds, frame_view.surface))
+        .is_some()
+}
+
+pub(crate) fn scene_display_item_bounds(
+    item: &SceneDisplayItem,
+    frame_view: FrameView,
+) -> Option<DirtyRegion> {
+    let bounds = match item {
+        SceneDisplayItem::Rectangle(item) => match item.shape {
+            DisplayRectangleShape::Diamond => draw_diamond_bounds(
+                frame_view,
+                item.center_x,
+                item.center_y,
+                item.width,
+                item.height,
+                item.rotation,
+                item.stroke_width,
+            ),
+            DisplayRectangleShape::Rectangle | DisplayRectangleShape::Ellipse => draw_rect_bounds(
+                frame_view,
+                item.center_x,
+                item.center_y,
+                item.width,
+                item.height,
+                item.rotation,
+                item.stroke_width,
+            ),
+        },
+        SceneDisplayItem::SpeechBubble(item) => draw_path_item_bounds(frame_view, &item.path),
+        SceneDisplayItem::Magnifier(item) => {
+            let body = item.paint_geometry().bounds().map(|bounds| {
+                let min =
+                    canvas_point_to_surface(frame_view, Point::new(bounds.min_x, bounds.min_y));
+                let max =
+                    canvas_point_to_surface(frame_view, Point::new(bounds.max_x, bounds.max_y));
+                DirtyRegion::new(min.x, min.y, max.x, max.y)
+            });
+            let leader = item
+                .leader
+                .as_ref()
+                .and_then(|leader| draw_path_item_bounds(frame_view, leader));
+            match (body, leader) {
+                (Some(a), Some(b)) => Some(a.union(b)),
+                (a, None) => a,
+                (None, b) => b,
+            }
+        }
+        SceneDisplayItem::Filter(item) => draw_rect_bounds(
+            frame_view,
+            item.center_x,
+            item.center_y,
+            item.width,
+            item.height,
+            item.rotation,
+            item.stroke_width,
+        ),
+        SceneDisplayItem::Arrow(item) => draw_path_item_bounds(frame_view, item),
+        SceneDisplayItem::Text(item) => draw_text_bounds(frame_view, item),
+        SceneDisplayItem::SerialNumber(item) => draw_rect_bounds(
+            frame_view,
+            item.center_x,
+            item.center_y,
+            item.diameter,
+            item.diameter,
+            item.rotation,
+            item.stroke_width,
+        ),
+        SceneDisplayItem::SerialNumberConnector(item) => {
+            draw_serial_number_connector_bounds(frame_view, *item)
+        }
+        SceneDisplayItem::Stroke | SceneDisplayItem::Image => None,
+    };
+    let style = match item {
+        SceneDisplayItem::Rectangle(item) if item.stroke.a != 0 && item.stroke_width > 0.0 => {
+            item.stroke_rendering_style
+        }
+        SceneDisplayItem::Arrow(item)
+            if (item.stroke.a != 0
+                || (item.arrow_outline_color.a != 0 && item.arrow_outline_width > 0.0))
+                && item.stroke_width > 0.0 =>
+        {
+            item.stroke_rendering_style
+        }
+        SceneDisplayItem::SpeechBubble(item)
+            if item.path.stroke.a != 0 && item.path.stroke_width > 0.0 =>
+        {
+            item.path.stroke_rendering_style
+        }
+        SceneDisplayItem::SerialNumber(item)
+            if item.color.a != 0
+                && item.stroke_width > 0.0
+                && matches!(
+                    item.serial_number_type,
+                    snow_draw_engine_display::DisplaySerialNumberType::OutlinedCircle
+                        | snow_draw_engine_display::DisplaySerialNumberType::OutlinedSquare
+                ) =>
+        {
+            item.stroke_rendering_style
+        }
+        _ => Default::default(),
+    };
+    let outline = match item {
+        SceneDisplayItem::Arrow(item)
+            if item.arrow_outline_color.a != 0 && item.stroke_width > 0.0 =>
+        {
+            item.arrow_outline_width / 2.0
+        }
+        _ => 0.0,
+    };
+    let outset = (snow_draw_engine_core::arrow::stroke_rendering_outset(style, f64::MAX) + outline)
+        * frame_view.camera.zoom.max(0.0);
+    bounds.map(|bounds| {
+        DirtyRegion::new(
+            bounds.min_x - outset,
+            bounds.min_y - outset,
+            bounds.max_x + outset,
+            bounds.max_y + outset,
+        )
+    })
+}
+
+fn draw_path_item_bounds(
+    frame_view: FrameView,
+    item: &snow_draw_engine_display::ArrowDisplayItem,
+) -> Option<DirtyRegion> {
+    if let Some(pressure) = &item.pressure_geometry {
+        let mut bounds = pressure.canvas_bounds;
+        if item.fill_style.is_visible(item.fill) {
+            let center = item.geometry.canvas_bounds;
+            bounds = [
+                bounds[0].min(center[0]),
+                bounds[1].min(center[1]),
+                bounds[2].max(center[2]),
+                bounds[3].max(center[3]),
+            ];
+        }
+        return draw_path_geometry_bounds(frame_view, bounds, 0.0, &[]);
+    }
+    draw_path_geometry_bounds(
+        frame_view,
+        item.geometry.canvas_bounds,
+        item.stroke_width,
+        &item.arrowhead_primitives,
+    )
+}
+
+fn draw_path_geometry_bounds(
+    frame_view: FrameView,
+    bounds: [f64; 4],
+    stroke_width: f64,
+    arrowhead_primitives: &[snow_draw_engine_display::ArrowheadDisplayPrimitive],
+) -> Option<DirtyRegion> {
+    if bounds.iter().any(|value| !value.is_finite()) || stroke_width < 0.0 {
+        return None;
+    }
+    let outset = stroke_width * 0.5;
+    let mut min_x = bounds[0] - outset;
+    let mut min_y = bounds[1] - outset;
+    let mut max_x = bounds[2] + outset;
+    let mut max_y = bounds[3] + outset;
+    for primitive in arrowhead_primitives {
+        for point in &primitive.points {
+            min_x = min_x.min(point[0] - outset);
+            min_y = min_y.min(point[1] - outset);
+            max_x = max_x.max(point[0] + outset);
+            max_y = max_y.max(point[1] + outset);
+        }
+        if primitive.diameter > 0.0 {
+            let radius = primitive.diameter * 0.5 + outset;
+            min_x = min_x.min(primitive.center[0] - radius);
+            min_y = min_y.min(primitive.center[1] - radius);
+            max_x = max_x.max(primitive.center[0] + radius);
+            max_y = max_y.max(primitive.center[1] + radius);
+        }
+    }
+    let top_left = canvas_point_to_surface(frame_view, Point::new(min_x, min_y));
+    let bottom_right = canvas_point_to_surface(frame_view, Point::new(max_x, max_y));
+    Some(DirtyRegion::new(
+        top_left.x.min(bottom_right.x),
+        top_left.y.min(bottom_right.y),
+        top_left.x.max(bottom_right.x),
+        top_left.y.max(bottom_right.y),
+    ))
+}
+
+fn draw_text_bounds(frame_view: FrameView, item: &TextDisplayItem) -> Option<DirtyRegion> {
+    // Consume the published paint bounds (aligned content box + fill padding +
+    // stroke halo). Reconstructing from the wrap rectangle would miss overflow
+    // ink and over-invalidate wrapped labels.
+    draw_document_bounds(
+        frame_view,
+        text_paint_bounds(&text_paint_geometry_from_display_item(item)),
+    )
+}
+
+fn draw_document_bounds(frame_view: FrameView, bounds: DrawRect) -> Option<DirtyRegion> {
+    if !bounds.min_x.is_finite()
+        || !bounds.min_y.is_finite()
+        || !bounds.max_x.is_finite()
+        || !bounds.max_y.is_finite()
+        || bounds.max_x <= bounds.min_x
+        || bounds.max_y <= bounds.min_y
+    {
+        return None;
+    }
+    let top_left = canvas_point_to_surface(frame_view, Point::new(bounds.min_x, bounds.min_y));
+    let bottom_right = canvas_point_to_surface(frame_view, Point::new(bounds.max_x, bounds.max_y));
+    Some(DirtyRegion::new(
+        top_left.x.min(bottom_right.x),
+        top_left.y.min(bottom_right.y),
+        top_left.x.max(bottom_right.x),
+        top_left.y.max(bottom_right.y),
+    ))
+}
+
+pub(crate) fn overlay_display_item_bounds(
+    item: &OverlayDisplayItem,
+    frame_view: FrameView,
+) -> Option<DirtyRegion> {
+    match item {
+        OverlayDisplayItem::Rectangle(item) => draw_rect_bounds(
+            frame_view,
+            item.center_x,
+            item.center_y,
+            item.width,
+            item.height,
+            item.rotation,
+            item.stroke_width,
+        ),
+        OverlayDisplayItem::FocusConnection(item) => {
+            // Hover strokes are screen-sized, but arrowheads retain the document's
+            // geometry. Bound the published primitives used by the renderer;
+            // rebuilding an arrow from the thin hover stroke shrinks its heads.
+            let geometry = snow_draw_engine_core::PathGeometry::from_commands(
+                0,
+                item.path_commands.clone(),
+                false,
+            );
+            draw_path_geometry_bounds(
+                frame_view,
+                geometry.canvas_bounds,
+                item.stroke_width,
+                &item.arrowhead_primitives,
+            )
+        }
+        OverlayDisplayItem::PenFilterContour(item) => draw_arrow_bounds(
+            frame_view,
+            display_arrow_to_document_arrow(
+                &item.points,
+                item.arrow_type,
+                item.start_arrowhead,
+                item.end_arrowhead,
+                item.stroke,
+                item.stroke_width + 1.0 / frame_view.camera.zoom.max(0.0001),
+                item.stroke_style,
+            ),
+        ),
+        OverlayDisplayItem::SnapGuide(item) => snap_guide_bounds(*item, frame_view),
+    }
+}
+
+pub(crate) fn draw_rect_bounds(
+    frame_view: FrameView,
+    center_x: f64,
+    center_y: f64,
+    width: f64,
+    height: f64,
+    rotation: f64,
+    stroke_width: f64,
+) -> Option<DirtyRegion> {
+    if !center_x.is_finite()
+        || !center_y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || !rotation.is_finite()
+        || !stroke_width.is_finite()
+    {
+        return None;
+    }
+
+    let center = canvas_point_to_surface(frame_view, Point::new(center_x, center_y));
+    let zoom = frame_view.camera.zoom.max(0.0);
+    let (extent_x, extent_y) = rotated_rect_extents(
+        width.max(0.0) * zoom,
+        height.max(0.0) * zoom,
+        rotation,
+        stroke_width.max(0.0) * zoom,
+    );
+    Some(DirtyRegion::new(
+        center.x - extent_x,
+        center.y - extent_y,
+        center.x + extent_x,
+        center.y + extent_y,
+    ))
+}
+
+fn draw_diamond_bounds(
+    frame_view: FrameView,
+    center_x: f64,
+    center_y: f64,
+    width: f64,
+    height: f64,
+    rotation: f64,
+    stroke_width: f64,
+) -> Option<DirtyRegion> {
+    if !center_x.is_finite()
+        || !center_y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || !rotation.is_finite()
+        || !stroke_width.is_finite()
+    {
+        return None;
+    }
+
+    let center = canvas_point_to_surface(frame_view, Point::new(center_x, center_y));
+    let zoom = frame_view.camera.zoom.max(0.0);
+    let half_width = width.max(0.0) * zoom / 2.0;
+    let half_height = height.max(0.0) * zoom / 2.0;
+    let half_stroke = stroke_width.max(0.0) * zoom / 2.0;
+    let diagonal = half_width.hypot(half_height);
+
+    // The renderer uses Qt::MiterJoin. At a diamond tip the miter extends
+    // farther than half the stroke width, unlike a rectangular or elliptic
+    // outline. Match QPen's default miter limit so very thin diamonds whose
+    // joins are bevelled do not produce disproportionately large dirty areas.
+    const QT_DEFAULT_MITER_LIMIT: f64 = 2.0;
+    let max_miter = stroke_width.max(0.0) * zoom * QT_DEFAULT_MITER_LIMIT;
+    let miter_x = if half_height > 0.0 {
+        (half_stroke * diagonal / half_height).min(max_miter)
+    } else {
+        half_stroke
+    };
+    let miter_y = if half_width > 0.0 {
+        (half_stroke * diagonal / half_width).min(max_miter)
+    } else {
+        half_stroke
+    };
+    let local_extent_x = half_width + miter_x;
+    let local_extent_y = half_height + miter_y;
+    let cos_theta = rotation.cos().abs();
+    let sin_theta = rotation.sin().abs();
+    let extent_x = cos_theta * local_extent_x + sin_theta * local_extent_y;
+    let extent_y = sin_theta * local_extent_x + cos_theta * local_extent_y;
+
+    Some(DirtyRegion::new(
+        center.x - extent_x,
+        center.y - extent_y,
+        center.x + extent_x,
+        center.y + extent_y,
+    ))
+}
+
+fn draw_arrow_bounds(frame_view: FrameView, arrow: ArrowData) -> Option<DirtyRegion> {
+    if arrow_is_degenerate(&arrow) || !arrow.stroke_width.is_finite() || arrow.stroke_width < 0.0 {
+        return None;
+    }
+
+    let bounds = arrow_bounds(&arrow);
+    let min = canvas_point_to_surface(frame_view, Point::new(bounds.min_x, bounds.min_y));
+    let max = canvas_point_to_surface(frame_view, Point::new(bounds.max_x, bounds.max_y));
+    Some(DirtyRegion::new(min.x, min.y, max.x, max.y))
+}
+
+fn draw_serial_number_connector_bounds(
+    frame_view: FrameView,
+    item: SerialNumberConnectorDisplayItem,
+) -> Option<DirtyRegion> {
+    if !item.start_x.is_finite()
+        || !item.start_y.is_finite()
+        || !item.end_x.is_finite()
+        || !item.end_y.is_finite()
+        || !item.stroke_width.is_finite()
+        || item.stroke_width <= 0.0
+    {
+        return None;
+    }
+
+    let start = canvas_point_to_surface(frame_view, Point::new(item.start_x, item.start_y));
+    let end = canvas_point_to_surface(frame_view, Point::new(item.end_x, item.end_y));
+    let mut bounds = DirtyRegion::new(
+        start.x.min(end.x),
+        start.y.min(end.y),
+        start.x.max(end.x),
+        start.y.max(end.y),
+    );
+    if item.has_baseline {
+        if !item.baseline_start_x.is_finite()
+            || !item.baseline_start_y.is_finite()
+            || !item.baseline_end_x.is_finite()
+            || !item.baseline_end_y.is_finite()
+        {
+            return None;
+        }
+        let baseline_start = canvas_point_to_surface(
+            frame_view,
+            Point::new(item.baseline_start_x, item.baseline_start_y),
+        );
+        let baseline_end = canvas_point_to_surface(
+            frame_view,
+            Point::new(item.baseline_end_x, item.baseline_end_y),
+        );
+        bounds = bounds.union(DirtyRegion::new(
+            baseline_start.x.min(baseline_end.x),
+            baseline_start.y.min(baseline_end.y),
+            baseline_start.x.max(baseline_end.x),
+            baseline_start.y.max(baseline_end.y),
+        ));
+    }
+
+    let padding = (item.stroke_width * frame_view.camera.zoom.max(0.0)).max(1.0);
+    Some(DirtyRegion::new(
+        bounds.min_x - padding,
+        bounds.min_y - padding,
+        bounds.max_x + padding,
+        bounds.max_y + padding,
+    ))
+}
+
+fn snap_guide_bounds(item: SnapGuideDisplayItem, frame_view: FrameView) -> Option<DirtyRegion> {
+    if !item.line_width.is_finite()
+        || !item.marker_size.is_finite()
+        || item.line_width < 0.0
+        || item.marker_size < 0.0
+    {
+        return None;
+    }
+
+    let start = canvas_point_to_surface(frame_view, item.start);
+    let end = canvas_point_to_surface(frame_view, item.end);
+    let half_line_width = item.line_width / 2.0;
+    let mut bounds = DirtyRegion::new(
+        start.x.min(end.x) - half_line_width,
+        start.y.min(end.y) - half_line_width,
+        start.x.max(end.x) + half_line_width,
+        start.y.max(end.y) + half_line_width,
+    );
+
+    let marker_radius = match item.kind {
+        SnapGuideKind::Gap => item.marker_size * 0.75,
+        SnapGuideKind::Point => item.marker_size * 0.5,
+    };
+    if item.marker_count == 0 {
+        bounds = bounds.union(point_bounds(start, marker_radius));
+        bounds = bounds.union(point_bounds(end, marker_radius));
+    } else {
+        for marker in item.markers.iter().take(item.marker_count as usize) {
+            bounds = bounds.union(point_bounds(
+                canvas_point_to_surface(frame_view, *marker),
+                marker_radius,
+            ));
+        }
+    }
+
+    if let Some(label) = item.label {
+        bounds = bounds.union(snap_guide_label_bounds(
+            item.axis,
+            start,
+            end,
+            format!("{label:.0}").chars().count(),
+        ));
+    }
+
+    Some(bounds)
+}
+
+fn point_bounds(point: Point<f64>, radius: f64) -> DirtyRegion {
+    DirtyRegion::new(
+        point.x - radius,
+        point.y - radius,
+        point.x + radius,
+        point.y + radius,
+    )
+}
+
+pub(crate) const SNAP_GUIDE_LABEL_CHAR_WIDTH: f64 = 12.0;
+pub(crate) const SNAP_GUIDE_LABEL_BASE_WIDTH: f64 = 20.0;
+pub(crate) const SNAP_GUIDE_LABEL_HEIGHT: f64 = 24.0;
+pub(crate) const SNAP_GUIDE_LABEL_OFFSET: f64 = 6.0;
+pub(crate) const SNAP_GUIDE_LABEL_SIDE_PADDING: f64 = 4.0;
+pub(crate) const SNAP_GUIDE_LABEL_VERTICAL_PADDING: f64 = 2.0;
+
+pub(crate) fn snap_guide_label_bounds(
+    axis: SnapGuideAxis,
+    start: Point<f64>,
+    end: Point<f64>,
+    text_len: usize,
+) -> DirtyRegion {
+    let midpoint = Point::new(f64::midpoint(start.x, end.x), f64::midpoint(start.y, end.y));
+    let width = SNAP_GUIDE_LABEL_BASE_WIDTH + text_len as f64 * SNAP_GUIDE_LABEL_CHAR_WIDTH;
+    match axis {
+        SnapGuideAxis::Horizontal => DirtyRegion::new(
+            midpoint.x - width / 2.0 - SNAP_GUIDE_LABEL_SIDE_PADDING,
+            midpoint.y
+                - SNAP_GUIDE_LABEL_HEIGHT
+                - SNAP_GUIDE_LABEL_OFFSET
+                - SNAP_GUIDE_LABEL_VERTICAL_PADDING,
+            midpoint.x + width / 2.0 + SNAP_GUIDE_LABEL_SIDE_PADDING,
+            midpoint.y + SNAP_GUIDE_LABEL_HEIGHT / 2.0 + SNAP_GUIDE_LABEL_VERTICAL_PADDING,
+        ),
+        SnapGuideAxis::Vertical => DirtyRegion::new(
+            midpoint.x + SNAP_GUIDE_LABEL_OFFSET - SNAP_GUIDE_LABEL_SIDE_PADDING,
+            midpoint.y - SNAP_GUIDE_LABEL_HEIGHT / 2.0 - SNAP_GUIDE_LABEL_VERTICAL_PADDING,
+            midpoint.x + SNAP_GUIDE_LABEL_OFFSET + width + SNAP_GUIDE_LABEL_SIDE_PADDING,
+            midpoint.y + SNAP_GUIDE_LABEL_HEIGHT / 2.0 + SNAP_GUIDE_LABEL_VERTICAL_PADDING,
+        ),
+    }
+}
+
+pub(crate) fn canvas_point_to_surface(frame_view: FrameView, point: Point<f64>) -> Point<f64> {
+    Point::new(
+        (point.x - frame_view.camera.center.x) * frame_view.camera.zoom
+            + frame_view.surface.width as f64 / 2.0,
+        (point.y - frame_view.camera.center.y) * frame_view.camera.zoom
+            + frame_view.surface.height as f64 / 2.0,
+    )
+}
+
+fn display_arrow_to_document_arrow(
+    points: &[[f64; 2]],
+    arrow_type: ArrowType,
+    start_arrowhead: Option<Arrowhead>,
+    end_arrowhead: Option<Arrowhead>,
+    stroke: ColorRgba8,
+    stroke_width: f64,
+    stroke_style: StrokeStyle,
+) -> ArrowData {
+    let global_points = points
+        .iter()
+        .map(|point| Point::new(point[0], point[1]))
+        .collect::<Vec<_>>();
+    let mut arrow = ArrowData::from_global_points(
+        &global_points,
+        stroke,
+        stroke_width,
+        stroke_style,
+        arrow_type,
+        start_arrowhead,
+        end_arrowhead,
+    )
+    .unwrap_or_else(|| ArrowData {
+        arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(),
+        arrow_outline_width: 0.0,
+        stroke_rendering_seed: 0,
+        stroke_rendering_style: Default::default(),
+        linear_kind: LinearElementKind::Arrow,
+        distance: None,
+        angle: None,
+        text_element_id: None,
+        text_path_fraction: None,
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+        rotation: 0.0,
+        points: Vec::new(),
+        start_binding: None,
+        end_binding: None,
+        start_arrowhead,
+        end_arrowhead,
+        arrow_type,
+        arrow_shaft_type: Default::default(),
+        arrow_ratio: 1.0,
+        fixed_segments: None,
+        start_is_special: None,
+        end_is_special: None,
+        stroke,
+        stroke_width,
+        stroke_style,
+        fill: ColorRgba8::default(),
+        fill_style: FillStyle::Solid,
+        opacity: 1.0,
+    });
+    arrow.start_arrowhead = start_arrowhead;
+    arrow.end_arrowhead = end_arrowhead;
+    arrow.arrow_type = arrow_type;
+    arrow.stroke = stroke;
+    arrow.stroke_width = stroke_width;
+    arrow.stroke_style = stroke_style;
+    arrow
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snow_draw_engine_core::{Camera, CornerRadii, SurfaceSize};
+    use snow_draw_engine_display::{
+        DisplayFillStyle, DisplayItemId, DisplayTextHorizontalAlign, DisplayTextVerticalAlign,
+        RectangleDisplayItem,
+    };
+
+    fn frame_view() -> FrameView {
+        FrameView {
+            surface: SurfaceSize {
+                width: 1000,
+                height: 1000,
+            },
+            camera: Camera {
+                center: Point::default(),
+                zoom: 1.0,
+            },
+            clear_color: ColorRgba8::default(),
+        }
+    }
+
+    #[test]
+    fn magnifier_scene_damage_covers_the_document_paint_contract() {
+        use snow_draw_engine_core::MagnifierConnectionType;
+        use snow_draw_engine_document::{HighlightShape, MagnifierData, magnifier_bounds};
+        use snow_draw_engine_model::ElementId;
+
+        for shape in [
+            HighlightShape::Rectangle,
+            HighlightShape::Ellipse,
+            HighlightShape::Diamond,
+        ] {
+            for connection_type in [
+                MagnifierConnectionType::None,
+                MagnifierConnectionType::LeaderLine,
+                MagnifierConnectionType::Gradient,
+            ] {
+                for source_outline in [false, true] {
+                    for rotation in [0.0, 0.63] {
+                        let value = MagnifierData {
+                            source_center: Point::new(-320.0, 190.0),
+                            magnified_center: Point::new(260.0, -170.0),
+                            width: 150.0,
+                            height: 90.0,
+                            stroke_width: 12.0,
+                            shape,
+                            connection_type,
+                            source_outline,
+                            rotation,
+                            ..MagnifierData::default()
+                        };
+                        let item = crate::item_conversions::scene_item_from_magnifier(
+                            ElementId {
+                                index: 1,
+                                generation: 1,
+                            },
+                            value,
+                        );
+                        for zoom in [0.5, 1.0, 2.0] {
+                            let mut frame = frame_view();
+                            frame.camera.zoom = zoom;
+                            frame.camera.center = Point::new(15.0, -30.0);
+                            let actual = scene_display_item_bounds(&item, frame).unwrap();
+                            let bounds = magnifier_bounds(&value);
+                            let min = canvas_point_to_surface(
+                                frame,
+                                Point::new(bounds.min_x, bounds.min_y),
+                            );
+                            let max = canvas_point_to_surface(
+                                frame,
+                                Point::new(bounds.max_x, bounds.max_y),
+                            );
+                            assert!(
+                                actual.min_x <= min.x + 1e-8
+                                    && actual.min_y <= min.y + 1e-8
+                                    && actual.max_x >= max.x - 1e-8
+                                    && actual.max_y >= max.y - 1e-8,
+                                "{shape:?} {connection_type:?} outline={source_outline} rotation={rotation} zoom={zoom}: {actual:?}, expected {min:?}..{max:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hovered_arrow_bounds_cover_original_arrowheads_at_every_zoom() {
+        use crate::item_conversions::hover_arrow_item;
+
+        for head in [
+            Arrowhead::Dot,
+            Arrowhead::Circle,
+            Arrowhead::CircleOutline,
+            Arrowhead::Arrow,
+            Arrowhead::Bar,
+            Arrowhead::Triangle,
+            Arrowhead::TriangleOutline,
+            Arrowhead::Diamond,
+            Arrowhead::DiamondOutline,
+            Arrowhead::CrowfootOne,
+            Arrowhead::CrowfootMany,
+            Arrowhead::CrowfootOneOrMany,
+            Arrowhead::Square,
+            Arrowhead::InvertedTriangle,
+            Arrowhead::IndentedTriangle,
+        ] {
+            for arrow_type in [ArrowType::Straight, ArrowType::Curve, ArrowType::Elbow] {
+                for zoom in [0.5, 1.0, 2.0, 4.0] {
+                    let arrow = ArrowData::from_global_points(
+                        &[Point::new(-100.0, 60.0), Point::new(100.0, -60.0)],
+                        ColorRgba8::default(),
+                        8.0,
+                        StrokeStyle::Solid,
+                        arrow_type,
+                        Some(head),
+                        Some(head),
+                    )
+                    .unwrap();
+                    let hover = hover_arrow_item(&arrow, zoom);
+                    let mut view = frame_view();
+                    view.camera.zoom = zoom;
+                    let bounds = overlay_display_item_bounds(
+                        &OverlayDisplayItem::FocusConnection(hover.clone()),
+                        view,
+                    )
+                    .unwrap();
+                    let half_stroke = hover.stroke_width * 0.5;
+                    for primitive in &hover.arrowhead_primitives {
+                        let mut points = primitive.points.clone();
+                        if primitive.diameter > 0.0 {
+                            let radius = primitive.diameter * 0.5;
+                            points
+                                .push([primitive.center[0] - radius, primitive.center[1] - radius]);
+                            points
+                                .push([primitive.center[0] + radius, primitive.center[1] + radius]);
+                        }
+                        for point in points {
+                            let min = canvas_point_to_surface(
+                                view,
+                                Point::new(point[0] - half_stroke, point[1] - half_stroke),
+                            );
+                            let max = canvas_point_to_surface(
+                                view,
+                                Point::new(point[0] + half_stroke, point[1] + half_stroke),
+                            );
+                            assert!(
+                                bounds.min_x <= min.x + 1e-9
+                                    && bounds.min_y <= min.y + 1e-9
+                                    && bounds.max_x >= max.x - 1e-9
+                                    && bounds.max_y >= max.y - 1e-9,
+                                "{head:?} {arrow_type:?} at zoom {zoom}: {bounds:?} clips {point:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn text_item() -> TextDisplayItem {
+        TextDisplayItem {
+            text_ink_reserve: 0.0,
+            id: DisplayItemId::default(),
+            center_x: 0.0,
+            center_y: 0.0,
+            width: 100.0,
+            height: 40.0,
+            rotation: 0.0,
+            content_width: 100.0,
+            content_height: 40.0,
+            text: "editing".to_owned(),
+            color: ColorRgba8::default(),
+            font_size: 20.0,
+            bold: false,
+            italic: false,
+            font_family: None,
+            fill: ColorRgba8::default(),
+            fill_style: DisplayFillStyle::Solid,
+            stroke: ColorRgba8::default(),
+            stroke_width: 0.0,
+            corner_radii: CornerRadii::default(),
+            horizontal_align: DisplayTextHorizontalAlign::Left,
+            vertical_align: DisplayTextVerticalAlign::Center,
+            opacity: 1.0,
+        }
+    }
+
+    fn published_fill_outset(font_size: f64) -> (f64, f64) {
+        let line_height = font_size.max(1.0) * 1.2;
+        (line_height * 0.32, line_height * 0.1)
+    }
+
+    fn surface_dirty_for_canvas_rect(
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> DirtyRegion {
+        let view = frame_view();
+        let top_left = canvas_point_to_surface(view, Point::new(min_x, min_y));
+        let bottom_right = canvas_point_to_surface(view, Point::new(max_x, max_y));
+        DirtyRegion::new(
+            top_left.x.min(bottom_right.x),
+            top_left.y.min(bottom_right.y),
+            top_left.x.max(bottom_right.x),
+            top_left.y.max(bottom_right.y),
+        )
+    }
+
+    #[test]
+    fn active_text_scene_bounds_follow_published_paint_outset() {
+        let mut item = text_item();
+        item.fill = ColorRgba8 {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 0xff,
+        };
+        let (pad_x, pad_y) = published_fill_outset(item.font_size);
+        let fill_bounds = draw_text_bounds(frame_view(), &item).unwrap();
+        assert_eq!(
+            fill_bounds,
+            surface_dirty_for_canvas_rect(
+                -item.width / 2.0 - pad_x,
+                -item.height / 2.0 - pad_y,
+                item.width / 2.0 + pad_x,
+                item.height / 2.0 + pad_y,
+            )
+        );
+
+        item.stroke = ColorRgba8 {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0xff,
+        };
+        item.stroke_width = 40.0;
+        let stroked_fill_bounds = draw_text_bounds(frame_view(), &item).unwrap();
+        assert!(
+            stroked_fill_bounds.min_x < fill_bounds.min_x
+                && stroked_fill_bounds.max_y > fill_bounds.max_y,
+            "dominant stroke must widen dirty regions past the pill"
+        );
+        assert_eq!(
+            stroked_fill_bounds,
+            surface_dirty_for_canvas_rect(
+                -item.width / 2.0 - 20.0,
+                -item.height / 2.0 - 20.0,
+                item.width / 2.0 + 20.0,
+                item.height / 2.0 + 20.0,
+            )
+        );
+
+        item.fill = ColorRgba8::default();
+        item.stroke_width = 10.0;
+        let stroke_bounds = draw_text_bounds(frame_view(), &item).unwrap();
+        assert_eq!(stroke_bounds, DirtyRegion::new(445.0, 475.0, 555.0, 525.0));
+    }
+
+    #[test]
+    fn large_text_scene_bounds_follow_published_fill_padding() {
+        let mut item = text_item();
+        item.font_size = 400.0;
+        item.fill = ColorRgba8 {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 0xff,
+        };
+        let (pad_x, pad_y) = published_fill_outset(item.font_size);
+        let fill_bounds = draw_text_bounds(frame_view(), &item).unwrap();
+        assert_eq!(
+            fill_bounds,
+            surface_dirty_for_canvas_rect(
+                -item.width / 2.0 - pad_x,
+                -item.height / 2.0 - pad_y,
+                item.width / 2.0 + pad_x,
+                item.height / 2.0 + pad_y,
+            )
+        );
+    }
+
+    #[test]
+    fn wrapped_text_scene_bounds_follow_aligned_ink() {
+        let mut item = text_item();
+        item.width = 80.0;
+        item.height = 40.0;
+        item.content_width = 40.0;
+        item.content_height = 20.0;
+        item.horizontal_align = DisplayTextHorizontalAlign::Left;
+        item.vertical_align = DisplayTextVerticalAlign::Top;
+        item.fill = ColorRgba8 {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+            a: 0xff,
+        };
+        let (pad_x, pad_y) = published_fill_outset(item.font_size);
+        let fill_bounds = draw_text_bounds(frame_view(), &item).unwrap();
+        let ink_left = -item.width / 2.0;
+        let ink_top = -item.height / 2.0;
+        assert_eq!(
+            fill_bounds,
+            surface_dirty_for_canvas_rect(
+                ink_left - pad_x,
+                ink_top - pad_y,
+                ink_left + item.content_width + pad_x,
+                ink_top + item.content_height + pad_y,
+            )
+        );
+        assert!(
+            fill_bounds.max_x - fill_bounds.min_x < item.width + 2.0 * pad_x,
+            "dirty region must track the ink box, not the wrap rectangle"
+        );
+    }
+
+    #[test]
+    fn diamond_scene_bounds_include_mitered_corners() {
+        let item = RectangleDisplayItem {
+            center_x: 0.0,
+            center_y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            stroke_width: 10.0,
+            shape: DisplayRectangleShape::Diamond,
+            ..RectangleDisplayItem::default()
+        };
+
+        let bounds = scene_display_item_bounds(&SceneDisplayItem::Rectangle(item), frame_view())
+            .expect("diamond should have dirty bounds");
+        let expected_extent = 50.0 + 5.0 * 2.0_f64.sqrt();
+
+        assert!((bounds.min_x - (500.0 - expected_extent)).abs() < 1e-9);
+        assert!((bounds.max_x - (500.0 + expected_extent)).abs() < 1e-9);
+        assert!((bounds.min_y - (500.0 - expected_extent)).abs() < 1e-9);
+        assert!((bounds.max_y - (500.0 + expected_extent)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diamond_scene_bounds_account_for_rotation() {
+        let item = RectangleDisplayItem {
+            center_x: 0.0,
+            center_y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            rotation: std::f64::consts::FRAC_PI_4,
+            stroke_width: 10.0,
+            shape: DisplayRectangleShape::Diamond,
+            ..RectangleDisplayItem::default()
+        };
+
+        let bounds = scene_display_item_bounds(&SceneDisplayItem::Rectangle(item), frame_view())
+            .expect("rotated diamond should have dirty bounds");
+        let expected_extent = 50.0 * 2.0_f64.sqrt() + 10.0;
+
+        assert!((bounds.min_x - (500.0 - expected_extent)).abs() < 1e-9);
+        assert!((bounds.max_x - (500.0 + expected_extent)).abs() < 1e-9);
+        assert!((bounds.min_y - (500.0 - expected_extent)).abs() < 1e-9);
+        assert!((bounds.max_y - (500.0 + expected_extent)).abs() < 1e-9);
+    }
+    #[test]
+    fn arrow_outline_dirty_bounds_scale_without_changing_geometry() {
+        let mut arrow = snow_draw_engine_display::ArrowDisplayItem {
+            stroke_width: 2.0,
+            arrow_outline_color: ColorRgba8 {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            ..Default::default()
+        };
+        for zoom in [0.5, 1.0, 3.0] {
+            let mut frame = frame_view();
+            frame.camera.zoom = zoom;
+            arrow.arrow_outline_width = 0.0;
+            let original =
+                scene_display_item_bounds(&SceneDisplayItem::Arrow(arrow.clone()), frame).unwrap();
+            arrow.arrow_outline_width = 8.0;
+            let outlined =
+                scene_display_item_bounds(&SceneDisplayItem::Arrow(arrow.clone()), frame).unwrap();
+            assert_eq!(outlined.min_x, original.min_x - 4.0 * zoom);
+            assert_eq!(outlined.max_y, original.max_y + 4.0 * zoom);
+        }
+    }
+
+    #[test]
+    fn stroke_rendering_scene_dirty_bounds_cover_shared_ink_outset() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        let mut item = RectangleDisplayItem {
+            width: 100.0,
+            height: 80.0,
+            stroke_width: 2.0,
+            stroke: ColorRgba8 {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            ..Default::default()
+        };
+        for zoom in [0.5, 1.0, 3.0] {
+            let mut frame = frame_view();
+            frame.camera.zoom = zoom;
+            item.stroke_rendering_style = StrokeRenderingStyle::Architect;
+            let exact =
+                scene_display_item_bounds(&SceneDisplayItem::Rectangle(item), frame).unwrap();
+            item.stroke_rendering_style = StrokeRenderingStyle::Cartoonist;
+            let rough =
+                scene_display_item_bounds(&SceneDisplayItem::Rectangle(item), frame).unwrap();
+            assert_eq!(rough.min_x, exact.min_x - 4.0 * zoom);
+            assert_eq!(rough.max_y, exact.max_y + 4.0 * zoom);
+        }
+    }
+
+    #[test]
+    fn serial_stroke_rendering_dirty_bounds_expand_only_outlined_badges() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        use snow_draw_engine_display::{DisplaySerialNumberType, SerialNumberDisplayItem};
+        for zoom in [0.75, 1.0, 1.5] {
+            let mut frame = frame_view();
+            frame.camera.zoom = zoom;
+            for kind in [
+                DisplaySerialNumberType::OutlinedCircle,
+                DisplaySerialNumberType::OutlinedSquare,
+                DisplaySerialNumberType::SolidCircle,
+                DisplaySerialNumberType::SolidSquare,
+                DisplaySerialNumberType::Circle,
+            ] {
+                let mut item = SerialNumberDisplayItem {
+                    diameter: 40.0,
+                    color: ColorRgba8 {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    stroke_width: 2.0,
+                    serial_number_type: kind,
+                    ..Default::default()
+                };
+                let exact =
+                    scene_display_item_bounds(&SceneDisplayItem::SerialNumber(item.clone()), frame)
+                        .unwrap();
+                item.stroke_rendering_style = StrokeRenderingStyle::Cartoonist;
+                let rough = scene_display_item_bounds(&SceneDisplayItem::SerialNumber(item), frame)
+                    .unwrap();
+                let extra = if matches!(
+                    kind,
+                    DisplaySerialNumberType::OutlinedCircle
+                        | DisplaySerialNumberType::OutlinedSquare
+                ) {
+                    4.0 * zoom
+                } else {
+                    0.0
+                };
+                assert_eq!(rough.min_x, exact.min_x - extra);
+                assert_eq!(rough.max_y, exact.max_y + extra);
+            }
+        }
+    }
+}

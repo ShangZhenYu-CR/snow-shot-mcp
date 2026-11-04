@@ -1,0 +1,261 @@
+use std::fmt;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// One failed display enumeration and its automatic retry deadline.
+/// Cloned errors share this record so cached reads are not new failed attempts.
+/// A new display notification or explicit refresh may supersede the deadline.
+#[derive(Debug)]
+pub struct DisplayRefreshRetry {
+    cause: CaptureError,
+    retry_at: Instant,
+}
+
+impl DisplayRefreshRetry {
+    #[cfg(any(windows, test))]
+    pub(crate) fn new(cause: CaptureError, retry_at: Instant) -> Self {
+        Self { cause, retry_at }
+    }
+
+    pub fn cause(&self) -> &CaptureError {
+        &self.cause
+    }
+
+    pub fn retry_at(&self) -> Instant {
+        self.retry_at
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum CaptureError {
+    InvalidTarget(String),
+
+    PermissionDenied,
+
+    MonitorLost,
+
+    NoPrimaryMonitor,
+
+    AccessLost,
+
+    Timeout,
+
+    UnsupportedFormat(String),
+
+    BufferOverflow,
+
+    InvalidConfig(String),
+
+    WorkerDead,
+
+    BackendUnavailable(String),
+
+    Canceled,
+
+    /// The capture source resolution changed during a streaming session.
+    /// Contains (new_width, new_height). The stream will automatically
+    /// deliver a `CaptureEvent::ResolutionChanged` event.
+    ResolutionChanged(u32, u32),
+
+    /// Display discovery is temporarily unavailable. Wait until the shared retry
+    /// deadline; switching backends or recreating capture workers cannot refresh it sooner.
+    DisplayRefreshPending(Arc<DisplayRefreshRetry>),
+
+    Platform(Arc<anyhow::Error>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureErrorClass {
+    InvalidInput,
+    Unsupported,
+    Transient,
+    Fatal,
+}
+
+impl CaptureError {
+    /// Wrap an `anyhow::Error` (or anything convertible to one) in the
+    /// `Platform` variant. The inner error is stored behind an `Arc` so
+    /// that `CaptureError` remains `Clone`.
+    pub fn platform(err: impl Into<anyhow::Error>) -> Self {
+        Self::Platform(Arc::new(err.into()))
+    }
+
+    pub fn class(&self) -> CaptureErrorClass {
+        match self {
+            Self::InvalidTarget(_) | Self::NoPrimaryMonitor | Self::InvalidConfig(_) => {
+                CaptureErrorClass::InvalidInput
+            }
+            Self::UnsupportedFormat(_) | Self::BackendUnavailable(_) => {
+                CaptureErrorClass::Unsupported
+            }
+            Self::AccessLost
+            | Self::Timeout
+            | Self::WorkerDead
+            | Self::MonitorLost
+            | Self::DisplayRefreshPending(_)
+            | Self::ResolutionChanged(_, _) => CaptureErrorClass::Transient,
+            Self::Canceled | Self::PermissionDenied | Self::BufferOverflow | Self::Platform(_) => {
+                CaptureErrorClass::Fatal
+            }
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.class(), CaptureErrorClass::Transient)
+    }
+
+    /// Whether another capture backend can recover the same valid request.
+    /// Permission, cancellation and invalid input remain terminal errors.
+    pub fn allows_backend_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::BackendUnavailable(_)
+                | Self::UnsupportedFormat(_)
+                | Self::AccessLost
+                | Self::Timeout
+                | Self::WorkerDead
+                | Self::Platform(_)
+        )
+    }
+
+    pub fn requires_worker_reset(&self) -> bool {
+        matches!(
+            self,
+            Self::MonitorLost | Self::AccessLost | Self::WorkerDead | Self::ResolutionChanged(_, _)
+        )
+    }
+}
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PermissionDenied => write!(f, "screen recording permission is required"),
+            Self::InvalidTarget(id) => write!(
+                f,
+                "requested monitor target is not available in this session/backend: {id}"
+            ),
+            Self::MonitorLost => write!(f, "requested monitor is no longer available"),
+            Self::NoPrimaryMonitor => write!(f, "no primary monitor found"),
+            Self::AccessLost => write!(f, "capture access lost"),
+            Self::Timeout => write!(f, "failed to acquire desktop frame within timeout"),
+            Self::UnsupportedFormat(fmt_name) => {
+                write!(f, "unsupported desktop texture format: {fmt_name}")
+            }
+            Self::BufferOverflow => write!(f, "frame buffer size overflow"),
+            Self::InvalidConfig(message) => write!(f, "invalid capture configuration: {message}"),
+            Self::WorkerDead => write!(f, "capture worker is not running"),
+            Self::BackendUnavailable(message) => {
+                write!(f, "no available backend implementation: {message}")
+            }
+            Self::Canceled => write!(f, "capture request was canceled"),
+            Self::ResolutionChanged(w, h) => {
+                write!(f, "capture source resolution changed to {w}x{h}")
+            }
+            Self::DisplayRefreshPending(retry) => {
+                write!(f, "display configuration refresh pending: {}", retry.cause)
+            }
+            Self::Platform(inner) => write!(f, "{inner:#}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DisplayRefreshPending(retry) => Some(retry.cause()),
+            Self::Platform(inner) => Some(inner.as_ref().as_ref()),
+            _ => None,
+        }
+    }
+}
+
+pub type CaptureResult<T> = Result<T, CaptureError>;
+
+impl snow_core::error::Classify for CaptureError {
+    fn class(&self) -> snow_core::error::ErrorClass {
+        match CaptureError::class(self) {
+            CaptureErrorClass::InvalidInput | CaptureErrorClass::Unsupported => {
+                snow_core::error::ErrorClass::InvalidConfig
+            }
+            CaptureErrorClass::Transient => snow_core::error::ErrorClass::Transient,
+            CaptureErrorClass::Fatal => snow_core::error::ErrorClass::Fatal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureError, DisplayRefreshRetry};
+    use std::error::Error;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    fn scheduled_display_retry_preserves_cause_without_resetting_capture_workers() {
+        let cause = CaptureError::platform(anyhow::anyhow!("native enumeration failure"));
+        let error = CaptureError::DisplayRefreshPending(Arc::new(DisplayRefreshRetry::new(
+            cause,
+            Instant::now(),
+        )));
+        assert!(error.is_retryable());
+        assert!(!error.requires_worker_reset());
+        assert!(!error.allows_backend_fallback());
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "native enumeration failure"
+        );
+        assert!(error.to_string().contains("native enumeration failure"));
+    }
+
+    #[test]
+    fn canceled_and_denied_sessions_do_not_retry() {
+        assert!(!CaptureError::Canceled.is_retryable());
+        assert!(!CaptureError::PermissionDenied.is_retryable());
+        assert!(CaptureError::Timeout.is_retryable());
+    }
+
+    #[test]
+    fn backend_fallback_recovers_backend_failures_without_hiding_terminal_errors() {
+        for error in [
+            CaptureError::BackendUnavailable("missing implementation".into()),
+            CaptureError::UnsupportedFormat("format".into()),
+            CaptureError::AccessLost,
+            CaptureError::Timeout,
+            CaptureError::WorkerDead,
+            CaptureError::platform(anyhow::anyhow!("driver failure")),
+        ] {
+            assert!(error.allows_backend_fallback(), "{error}");
+        }
+        for error in [
+            CaptureError::InvalidTarget("target".into()),
+            CaptureError::PermissionDenied,
+            CaptureError::MonitorLost,
+            CaptureError::NoPrimaryMonitor,
+            CaptureError::BufferOverflow,
+            CaptureError::InvalidConfig("config".into()),
+            CaptureError::Canceled,
+            CaptureError::ResolutionChanged(100, 100),
+        ] {
+            assert!(!error.allows_backend_fallback(), "{error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn platform_error_display_preserves_windows_cause_and_context() {
+        let cause =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x80040154_u32 as i32));
+        let cause_text = cause.to_string();
+        let error = CaptureError::platform(
+            anyhow::Error::from(cause)
+                .context("GraphicsCaptureSession::IsSupported failed")
+                .context("capture initialization failed"),
+        );
+
+        let displayed = error.to_string();
+        assert!(displayed.contains("capture initialization failed"));
+        assert!(displayed.contains("GraphicsCaptureSession::IsSupported failed"));
+        assert!(displayed.contains(&cause_text));
+        assert!(displayed.contains("80040154"));
+    }
+}

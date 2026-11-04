@@ -1,0 +1,157 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENRECORDINGAREAWINDOW_H
+#define SNOW_SHOT_PRESENTATION_SCREENRECORDINGAREAWINDOW_H
+
+#include "snow_shot/presentation/screenshotwheelinput.h"
+
+#include "snow_shot/presentation/screenshottoolpalette.h"
+
+#include <QRect>
+#include <QImage>
+#include <QMarginsF>
+#include <QRectF>
+#include <QRegion>
+#include <QWidget>
+
+#include <memory>
+
+class QEvent;
+class QShowEvent;
+class RecordingRegionDragHandle;
+class RecordingRegionInputRouter;
+class RecordingWebcamControl;
+class SnowCanvasRuntime;
+class SnowCanvasWidget;
+
+namespace snow_shot::presentation::recording {
+class RecordingCountdownOverlay;
+}
+
+class ScreenRecordingAreaWindow final : public QWidget {
+    Q_OBJECT
+
+  public:
+    enum class InputMode {
+        PassThrough,
+        Drawing,
+        RegionEditing,
+    };
+
+    explicit ScreenRecordingAreaWindow(QWidget* parent = nullptr);
+    ~ScreenRecordingAreaWindow() override;
+
+    // Desktop points on macOS; physical desktop pixels on Windows.
+    void setRecordingRegion(const QRect& region);
+    [[nodiscard]] QRect recordingRegion() const;
+    [[nodiscard]] bool canRestoreRecordingRegion() const;
+    bool restoreRecordingRegion(const QRect& region);
+    void setRecordingState(ScreenshotToolPalette::RecordingState state);
+    void setInputMode(InputMode mode);
+    [[nodiscard]] InputMode inputMode() const;
+    // Focus the effective input owner; pass-through and blocked areas cannot activate.
+    bool activateInput();
+    void setDrawingBlocked(bool blocked);
+    void setTrimming(bool enabled);
+    void setWebcamOverlay(const QRectF& bounds, const QSize& region = {}, int size = 150,
+                          const QPoint& offset = {}, const QPoint& fittedOffset = {},
+                          bool circle = false);
+    void cancelWebcamInteraction();
+    void setPreviewFrame(const QImage& frame);
+    [[nodiscard]] bool drawingBlocked() const;
+    void startCountdown(int seconds);
+    void updateCountdown(qint64 remainingMilliseconds);
+    void clearCountdown();
+    [[nodiscard]] bool countdownActive() const;
+    [[nodiscard]] QColor inputSurfaceColor() const;
+    [[nodiscard]] SnowCanvasWidget* canvas() const;
+    [[nodiscard]] SnowCanvasRuntime& canvasRuntime() {
+        return *m_canvasRuntime;
+    }
+    [[nodiscard]] QRect canvasGeometry() const;
+    [[nodiscard]] QRectF selectionRect() const {
+        return m_selectionRect;
+    }
+
+  signals:
+    void webcamLayoutPreviewed(int size, const QPoint& offset);
+    void webcamLayoutCommitted(int size, const QPoint& offset);
+    void webcamOrientationRequested(int action);
+    void recordingRegionChanged(const QRect& region);
+    void regionInteractionStarted();
+    void regionInteractionFinished();
+    void closeRequested();
+    void drawingDeactivationRequested();
+    void drawingWheelRequested(int direction);
+
+  protected:
+    bool event(QEvent* event) override;
+    void moveEvent(QMoveEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
+    void enterEvent(QEnterEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
+    void paintEvent(QPaintEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+
+  private:
+    friend class ScreenRecordingAreaWindowTestAccess;
+
+    void applyInputMode();
+    void placeRecordingRegion(const QRect& region);
+    void beginRegionDrag(const QPoint& pointer, Qt::Edges edges);
+    void updateRegionDrag(const QPoint& pointer);
+    void applyRegionDragGeometry(const QRect& region);
+    void setRegionCursor(Qt::Edges edges);
+    [[nodiscard]] int minimumRegionExtent() const;
+    void updateRegionCursor(const QPointF& position);
+    void applyNativePassThrough(bool enabled);
+    [[nodiscard]] bool regionEditingEnabled() const;
+    [[nodiscard]] bool drawingEnabled() const;
+    [[nodiscard]] Qt::Edges resizeEdgesAt(const QPointF& position) const;
+    void cancelRegionInteraction();
+    void finishRegionInteraction();
+    void synchronizeWindowGeometry();
+    void scheduleGeometrySynchronization();
+    void layoutSelection();
+    void layoutCountdownOverlay();
+    void layoutRegionDragHandle();
+    void layoutWebcamControl();
+    [[nodiscard]] QRegion regionInteractionRegion() const;
+    void updateNativeMouseRouting(const QPoint& desktopPosition);
+
+    QRectF m_frameRect;
+    QRectF m_selectionRect;
+    QRect m_recordingRegion;
+    qreal m_paddingWidth = 0.0;
+    ScreenshotToolPalette::RecordingState m_state = ScreenshotToolPalette::RecordingState::Idle;
+    InputMode m_inputMode = InputMode::PassThrough;
+    bool m_drawingBlocked = false;
+    bool m_windowBlocked = false;
+    bool m_trimming = false;
+    QImage m_previewFrame;
+    Qt::MouseButton m_gestureButton = Qt::NoButton;
+    bool m_cancellingRegionInteraction = false;
+    bool m_settingRegion = false;
+    bool m_geometrySyncPending = false;
+    QMarginsF m_physicalInsets;
+    bool m_regionDragActive = false;
+    QWidget* m_regionDragSource = nullptr;
+    bool m_regionEscapeRelease = false;
+    QPoint m_regionDragOrigin;
+    QRect m_regionDragRect;
+    Qt::Edges m_regionDragEdges;
+    Qt::Edges m_regionEffectiveEdges;
+    std::unique_ptr<SnowCanvasRuntime> m_canvasRuntime;
+    SnowCanvasWidget* m_canvas = nullptr;
+    snow_shot::presentation::WheelStepAccumulator m_angleWheelSteps;
+    std::unique_ptr<RecordingRegionInputRouter> m_regionInputRouter;
+    RecordingRegionDragHandle* m_regionDragHandle = nullptr;
+    RecordingWebcamControl* m_webcamControl = nullptr;
+    bool m_webcamVisible = false;
+    snow_shot::presentation::recording::RecordingCountdownOverlay* m_countdownOverlay = nullptr;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENRECORDINGAREAWINDOW_H

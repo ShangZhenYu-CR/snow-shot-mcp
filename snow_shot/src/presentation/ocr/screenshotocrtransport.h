@@ -1,0 +1,179 @@
+#pragma once
+
+#include "snow_draw_engine_qt/snow_canvas_image.h"
+#include "screenshotocrprotocol.h"
+#include "screenshotocrtransferbuffer.h"
+#include "snow_shot/presentation/screenshotocrassets.h"
+#include "snow_shot/diagnostics/diagnostics.h"
+#include "snow_shot/runtime/runtimeactivitytracker.h"
+#include <QImage>
+#include <QObject>
+#include <QMetaObject>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QTemporaryFile>
+#include <QTimer>
+#include <atomic>
+#include <functional>
+#include <limits>
+#include <memory>
+
+namespace snow_shot::ocr {
+using namespace protocol;
+
+namespace transport_detail {
+// Populate the private slot without publishing Ready. The process notification
+// and release fence remain in submit(), after every pixel and header field fits.
+inline bool copyImageToTransferSlot(const QImage& image, uchar* header, qsizetype capacity,
+                                    quint64 sequence) {
+    if (header == nullptr || capacity < kSlotHeaderBytes)
+        return false;
+    writeU32(header + kSlotStateOffset, kSlotFree);
+    if (image.isNull())
+        return false;
+    const quint64 stride = static_cast<quint64>(image.width()) * 4;
+    const quint64 bytes = stride * static_cast<quint64>(image.height());
+    if (stride > std::numeric_limits<quint32>::max() ||
+        bytes > std::numeric_limits<quint32>::max() ||
+        bytes > static_cast<quint64>(capacity - kSlotHeaderBytes))
+        return false;
+    if (!snowCanvasCopyRgba8888Rows(image, 0, image.height(), header + kSlotHeaderBytes,
+                                    capacity - kSlotHeaderBytes, static_cast<qsizetype>(stride)))
+        return false;
+    writeU64(header + kSlotSequenceOffset, sequence);
+    writeU32(header + kSlotWidthOffset, static_cast<quint32>(image.width()));
+    writeU32(header + kSlotHeightOffset, static_cast<quint32>(image.height()));
+    writeU32(header + kSlotStrideOffset, static_cast<quint32>(stride));
+    writeU32(header + kSlotBytesOffset, static_cast<quint32>(bytes));
+    writeU32(header + kSlotMagicOffset, kSlotMagic);
+    return true;
+}
+} // namespace transport_detail
+
+// Private transport: every method and all Qt/file objects belong to its I/O thread.
+// The service retains scheduling and receiver ownership on the application thread.
+class ScreenshotOcrTransport final : public QObject {
+  public:
+    struct Callbacks {
+        std::function<void(qint64)> started;
+        std::function<void(QByteArray)> output;
+        std::function<void(QByteArray)> errorOutput;
+        std::function<void(int, QProcess::ExitStatus)> finished;
+        std::function<void(QString, QString)> failed;
+    };
+
+    ScreenshotOcrTransport(QObject* receiver, Callbacks callbacks)
+        : m_receiver(receiver), m_callbacks(std::move(callbacks)) {}
+
+    ~ScreenshotOcrTransport() override {
+        const auto activity = snow_shot::runtime::RuntimeActivityTracker::shared().acquire();
+        if (m_process != nullptr) {
+            m_process->disconnect(this);
+            if (m_process->state() != QProcess::NotRunning) {
+                const auto pid = m_process->processId();
+                m_process->kill();
+                m_process->waitForFinished(1000);
+                snow_shot::diagnostics::logEvent(
+                    QStringLiteral("snow_shot.ocr"), QStringLiteral("ocr.process_exit"),
+                    {{QStringLiteral("exit_code"), m_process->exitCode()},
+                     {QStringLiteral("outcome"), QStringLiteral("shutdown")},
+                     {QStringLiteral("child_pid"), pid}});
+            }
+        }
+        releaseBuffer();
+    }
+
+    void start(const ScreenshotOcrResolvedAssets& assets, const QProcessEnvironment& environment) {
+        m_process = std::make_unique<QProcess>();
+        connect(m_process.get(), &QProcess::started, this, [this]() {
+            post(m_callbacks.started, m_process->processId());
+            send(makeFrame(kHello, 0, {}));
+        });
+        connect(m_process.get(), &QProcess::readyReadStandardOutput, this,
+                [this]() { post(m_callbacks.output, m_process->readAllStandardOutput()); });
+        connect(m_process.get(), &QProcess::readyReadStandardError, this,
+                [this]() { post(m_callbacks.errorOutput, m_process->readAllStandardError()); });
+        connect(m_process.get(), &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error) {
+                    if (error == QProcess::FailedToStart)
+                        post(m_callbacks.failed, QStringLiteral("start_failed"),
+                             m_process->errorString());
+                });
+        connect(m_process.get(), qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this](int code, QProcess::ExitStatus status) {
+                    post(m_callbacks.output, m_process->readAllStandardOutput());
+                    post(m_callbacks.errorOutput, m_process->readAllStandardError());
+                    post(m_callbacks.finished, code, status);
+                });
+        m_process->setWorkingDirectory(assets.runtimeDirectory);
+        m_process->setProcessEnvironment(environment);
+        m_process->start(assets.processPath);
+    }
+
+    void allocateBuffer(qsizetype bytes, quint64 generation) {
+        if (!m_buffer.allocate(bytes, generation)) {
+            post(m_callbacks.failed, QStringLiteral("shared_memory"), QString{});
+            return;
+        }
+        QByteArray payload;
+        appendString(payload, m_buffer.path());
+        appendU64(payload, static_cast<quint64>(bytes));
+        send(makeFrame(kAttachBuffer, generation, payload));
+    }
+
+    void releaseBuffer() {
+        m_buffer.release();
+    }
+
+    void submit(QImage image, quint64 sequence, quint64 token) {
+        if (m_process == nullptr || m_process->state() != QProcess::Running)
+            return;
+        uchar* header = m_buffer.data();
+        if (!transport_detail::copyImageToTransferSlot(image, header, m_buffer.capacity(),
+                                                       sequence)) {
+            post(m_callbacks.failed, QStringLiteral("image_transfer"), QString{});
+            return;
+        }
+        const quint32 stride = static_cast<quint32>(image.width()) * 4;
+        QByteArray payload;
+        appendU64(payload, m_buffer.generation());
+        appendU32(payload, static_cast<quint32>(image.width()));
+        appendU32(payload, static_cast<quint32>(image.height()));
+        appendU32(payload, stride);
+        appendU64(payload, sequence);
+        std::atomic_thread_fence(std::memory_order_release);
+        writeU32(header + kSlotStateOffset, kSlotReady);
+        send(makeFrame(kSubmit, token, payload));
+    }
+
+    void send(const QByteArray& frame) {
+        if (m_process != nullptr && m_process->state() == QProcess::Running)
+            m_process->write(frame);
+    }
+
+    void stop(bool force) {
+        if (m_process == nullptr || m_process->state() == QProcess::NotRunning)
+            return;
+        if (force) {
+            m_process->kill();
+        } else {
+            send(makeFrame(kShutdown, 0));
+            m_process->closeWriteChannel();
+            QTimer::singleShot(1000, this, [this]() { stop(true); });
+        }
+    }
+
+  private:
+    template <typename Callback, typename... Args> void post(Callback callback, Args... args) {
+        QMetaObject::invokeMethod(m_receiver,
+                                  snow_shot::runtime::trackRuntimeWork(
+                                      [callback, args...]() mutable { callback(args...); }),
+                                  Qt::QueuedConnection);
+    }
+    QObject* m_receiver;
+    Callbacks m_callbacks;
+    std::unique_ptr<QProcess> m_process;
+    ScreenshotOcrTransferBuffer m_buffer;
+};
+
+} // namespace snow_shot::ocr

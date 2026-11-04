@@ -1,0 +1,1613 @@
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+#include "snow_canvas_renderer.h"
+#include "snow_canvas_runtime_access.h"
+#include "snow_canvas_text_editor_session.h"
+#include "snow_canvas_text.h"
+#include "snow_canvas_text_measurement.h"
+#include "snow_canvas_text_render.h"
+#include "snow_canvas_text_layout.h"
+#include "snow_canvas_viewport.h"
+#include "snow_canvas_ffi_handles.h"
+#include "snow_canvas_type_conversions.h"
+
+#include <QApplication>
+#include <QImage>
+#include <QInputMethodEvent>
+#include <QInputMethodQueryEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QWheelEvent>
+#include <QTextCursor>
+#include <QTextCharFormat>
+
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <future>
+#include <thread>
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+QImage paintTextContents(const SnowCanvasSceneItem& item, bool cached, double zoom,
+                         double devicePixelRatio = 1.0, const QFont& baseFont = QFont()) {
+    QImage image(QSize(540, 480) * devicePixelRatio, QImage::Format_ARGB32_Premultiplied);
+    image.setDevicePixelRatio(devicePixelRatio);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setClipRegion(QRegion(30, 40, 200, 350) + QRegion(250, 80, 220, 300));
+    painter.translate(270.0, 220.0);
+    painter.rotate(item.rotation * 180.0 / 3.14159265358979323846);
+    painter.setOpacity(item.opacity);
+    const QRectF rect(-item.width * zoom / 2.0, -item.height * zoom / 2.0, item.width * zoom,
+                      item.height * zoom);
+    if (cached) {
+        snow_canvas_text_render::drawContents(painter, item, baseFont, rect, zoom);
+    } else {
+        auto layout = snow_canvas_text_layout::createDocumentLayout(
+            item, baseFont, zoom, snow_canvas_text::textFromSceneItem(item), false);
+        QTextCursor cursor(&layout.textDocument());
+        cursor.select(QTextCursor::Document);
+        QTextCharFormat format;
+        format.setForeground(
+            QColor(item.text_color.r, item.text_color.g, item.text_color.b, item.text_color.a));
+        cursor.mergeCharFormat(format);
+        painter.translate(rect.left(), rect.top() + layout.topOffset);
+        painter.scale(layout.resolution.scale, layout.resolution.scale);
+        snow_canvas_text_layout::drawDocument(painter, layout);
+    }
+    return image;
+}
+
+void retainedTextLayoutsPreservePixelsAndRespectInvalidationAndBudget() {
+    using namespace snow_canvas_text_render;
+    resetLayoutCacheForCurrentThread();
+    SnowTextElementInfo info{};
+    info.font_size = 23.5;
+    auto item = snow_canvas_text::defaultPreviewItem(info);
+    item.width = 180;
+    item.height = 100;
+    item.opacity = 0.75;
+    item.rotation = 0.23;
+    item.text_color = {190, 40, 90, 200};
+    snow_canvas_text::copyTextToSceneItem(item, QStringLiteral("125.00 cm"));
+    const auto before = layoutCacheStatsForCurrentThread().builds;
+    const auto first = paintTextContents(item, true, 1.25);
+    bool painted = false;
+    for (int y = 0; y < first.height(); ++y) {
+        const auto* pixels = reinterpret_cast<const QRgb*>(first.constScanLine(y));
+        for (int x = 0; x < first.width(); ++x)
+            painted = painted || qAlpha(pixels[x]) != 0;
+    }
+    require(painted, "pixel comparison must contain painted glyphs");
+    require(first == paintTextContents(item, false, 1.25),
+            "retained text must preserve fresh document pixels and exposed clips");
+    require(first == paintTextContents(item, true, 1.25), "cached paint is stable");
+    item.center_x += 20;
+    item.rotation += 0.1;
+    item.opacity = 0.5;
+    paintTextContents(item, true, 1.25);
+    require(layoutCacheStatsForCurrentThread().builds == before + 1,
+            "geometry and opacity must reuse the shaped document");
+    item.text_color = {20, 80, 200, 170};
+    require(paintTextContents(item, true, 1.25) == paintTextContents(item, false, 1.25) &&
+                layoutCacheStatsForCurrentThread().builds == before + 1,
+            "foreground changes reuse layout while preserving exact pixels");
+    for (const QString& text : {QStringLiteral("Long wrapped label with several words\nand lines"),
+                                QString::fromUtf8("ä¸­æ–‡ Ø§Ù„Ø¹Ø±Ø¨ÙŠØ©")}) {
+        snow_canvas_text::copyTextToSceneItem(item, text);
+        for (double zoom : {0.75, 1.0, 1.25, 2.0}) {
+            for (auto align : {SNOW_TEXT_HORIZONTAL_ALIGN_LEFT, SNOW_TEXT_HORIZONTAL_ALIGN_CENTER,
+                               SNOW_TEXT_HORIZONTAL_ALIGN_RIGHT}) {
+                item.text_horizontal_align = align;
+                item.text_vertical_align = SNOW_TEXT_VERTICAL_ALIGN_BOTTOM;
+                require(paintTextContents(item, true, zoom, 2.0) ==
+                            paintTextContents(item, false, zoom, 2.0),
+                        "wrapping, alignment, fractional zoom, and DPI preserve pixels");
+            }
+        }
+    }
+    item.width = 130;
+    item.height = 160;
+    item.font_size = 40;
+    item.text_color = {20, 80, 200, 170};
+    require(paintTextContents(item, true, 1.0) == paintTextContents(item, false, 1.0),
+            "size and font changes invalidate cached layout");
+    QFont boldFont;
+    boldFont.setBold(true);
+    require(paintTextContents(item, true, 1.0, 1.0, boldFont) ==
+                paintTextContents(item, false, 1.0, 1.0, boldFont),
+            "base font changes invalidate cached layout");
+    std::promise<void> workerReady, resumeWorker;
+    auto resumed = resumeWorker.get_future();
+    bool workerInvalidated = false;
+    std::thread worker([&]() {
+        paintTextContents(item, true, 1.0);
+        workerReady.set_value();
+        resumed.wait();
+        workerInvalidated = layoutCacheStatsForCurrentThread().entries == 0;
+    });
+    workerReady.get_future().wait();
+    require(QMetaObject::invokeMethod(qApp, "fontDatabaseChanged", Qt::DirectConnection),
+            "invalidate worker font database generation");
+    resumeWorker.set_value();
+    worker.join();
+    require(workerInvalidated, "export workers invalidate layouts without an event loop");
+    for (int index = 0; index < 1100; ++index) {
+        snow_canvas_text::copyTextToSceneItem(item, QString::number(index) + QStringLiteral(" cm"));
+        paintTextContents(item, true, 1.0);
+    }
+    require(layoutCacheStatsForCurrentThread().estimatedBytes <= 4 * 1024 * 1024 &&
+                layoutCacheStatsForCurrentThread().entries < 1100,
+            "text layout cache evicts old labels within its memory budget");
+    require(QMetaObject::invokeMethod(qApp, "fontDatabaseChanged", Qt::DirectConnection),
+            "invoke font database invalidation");
+    require(layoutCacheStatsForCurrentThread().entries == 0,
+            "font database changes release cached documents");
+    paintTextContents(item, true, 1.0);
+    resetLayoutCacheForCurrentThread();
+    require(layoutCacheStatsForCurrentThread().estimatedBytes == 0,
+            "runtime cleanup releases retained text documents");
+}
+
+void naturalLayoutCacheTracksTypographyAndHasABoundedBudget() {
+    snow_canvas_text_measurement::NaturalTextLayoutCache cache;
+    SnowTextElementInfo info{};
+    info.font_size = 24.0;
+    auto item = snow_canvas_text::defaultPreviewItem(info);
+    const QString text = QStringLiteral("Natural width\nwith multiple lines");
+    const QFont font;
+    const auto first = cache.measure(text, font, item);
+    for (double width : {200.0, 400.0, 1600.0}) {
+        item.width = width;
+        item.center_x = width;
+        const auto reused = cache.measure(text, font, item);
+        require(reused.layout == first.layout && reused.content == first.content,
+                "arrow geometry must not invalidate natural text metrics");
+    }
+    require(cache.measurementCount() == 1, "unchanged typography is shaped only once");
+    item.font_size = 40.0;
+    const auto larger = cache.measure(text, font, item);
+    require(larger.layout != first.layout && cache.measurementCount() == 2,
+            "font size must invalidate natural text metrics");
+    QFont bold = font;
+    bold.setBold(true);
+    cache.measure(text, bold, item);
+    require(cache.measurementCount() == 2,
+            "explicit regular text must override inherited base-font emphasis");
+    item.text_bold = 1;
+    cache.measure(text, bold, item);
+    cache.measure(text + QStringLiteral("!"), bold, item);
+    require(cache.measurementCount() == 4,
+            "element emphasis and contents are part of the cache key");
+    require(cache.retainedBytes() > 0, "measuring labels must retain their natural-layout entries");
+    cache.clear();
+    require(cache.retainedBytes() == 0,
+            "document or font invalidation must release cached layouts");
+    cache.measure(text, bold, item);
+    require(cache.measurementCount() == 5, "font database invalidation clears cached metrics");
+    snow_canvas_text_measurement::NaturalTextLayoutCache tiny(1);
+    tiny.measure(text, font, item);
+    tiny.measure(text, font, item);
+    require(tiny.measurementCount() == 2, "entries larger than the budget are not retained");
+}
+
+void documentCleanupReleasesTextDraftHistoryStorage() {
+    SnowCanvasTextDraft draft;
+    draft.begin(QStringLiteral("Old label"));
+    for (int index = 0; index < 64; ++index) {
+        require(draft.replaceSelection(QStringLiteral("a")), "populate text-draft undo history");
+    }
+    require(draft.undoEdit(), "populate text-draft redo history");
+    const auto historyBytes = draft.retainedHistoryStorageBytes();
+    require(historyBytes > 0, "text editing must allocate retained undo and redo storage");
+    draft.reset();
+    require(draft.retainedHistoryStorageBytes() == historyBytes,
+            "ordinary text-edit reset should retain reusable history storage within a document");
+    draft.releaseRetainedState();
+    require(draft.retainedHistoryStorageBytes() == 0 && draft.text().isEmpty() &&
+                !draft.undoEdit() && !draft.redoEdit(),
+            "document cleanup must release text-draft history capacity and old edits");
+    draft.begin(QStringLiteral("Next label"));
+    require(draft.replaceSelection(QStringLiteral("!")) && draft.undoEdit() &&
+                draft.text() == QStringLiteral("Next label"),
+            "a new text draft must still support editing and undo after releasing retained state");
+}
+
+void mouse(SnowCanvasWidget& canvas, QEvent::Type type, QPointF point, Qt::MouseButton button,
+           Qt::MouseButtons buttons) {
+    QMouseEvent event(type, point, point, point, button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(&canvas, &event);
+}
+
+void key(SnowCanvasWidget& canvas, int code, Qt::KeyboardModifiers modifiers = Qt::NoModifier,
+         const QString& text = {}) {
+    QKeyEvent event(QEvent::KeyPress, code, modifiers, text);
+    QApplication::sendEvent(&canvas, &event);
+}
+
+QJsonArray records(const SnowCanvasRuntime& runtime, const QString& kind) {
+    const QJsonObject document = QJsonDocument::fromJson(runtime.serializeDocumentSession())
+                                     .object()
+                                     .value(QStringLiteral("document"))
+                                     .toObject();
+    QJsonArray result;
+    for (const auto& slot : document.value(QStringLiteral("slots")).toArray()) {
+        const auto record = slot.toObject();
+        if (record.value(QStringLiteral("data")).toObject().contains(kind)) {
+            result.append(record);
+        }
+    }
+    return result;
+}
+
+QJsonObject payload(const SnowCanvasRuntime& runtime, const QString& kind) {
+    const auto found = records(runtime, kind);
+    require(found.size() == 1, "expected one record of the requested kind");
+    return found.first().toObject().value(QStringLiteral("data")).toObject().value(kind).toObject();
+}
+
+void createArrow(SnowCanvasWidget& canvas, SnowCanvasRuntime& runtime,
+                 SnowCanvasArrowType type = SnowCanvasArrowType::Straight) {
+    require(canvas.setCanvasTool(SnowCanvasTool::Arrow), "activate arrow tool");
+    SnowCanvasShapeStyle style;
+    style.arrowType = type;
+    require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyArrowType,
+                                            SnowCanvasShapeKind::Arrow),
+            "set arrow type");
+    mouse(canvas, QEvent::MouseButtonPress, {70.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseMove, {490.0, 180.0}, Qt::NoButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {490.0, 180.0}, Qt::LeftButton, Qt::NoButton);
+    require(records(runtime, QStringLiteral("Arrow")).size() == 1,
+            "arrow gesture creates one arrow");
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "activate selection tool");
+}
+
+void openLabel(SnowCanvasWidget& canvas) {
+    mouse(canvas, QEvent::MouseButtonDblClick, {280.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+    require(canvas.hasActiveTextEditing(), "double-click opens an attached text editor");
+    require(canvas.canvasStyleToolbarState().source == SnowCanvasStyleToolbarSource::SelectedText,
+            "arrow draft exposes text style controls");
+}
+
+void documentClearRebuildsArrowLabelLayouts() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    QImage previous;
+    for (int document = 0; document < 2; ++document) {
+        createArrow(canvas, runtime);
+        openLabel(canvas);
+        key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("Reused label"));
+        key(canvas, Qt::Key_Return, Qt::ControlModifier);
+        require(records(runtime, QStringLiteral("Text")).size() == 1,
+                "each document must commit its own arrow label");
+        const QImage image =
+            runtime.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {});
+        require(!image.isNull() && (previous.isNull() || previous == image),
+                "rebuilding document-scoped text layouts must preserve exported pixels");
+        previous = image;
+        require(runtime.clearDocumentPreservingViewports() &&
+                    records(runtime, QStringLiteral("Text")).isEmpty() && !runtime.canUndo(),
+                "document cleanup must discard old labels and history before reusing the canvas");
+    }
+}
+
+void arrowLabelRemeasuresAfterHostFontChange() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("Label"));
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    const double originalWidth =
+        payload(runtime, QStringLiteral("Text")).value(QStringLiteral("width")).toDouble();
+    QFont font = canvas.font();
+    font.setLetterSpacing(QFont::AbsoluteSpacing, 5.0);
+    canvas.setFont(font);
+    QApplication::processEvents();
+    mouse(canvas, QEvent::MouseButtonPress, {490, 180}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseMove, {520, 190}, Qt::NoButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {520, 190}, Qt::LeftButton, Qt::NoButton);
+    require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("width")).toDouble() >
+                originalWidth + 10.0,
+            "host font changes invalidate cached natural metrics before the next geometry commit");
+    const SnowRuntime engine = snow_canvas_runtime::Access::handle(runtime);
+    SnowCanvasViewport inspection;
+    require(inspection.create(engine, snow_canvas_viewport::defaultEngineConfig()),
+            "create legacy measurement inspection viewport");
+    require(snow_viewport_invalidate_arrow_text_layouts(engine, inspection.get()) == SNOW_OK,
+            "invalidate before testing legacy host measurements");
+    SnowArrowTextLayoutRequest request{};
+    std::uint32_t count = 0;
+    require(snow_viewport_get_arrow_text_layout_requests(engine, inspection.get(), &request, 1,
+                                                         &count) == SNOW_OK &&
+                count == 1,
+            "one pending measurement after invalidation");
+    const SnowArrowTextLayoutResult legacy{request.info.id, request.key, {100, 25, 95, 25}};
+    ScopedChangedViewportList changed;
+    require(snow_viewport_apply_arrow_text_layouts_ex(engine, inspection.get(), &legacy, 1,
+                                                      changed.outParam()) == SNOW_OK,
+            "the original result structure and C entry point remain supported");
+    require(snow_viewport_get_arrow_text_layout_requests(engine, inspection.get(), nullptr, 0,
+                                                         &count) == SNOW_OK &&
+                count == 0,
+            "legacy measurements satisfy the exact constraint");
+}
+
+void arrowRatioEditsRenderAndRoundTrip() {
+    for (const auto shaft : {SnowCanvasArrowShaftType::Plain, SnowCanvasArrowShaftType::Tapered}) {
+        for (const double ratio : {0.25, 0.5, 3.0}) {
+            SnowCanvasRuntime runtime;
+            SnowCanvasWidget canvas(runtime);
+            canvas.resize(600, 360);
+            canvas.show();
+            QApplication::processEvents();
+            require(canvas.setCanvasTool(SnowCanvasTool::Arrow), "activate ratio test arrow");
+            SnowCanvasShapeStyle style;
+            style.stroke = Qt::red;
+            style.strokeWidth = 2.0;
+            style.startArrowhead = SnowCanvasArrowhead::Triangle;
+            style.endArrowhead = SnowCanvasArrowhead::Triangle;
+            style.arrowShaftType = shaft;
+            require(canvas.setCanvasShapeStylePatch(style,
+                                                    SnowCanvasShapeStylePropertyStrokeColor |
+                                                        SnowCanvasShapeStylePropertyStrokeWidth |
+                                                        SnowCanvasShapeStylePropertyStartArrowhead |
+                                                        SnowCanvasShapeStylePropertyEndArrowhead |
+                                                        SnowCanvasShapeStylePropertyArrowShaftType,
+                                                    SnowCanvasShapeKind::Arrow),
+                    "configure ratio test arrow");
+            createArrow(canvas, runtime);
+            const auto render = [&]() {
+                return runtime.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {});
+            };
+            const QImage original = render();
+            mouse(canvas, QEvent::MouseButtonPress, {30.0, 120.0}, Qt::LeftButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseMove, {550.0, 240.0}, Qt::NoButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseButtonRelease, {550.0, 240.0}, Qt::LeftButton, Qt::NoButton);
+            require(canvas.canvasStyleToolbarState().source ==
+                        SnowCanvasStyleToolbarSource::SelectedArrow,
+                    "ratio test selects the arrow");
+            style.arrowRatio = ratio;
+            require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyArrowRatio,
+                                                    SnowCanvasShapeKind::Arrow),
+                    "edit selected ratio");
+            const auto arrow = payload(runtime, QStringLiteral("Arrow"));
+            require(arrow.value(QStringLiteral("arrow_ratio")).toDouble() == ratio &&
+                        arrow.value(QStringLiteral("stroke_width")).toDouble() == 2.0 &&
+                        canvas.canvasStyleToolbarState().shapeStyle.arrowRatio == ratio,
+                    "ratio crosses Qt and FFI without changing stroke width");
+            const QImage resized = render();
+            require(!original.isNull() && !resized.isNull() && original != resized,
+                    "ratio changes exported endpoint geometry");
+            SnowCanvasRuntime restored;
+            require(restored.restoreDocumentSession(runtime.serializeDocumentSession()) &&
+                        payload(restored, QStringLiteral("Arrow")) == arrow,
+                    "ratio round-trips through the document session");
+            require(canvas.undo() &&
+                        payload(runtime, QStringLiteral("Arrow"))
+                                .value(QStringLiteral("arrow_ratio"))
+                                .toDouble() == 1.0 &&
+                        render() == original,
+                    "undo restores ratio and original pixels");
+            require(canvas.redo() && render() == resized, "redo restores resized endpoint pixels");
+        }
+    }
+    SnowCanvasShapeStyle style;
+    for (double invalid : {-1.0, 0.0, 4.0, std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        style.arrowRatio = invalid;
+        const auto normalized =
+            snow_canvas_types::toCanvasShapeStyle(snow_canvas_types::toEngineShapeStyle(style));
+        require(normalized.arrowRatio == (invalid == 4.0 ? 3.0 : 1.0),
+                "Qt/FFI normalizes invalid ratios");
+    }
+}
+
+void arrowOutlineEditsRenderAndRoundTrip() {
+    for (const auto shaft : {SnowCanvasArrowShaftType::Plain, SnowCanvasArrowShaftType::Tapered}) {
+        for (const double outlineWidth : {2.0, 8.0, 72.0}) {
+            SnowCanvasRuntime runtime;
+            SnowCanvasWidget canvas(runtime);
+            canvas.resize(600, 360);
+            canvas.show();
+            QApplication::processEvents();
+            require(canvas.setCanvasTool(SnowCanvasTool::Arrow),
+                    "activate outline width test arrow");
+            SnowCanvasShapeStyle style;
+            style.stroke = Qt::red;
+            style.strokeWidth = 2.0;
+            style.startArrowhead = SnowCanvasArrowhead::Triangle;
+            style.endArrowhead = SnowCanvasArrowhead::Triangle;
+            style.arrowShaftType = shaft;
+            require(canvas.setCanvasShapeStylePatch(style,
+                                                    SnowCanvasShapeStylePropertyStrokeColor |
+                                                        SnowCanvasShapeStylePropertyStrokeWidth |
+                                                        SnowCanvasShapeStylePropertyStartArrowhead |
+                                                        SnowCanvasShapeStylePropertyEndArrowhead |
+                                                        SnowCanvasShapeStylePropertyArrowShaftType,
+                                                    SnowCanvasShapeKind::Arrow),
+                    "configure outline width test arrow");
+            createArrow(canvas, runtime);
+            const auto render = [&]() {
+                return runtime.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {});
+            };
+            const QImage original = render();
+            mouse(canvas, QEvent::MouseButtonPress, {30.0, 120.0}, Qt::LeftButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseMove, {550.0, 240.0}, Qt::NoButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseButtonRelease, {550.0, 240.0}, Qt::LeftButton, Qt::NoButton);
+            require(canvas.canvasStyleToolbarState().source ==
+                        SnowCanvasStyleToolbarSource::SelectedArrow,
+                    "outline width test selects the arrow");
+            style.arrowOutlineWidth = outlineWidth;
+            style.arrowOutlineColor = QColor(12, 120, 250, 180);
+            require(
+                canvas.setCanvasShapeStylePatch(style,
+                                                SnowCanvasShapeStylePropertyArrowOutlineWidth |
+                                                    SnowCanvasShapeStylePropertyArrowOutlineColor,
+                                                SnowCanvasShapeKind::Arrow),
+                "edit selected outline width");
+            const auto arrow = payload(runtime, QStringLiteral("Arrow"));
+            require(arrow.value(QStringLiteral("arrow_outline_width")).toDouble() == outlineWidth &&
+                        arrow.value(QStringLiteral("stroke_width")).toDouble() == 2.0 &&
+                        canvas.canvasStyleToolbarState().shapeStyle.arrowOutlineWidth ==
+                            outlineWidth &&
+                        canvas.canvasStyleToolbarState().shapeStyle.arrowOutlineColor ==
+                            style.arrowOutlineColor,
+                    "outline width crosses Qt and FFI without changing stroke width");
+            const QImage resized = render();
+            require(!original.isNull() && !resized.isNull() && original != resized,
+                    "outline width changes exported endpoint geometry");
+            SnowCanvasRuntime restored;
+            require(restored.restoreDocumentSession(runtime.serializeDocumentSession()) &&
+                        payload(restored, QStringLiteral("Arrow")) == arrow,
+                    "outline width round-trips through the document session");
+            require(canvas.undo() &&
+                        payload(runtime, QStringLiteral("Arrow"))
+                                .value(QStringLiteral("arrow_outline_width"))
+                                .toDouble() == 0.0 &&
+                        render() == original,
+                    "undo restores outline width and original pixels");
+            require(canvas.redo() && render() == resized, "redo restores outlined arrow pixels");
+            require(restored.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {}) ==
+                        resized,
+                    "restored documents export the same outline pixels");
+            require(canvas.setCanvasTool(SnowCanvasTool::Arrow),
+                    "activate outlined creation defaults");
+            require(
+                canvas.setCanvasShapeStylePatch(style,
+                                                SnowCanvasShapeStylePropertyArrowOutlineWidth |
+                                                    SnowCanvasShapeStylePropertyArrowOutlineColor,
+                                                SnowCanvasShapeKind::Arrow),
+                "configure outline on new arrows");
+            mouse(canvas, QEvent::MouseButtonPress, {70.0, 280.0}, Qt::LeftButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseMove, {490.0, 280.0}, Qt::NoButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseButtonRelease, {490.0, 280.0}, Qt::LeftButton, Qt::NoButton);
+            const auto arrows = records(runtime, QStringLiteral("Arrow"));
+            require(arrows.size() == 2, "outline defaults create a second arrow");
+            for (const auto& record : arrows) {
+                const auto data = record.toObject()
+                                      .value(QStringLiteral("data"))
+                                      .toObject()
+                                      .value(QStringLiteral("Arrow"))
+                                      .toObject();
+                require(data.value(QStringLiteral("arrow_outline_width")).toDouble() ==
+                                outlineWidth &&
+                            data.value(QStringLiteral("arrow_outline_color"))
+                                    .toObject()
+                                    .value(QStringLiteral("a"))
+                                    .toInt() == 180,
+                        "created and edited arrows carry the same independent outline style");
+            }
+        }
+    }
+}
+
+void arrowRatioFallbackRendering() {
+    for (const SnowArrowhead head : {SNOW_ARROWHEAD_TRIANGLE, SNOW_ARROWHEAD_CIRCLE}) {
+        for (const double width : {1.0, 2.0, 8.0}) {
+            const auto render = [&](double ratio) {
+                QImage image(600, 360, QImage::Format_ARGB32_Premultiplied);
+                image.fill(Qt::transparent);
+                SceneDisplayInfo info{};
+                info.surface_width = image.width();
+                info.surface_height = image.height();
+                info.camera_zoom = 1.0;
+                SnowArrowPoint points[] = {{-200.0, 0.0}, {200.0, 0.0}};
+                SnowSceneDisplayItem raw{};
+                raw.kind = SNOW_SCENE_DISPLAY_ITEM_ARROW;
+                raw.stroke = {255, 0, 0, 255};
+                raw.stroke_width = width;
+                raw.opacity = 1.0;
+                raw.arrow_points = points;
+                raw.arrow_point_count = 2;
+                raw.arrow_type = SNOW_ARROW_TYPE_STRAIGHT;
+                raw.arrow_start_head = head;
+                raw.arrow_end_head = head;
+                raw.arrow_ratio = ratio;
+                SnowCanvasSceneItem item(raw);
+                QPainter painter(&image);
+                snow_canvas_renderer::SceneRenderRequest request;
+                request.painter = &painter;
+                request.displayInfo = &info;
+                request.sceneItems = &item;
+                request.sceneItemCount = 1;
+                request.exposedRegion = QRegion(image.rect());
+                request.clearBackgroundEnabled = false;
+                snow_canvas_renderer::renderSceneItems(request);
+                return image;
+            };
+            const auto visiblePixels = [](const QImage& image) {
+                int count = 0;
+                for (int y = 0; y < image.height(); ++y)
+                    for (int x = 0; x < image.width(); ++x)
+                        count += image.pixelColor(x, y).alpha() > 0 ? 1 : 0;
+                return count;
+            };
+            const QImage original = render(1.0);
+            const QImage half = render(0.5);
+            const QImage quarter = render(0.25);
+            const QImage tiny = render(0.01);
+            require(visiblePixels(original) > visiblePixels(half) &&
+                        visiblePixels(half) > visiblePixels(quarter) &&
+                        visiblePixels(quarter) >= visiblePixels(tiny) && visiblePixels(tiny) > 0,
+                    "fallback endpoint rendering supports decreasing positive ratios");
+            require(tiny.pixelColor(300, 180).alpha() > 0,
+                    "tiny fallback arrowheads preserve the shaft");
+        }
+    }
+}
+
+void indentedTriangleStyleRoundTrips() {
+    static_assert(static_cast<int>(SnowCanvasArrowhead::Triangle) == 6);
+    static_assert(static_cast<int>(SnowCanvasArrowhead::CrowfootOneOrMany) == 12);
+    static_assert(SNOW_ARROWHEAD_TRIANGLE == 6);
+    static_assert(SNOW_ARROWHEAD_INVERTED_TRIANGLE == 14);
+    require(snow_canvas_types::toEngineArrowhead(SnowCanvasArrowhead::IndentedTriangle) ==
+                    SNOW_ARROWHEAD_INDENTED_TRIANGLE &&
+                snow_canvas_types::toCanvasArrowhead(SNOW_ARROWHEAD_INDENTED_TRIANGLE) ==
+                    SnowCanvasArrowhead::IndentedTriangle,
+            "indented triangle should round-trip through the Qt/C ABI boundary");
+    for (int id = 0; id <= 12; ++id) {
+        require(static_cast<int>(snow_canvas_types::toEngineArrowhead(
+                    static_cast<SnowCanvasArrowhead>(id))) == id &&
+                    static_cast<int>(
+                        snow_canvas_types::toCanvasArrowhead(static_cast<SnowArrowhead>(id))) == id,
+                "existing arrowhead numeric IDs must retain their meanings");
+    }
+    SnowCanvasStyleDefaults defaults;
+    for (auto* shape : {&defaults.rectangle, &defaults.arrow, &defaults.line, &defaults.freeDraw,
+                        &defaults.rectangleHighlight, &defaults.penHighlight}) {
+        shape->fill = Qt::transparent;
+        shape->stroke = Qt::red;
+    }
+    defaults.text.fill = Qt::transparent;
+    defaults.serialNumber.fill = Qt::transparent;
+    defaults.arrow.startArrowhead = SnowCanvasArrowhead::IndentedTriangle;
+    defaults.arrow.endArrowhead = SnowCanvasArrowhead::IndentedTriangle;
+    SnowStyleDefaults engineDefaults{};
+    require(snow_canvas_types::toEngineStyleDefaults(defaults, engineDefaults),
+            "indented endpoints should pass style defaults validation");
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    require(canvas.setCanvasTool(SnowCanvasTool::Arrow), "activate indented arrow tool");
+    SnowCanvasShapeStyle style;
+    style.startArrowhead = SnowCanvasArrowhead::IndentedTriangle;
+    style.endArrowhead = SnowCanvasArrowhead::IndentedTriangle;
+    style.stroke = QColor(255, 40, 30);
+    style.strokeWidth = 4.0;
+    require(canvas.setCanvasShapeStylePatch(style,
+                                            SnowCanvasShapeStylePropertyStartArrowhead |
+                                                SnowCanvasShapeStylePropertyEndArrowhead |
+                                                SnowCanvasShapeStylePropertyStrokeColor |
+                                                SnowCanvasShapeStylePropertyStrokeWidth,
+                                            SnowCanvasShapeKind::Arrow),
+            "indented triangle style should be accepted");
+    mouse(canvas, QEvent::MouseButtonPress, {150.0, 70.0}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseMove, {350.0, 290.0}, Qt::NoButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {350.0, 290.0}, Qt::LeftButton, Qt::NoButton);
+    const auto arrow = payload(runtime, QStringLiteral("Arrow"));
+    require(arrow.value(QStringLiteral("start_arrowhead")).toString() ==
+                    QStringLiteral("indented_triangle") &&
+                arrow.value(QStringLiteral("end_arrowhead")).toString() ==
+                    QStringLiteral("indented_triangle"),
+            "both indented endpoints should survive document serialization");
+    SnowCanvasRuntime restored;
+    require(restored.restoreDocumentSession(runtime.serializeDocumentSession()) &&
+                payload(restored, QStringLiteral("Arrow")) == arrow,
+            "indented endpoints should round-trip through saved documents");
+    const QString previewDirectory = qEnvironmentVariable("SNOW_ARROW_TEXT_PREVIEW_DIR");
+    if (!previewDirectory.isEmpty()) {
+        require(canvas.grab().save(previewDirectory + QStringLiteral("/indented-triangle.png")),
+                "save indented triangle rendering artifact");
+    }
+}
+
+void taperedShaftsRenderAndRoundTrip() {
+    {
+        SnowCanvasRuntime runtime;
+        SnowCanvasWidget canvas(runtime);
+        canvas.resize(600, 360);
+        canvas.show();
+        QApplication::processEvents();
+        require(canvas.setCanvasTool(SnowCanvasTool::Arrow),
+                "activate double-headed tapered arrow tool");
+        SnowCanvasShapeStyle style;
+        style.arrowShaftType = SnowCanvasArrowShaftType::Tapered;
+        style.startArrowhead = SnowCanvasArrowhead::Arrow;
+        style.endArrowhead = SnowCanvasArrowhead::Arrow;
+        style.stroke = QColor(255, 0, 0, 128);
+        style.strokeWidth = 4.0;
+        require(canvas.setCanvasShapeStylePatch(style,
+                                                SnowCanvasShapeStylePropertyArrowShaftType |
+                                                    SnowCanvasShapeStylePropertyStartArrowhead |
+                                                    SnowCanvasShapeStylePropertyEndArrowhead |
+                                                    SnowCanvasShapeStylePropertyStrokeColor |
+                                                    SnowCanvasShapeStylePropertyStrokeWidth,
+                                                SnowCanvasShapeKind::Arrow),
+                "set double-headed tapered arrow defaults");
+        createArrow(canvas, runtime);
+        const QImage image =
+            runtime.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {});
+        const int startInteriorAlpha = image.pixelColor(90, 180).alpha();
+        require(startInteriorAlpha >= 120 && startInteriorAlpha <= 130,
+                "both open-arrow heads must use the filled tapered rendering");
+        for (int y = 0; y < image.height(); ++y)
+            for (int x = 0; x < image.width(); ++x)
+                require(image.pixelColor(x, y).alpha() <= 130,
+                        "double-headed taper must not double-paint either head join");
+    }
+
+    for (const auto head :
+         {SnowCanvasArrowhead::Arrow, SnowCanvasArrowhead::Triangle,
+          SnowCanvasArrowhead::TriangleOutline, SnowCanvasArrowhead::IndentedTriangle}) {
+        SnowCanvasRuntime runtime;
+        SnowCanvasWidget canvas(runtime);
+        canvas.resize(600, 360);
+        canvas.show();
+        QApplication::processEvents();
+        require(canvas.setCanvasTool(SnowCanvasTool::Arrow), "activate tapered arrow tool");
+        SnowCanvasShapeStyle style;
+        style.arrowType = SnowCanvasArrowType::Straight;
+        style.arrowShaftType = SnowCanvasArrowShaftType::Tapered;
+        style.endArrowhead = head;
+        style.stroke = QColor(255, 0, 0, 128);
+        style.strokeWidth = 4.0;
+        const quint32 properties =
+            SnowCanvasShapeStylePropertyArrowType | SnowCanvasShapeStylePropertyArrowShaftType |
+            SnowCanvasShapeStylePropertyEndArrowhead | SnowCanvasShapeStylePropertyStrokeColor |
+            SnowCanvasShapeStylePropertyStrokeWidth;
+        require(canvas.setCanvasShapeStylePatch(style, properties, SnowCanvasShapeKind::Arrow),
+                "set tapered arrow defaults");
+        createArrow(canvas, runtime);
+        require(payload(runtime, QStringLiteral("Arrow"))
+                        .value(QStringLiteral("arrow_shaft_type"))
+                        .toString() == QStringLiteral("tapered"),
+                "new arrows should preserve the shaft preference");
+        const auto exportImage = [&]() {
+            return runtime.renderToImage(QRectF(-300, -180, 600, 360), QSize(600, 360), {});
+        };
+        QImage image = exportImage();
+        require(!image.isNull(), "tapered arrow export must render");
+        const QString directory = qEnvironmentVariable("SNOW_ARROW_TEXT_PREVIEW_DIR");
+        if (!directory.isEmpty())
+            image.save(directory + QStringLiteral("/shaft-%1.png").arg(static_cast<int>(head)));
+        if (head == SnowCanvasArrowhead::TriangleOutline) {
+            require(image.pixelColor(400, 180).alpha() == 0,
+                    "hollow shaft interior must stay transparent");
+            require(image.pixelColor(400, 176).alpha() > 0, "hollow shaft contour must be visible");
+        } else {
+            require(image.pixelColor(400, 180).alpha() >= 120 &&
+                        image.pixelColor(400, 180).alpha() <= 130,
+                    "filled taper must retain uniform alpha");
+            require(image.pixelColor(400, 178).alpha() > 0,
+                    "filled taper must widen near its head");
+        }
+        SnowCanvasRuntime restored;
+        require(restored.restoreDocumentSession(runtime.serializeDocumentSession()),
+                "restore tapered document");
+        require(payload(restored, QStringLiteral("Arrow")) ==
+                    payload(runtime, QStringLiteral("Arrow")),
+                "shaft must round-trip");
+        mouse(canvas, QEvent::MouseButtonPress, {40.0, 140.0}, Qt::LeftButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseMove, {530.0, 220.0}, Qt::NoButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseButtonRelease, {530.0, 220.0}, Qt::LeftButton, Qt::NoButton);
+        require(canvas.canvasStyleToolbarState().source ==
+                    SnowCanvasStyleToolbarSource::SelectedArrow,
+                "select arrow before editing shaft");
+        style.arrowShaftType = SnowCanvasArrowShaftType::Plain;
+        require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyArrowShaftType,
+                                                SnowCanvasShapeKind::Arrow),
+                "edit shaft on selected arrow");
+        require(payload(runtime, QStringLiteral("Arrow"))
+                        .value(QStringLiteral("arrow_shaft_type"))
+                        .toString() == QStringLiteral("plain"),
+                "selected shaft should change");
+        require(canvas.undo(), "undo shaft style edit");
+        require(payload(runtime, QStringLiteral("Arrow"))
+                        .value(QStringLiteral("arrow_shaft_type"))
+                        .toString() == QStringLiteral("tapered"),
+                "undo must restore shaft");
+        require(canvas.redo(), "redo shaft style edit");
+        require(payload(runtime, QStringLiteral("Arrow"))
+                        .value(QStringLiteral("arrow_shaft_type"))
+                        .toString() == QStringLiteral("plain"),
+                "redo restores plain shaft");
+        require(canvas.undo(), "restore taper for fallback check");
+        style.endArrowhead = SnowCanvasArrowhead::Circle;
+        require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyEndArrowhead,
+                                                SnowCanvasShapeKind::Arrow),
+                "switch to unsupported head");
+        const QImage fallback = exportImage();
+        require(payload(runtime, QStringLiteral("Arrow"))
+                        .value(QStringLiteral("arrow_shaft_type"))
+                        .toString() == QStringLiteral("tapered"),
+                "fallback retains preference");
+        require(canvas.setCanvasShapeStylePatch(style, SnowCanvasShapeStylePropertyArrowShaftType,
+                                                SnowCanvasShapeKind::Arrow),
+                "set explicit plain fallback");
+        require(exportImage() == fallback, "unsupported head must render exactly like plain shaft");
+        for (const QString& pathType :
+             {QStringLiteral("straight"), QStringLiteral("curve"), QStringLiteral("elbow")}) {
+            for (const QString& strokeStyle :
+                 {QStringLiteral("solid"), QStringLiteral("dashed"), QStringLiteral("dotted")}) {
+                for (const bool reverse : {false, true}) {
+                    auto session =
+                        QJsonDocument::fromJson(restored.serializeDocumentSession()).object();
+                    auto document = session.value(QStringLiteral("document")).toObject();
+                    auto documentSlots = document.value(QStringLiteral("slots")).toArray();
+                    for (int i = 0; i < documentSlots.size(); ++i) {
+                        auto slot = documentSlots.at(i).toObject();
+                        auto data = slot.value(QStringLiteral("data")).toObject();
+                        if (!data.contains(QStringLiteral("Arrow")))
+                            continue;
+                        auto arrow = data.value(QStringLiteral("Arrow")).toObject();
+                        arrow.insert(QStringLiteral("x"), -230.0);
+                        arrow.insert(QStringLiteral("y"), 0.0);
+                        arrow.insert(QStringLiteral("width"), 440.0);
+                        arrow.insert(QStringLiteral("height"), 180.0);
+                        arrow.insert(QStringLiteral("arrow_type"), pathType);
+                        arrow.insert(QStringLiteral("stroke_style"), strokeStyle);
+                        arrow.insert(QStringLiteral("points"),
+                                     pathType == QStringLiteral("elbow")
+                                         ? QJsonArray{QJsonArray{0, 0}, QJsonArray{300, 0},
+                                                      QJsonArray{300, -80}, QJsonArray{130, -80}}
+                                         : QJsonArray{QJsonArray{0, 0}, QJsonArray{300, 100},
+                                                      QJsonArray{440, 0}, QJsonArray{130, -80}});
+                        if (reverse) {
+                            arrow.insert(QStringLiteral("start_arrowhead"),
+                                         arrow.value(QStringLiteral("end_arrowhead")));
+                            arrow.insert(QStringLiteral("end_arrowhead"), QJsonValue::Null);
+                        }
+                        data.insert(QStringLiteral("Arrow"), arrow);
+                        slot.insert(QStringLiteral("data"), data);
+                        documentSlots.replace(i, slot);
+                    }
+                    document.insert(QStringLiteral("slots"), documentSlots);
+                    session.insert(QStringLiteral("document"), document);
+                    SnowCanvasRuntime empty;
+                    const auto emptySession =
+                        QJsonDocument::fromJson(empty.serializeDocumentSession()).object();
+                    session.insert(QStringLiteral("history"),
+                                   emptySession.value(QStringLiteral("history")));
+                    SnowCanvasRuntime variant;
+                    require(variant.restoreDocumentSession(QJsonDocument(session).toJson()),
+                            "restore routed taper fixture");
+                    const QImage routed =
+                        variant.renderToImage(QRectF(-300, -180, 600, 360), QSize(1200, 720), {});
+                    int visible = 0;
+                    for (int y = 0; y < routed.height(); ++y)
+                        for (int x = 0; x < routed.width(); ++x) {
+                            const int alpha = routed.pixelColor(x, y).alpha();
+                            visible += alpha > 0 ? 1 : 0;
+                            require(alpha <= 130,
+                                    "taper must not double-paint translucent bends or head joins");
+                        }
+                    require(visible > 100, "every route, dash style, and direction must render");
+                    if (!directory.isEmpty() && head == SnowCanvasArrowhead::TriangleOutline &&
+                        !reverse)
+                        routed.save(directory +
+                                    QStringLiteral("/shaft-%1-%2.png").arg(pathType, strokeStyle));
+                }
+            }
+        }
+    }
+}
+
+void escapeKeyCommitsEditedText() {
+    for (const bool attached : {false, true}) {
+        for (const bool existing : {false, true}) {
+            for (const QString& content : {QString::fromUtf8("Saved\nè¿žæŽ¥ â†’ response"),
+                                           QString(), QStringLiteral(" \n ")}) {
+                SnowCanvasRuntime runtime;
+                SnowCanvasWidget canvas(runtime);
+                canvas.resize(600, 360);
+                canvas.show();
+                QApplication::processEvents();
+                if (attached) {
+                    createArrow(canvas, runtime);
+                } else {
+                    require(canvas.setCanvasTool(SnowCanvasTool::Text), "activate text tool");
+                }
+                const auto beginEdit = [&] {
+                    if (attached) {
+                        openLabel(canvas);
+                    } else {
+                        mouse(canvas, QEvent::MouseButtonPress, {280.0, 180.0}, Qt::LeftButton,
+                              Qt::LeftButton);
+                        mouse(canvas, QEvent::MouseButtonRelease, {280.0, 180.0}, Qt::LeftButton,
+                              Qt::NoButton);
+                    }
+                    require(canvas.hasActiveTextEditing(), "begin text editing before Escape");
+                };
+                const QByteArray before = runtime.serializeDocumentHistory();
+                beginEdit();
+                if (existing) {
+                    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("original"));
+                    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+                    beginEdit();
+                }
+                key(canvas, Qt::Key_A, Qt::ControlModifier);
+                key(canvas, Qt::Key_Backspace);
+                if (!content.isEmpty()) {
+                    QInputMethodEvent committed;
+                    committed.setCommitString(content);
+                    QApplication::sendEvent(&canvas, &committed);
+                }
+                QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+                QApplication::sendEvent(&canvas, &escape);
+                require(escape.isAccepted() && !canvas.hasActiveTextEditing(),
+                        "Escape is consumed and exits text input mode");
+                require(!canvas.testAttribute(Qt::WA_InputMethodEnabled),
+                        "Escape disables text input methods");
+                const bool hasContent = !content.trimmed().isEmpty();
+                require(records(runtime, QStringLiteral("Text")).size() == (hasContent ? 1 : 0),
+                        "Escape commits content without retaining empty text elements");
+                if (hasContent) {
+                    require(payload(runtime, QStringLiteral("Text"))
+                                    .value(QStringLiteral("text"))
+                                    .toString() == content,
+                            "Escape preserves multiline Unicode text exactly");
+                }
+                const QByteArray after = runtime.serializeDocumentHistory();
+                QKeyEvent release(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier);
+                QApplication::sendEvent(&canvas, &release);
+                require(runtime.serializeDocumentHistory() == after,
+                        "releasing Escape must not change the committed document or history");
+                if (attached) {
+                    require(records(runtime, QStringLiteral("Arrow")).size() == 1,
+                            "Escape preserves the label's arrow");
+                }
+                if (!existing && !hasContent) {
+                    require(after == before, "empty new drafts leave document history untouched");
+                    continue;
+                }
+                require(canvas.undo(), "Escape's text commit is undoable");
+                if (existing) {
+                    require(payload(runtime, QStringLiteral("Text"))
+                                    .value(QStringLiteral("text"))
+                                    .toString() == QStringLiteral("original"),
+                            "one undo restores the text from before editing");
+                } else {
+                    require(records(runtime, QStringLiteral("Text")).isEmpty(),
+                            "one undo removes the new text");
+                }
+                require(canvas.redo(), "Escape's text commit is redoable");
+                const auto saved = QJsonDocument::fromJson(after).object();
+                const auto redone =
+                    QJsonDocument::fromJson(runtime.serializeDocumentHistory()).object();
+                auto savedDocument = saved.value(QStringLiteral("document")).toObject();
+                auto redoneDocument = redone.value(QStringLiteral("document")).toObject();
+                // Every transaction advances the revision, including undo and redo.
+                savedDocument.remove(QStringLiteral("revision"));
+                redoneDocument.remove(QStringLiteral("revision"));
+                require(redoneDocument == savedDocument &&
+                            redone.value(QStringLiteral("history")) ==
+                                saved.value(QStringLiteral("history")),
+                        "redo restores the exact text, geometry, ownership, and history");
+            }
+        }
+    }
+}
+
+void deleteKeyRemovesEditedText() {
+    for (const bool attached : {false, true}) {
+        for (const bool existing : {false, true}) {
+            for (const bool selected : {false, true}) {
+                SnowCanvasRuntime runtime;
+                SnowCanvasWidget canvas(runtime);
+                canvas.resize(600, 360);
+                canvas.show();
+                QApplication::processEvents();
+                if (attached) {
+                    createArrow(canvas, runtime);
+                    openLabel(canvas);
+                } else {
+                    require(canvas.setCanvasTool(SnowCanvasTool::Text), "activate text tool");
+                    mouse(canvas, QEvent::MouseButtonPress, {280.0, 180.0}, Qt::LeftButton,
+                          Qt::LeftButton);
+                    mouse(canvas, QEvent::MouseButtonRelease, {280.0, 180.0}, Qt::LeftButton,
+                          Qt::NoButton);
+                }
+                key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("abc"));
+                if (existing) {
+                    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+                    require(records(runtime, QStringLiteral("Text")).size() == 1,
+                            "commit creates text before reopening");
+                    if (attached) {
+                        openLabel(canvas);
+                    } else {
+                        mouse(canvas, QEvent::MouseButtonPress, {280.0, 180.0}, Qt::LeftButton,
+                              Qt::LeftButton);
+                        mouse(canvas, QEvent::MouseButtonRelease, {280.0, 180.0}, Qt::LeftButton,
+                              Qt::NoButton);
+                    }
+                }
+                require(canvas.hasActiveTextEditing(), "text editor is active before Delete");
+                key(canvas, Qt::Key_Home);
+                key(canvas, Qt::Key_Right);
+                if (selected) {
+                    key(canvas, Qt::Key_A, Qt::ControlModifier);
+                }
+                QInputMethodEvent preedit(QStringLiteral("pending"), {});
+                QApplication::sendEvent(&canvas, &preedit);
+                key(canvas, Qt::Key_Delete);
+                require(!canvas.hasActiveTextEditing(), "Delete ends text editing");
+                require(!canvas.testAttribute(Qt::WA_InputMethodEnabled),
+                        "Delete disables text input methods");
+                require(records(runtime, QStringLiteral("Text")).isEmpty(),
+                        "Delete removes the entire text regardless of caret or selection");
+                if (attached) {
+                    require(records(runtime, QStringLiteral("Arrow")).size() == 1,
+                            "deleting label preserves its arrow");
+                }
+                if (existing) {
+                    require(canvas.undo(), "text deletion is undoable");
+                    require(payload(runtime, QStringLiteral("Text"))
+                                    .value(QStringLiteral("text"))
+                                    .toString() == QStringLiteral("abc"),
+                            "one undo restores the original text");
+                    require(canvas.redo(), "text deletion is redoable");
+                    require(records(runtime, QStringLiteral("Text")).isEmpty(),
+                            "redo removes text again");
+                } else if (!attached) {
+                    require(!canvas.canvasHistoryState().canUndo,
+                            "deleting a new draft does not create a history entry");
+                }
+            }
+        }
+    }
+}
+
+void enabledDeleteKeepsEditedTextAndItsOwner() {
+    const auto text = [](SnowCanvasWidget& canvas) {
+        QInputMethodQueryEvent query(Qt::ImSurroundingText);
+        QApplication::sendEvent(&canvas, &query);
+        return query.value(Qt::ImSurroundingText).toString();
+    };
+    const auto standardKey = [](SnowCanvasWidget& canvas, QKeySequence::StandardKey command) {
+        const auto shortcut = QKeySequence(command)[0];
+        key(canvas, shortcut.key(), shortcut.keyboardModifiers());
+    };
+    for (const bool attached : {false, true}) {
+        for (const bool existing : {false, true}) {
+            SnowCanvasRuntime runtime;
+            SnowCanvasWidget canvas(runtime);
+            require(!canvas.deleteTextAfterCursor(), "forward Delete defaults to disabled");
+            canvas.setDeleteTextAfterCursor(true);
+            canvas.resize(600, 360);
+            canvas.show();
+            QApplication::processEvents();
+            if (attached) {
+                createArrow(canvas, runtime);
+                openLabel(canvas);
+            } else {
+                require(canvas.setCanvasTool(SnowCanvasTool::Text), "activate text tool");
+                mouse(canvas, QEvent::MouseButtonPress, {280, 180}, Qt::LeftButton, Qt::LeftButton);
+                mouse(canvas, QEvent::MouseButtonRelease, {280, 180}, Qt::LeftButton, Qt::NoButton);
+            }
+            key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("abc"));
+            if (existing) {
+                key(canvas, Qt::Key_Return, Qt::ControlModifier);
+                if (attached) {
+                    openLabel(canvas);
+                } else {
+                    mouse(canvas, QEvent::MouseButtonPress, {280, 180}, Qt::LeftButton,
+                          Qt::LeftButton);
+                    mouse(canvas, QEvent::MouseButtonRelease, {280, 180}, Qt::LeftButton,
+                          Qt::NoButton);
+                }
+            }
+            const QByteArray history = runtime.serializeDocumentHistory();
+            canvas.setDeleteTextAfterCursor(false);
+            canvas.setDeleteTextAfterCursor(true);
+            require(canvas.hasActiveTextEditing() && runtime.serializeDocumentHistory() == history,
+                    "changing Delete preferences preserves the active draft and document history");
+            key(canvas, Qt::Key_Home);
+            key(canvas, Qt::Key_Right);
+            key(canvas, Qt::Key_Delete);
+            require(canvas.hasActiveTextEditing() &&
+                        canvas.testAttribute(Qt::WA_InputMethodEnabled),
+                    "forward Delete retains the editor and input methods");
+            require(text(canvas) == QStringLiteral("ac"),
+                    "forward Delete removes only the next character");
+            standardKey(canvas, QKeySequence::Undo);
+            require(text(canvas) == QStringLiteral("abc"), "draft undo restores forward deletion");
+            standardKey(canvas, QKeySequence::Redo);
+            require(text(canvas) == QStringLiteral("ac"), "draft redo reapplies forward deletion");
+            key(canvas, Qt::Key_End);
+            key(canvas, Qt::Key_Delete);
+            require(canvas.hasActiveTextEditing(), "Delete at the end retains the element");
+            key(canvas, Qt::Key_A, Qt::ControlModifier);
+            key(canvas, Qt::Key_Delete);
+            key(canvas, Qt::Key_Delete);
+            require(canvas.hasActiveTextEditing() && text(canvas).isEmpty(),
+                    "deleting selected text and the empty draft retains editing");
+            standardKey(canvas, QKeySequence::Undo);
+            require(text(canvas) == QStringLiteral("ac"), "undo restores the deleted selection");
+            key(canvas, Qt::Key_Return, Qt::ControlModifier);
+            require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")) ==
+                        QStringLiteral("ac"),
+                    "commit persists the edited text");
+            if (existing) {
+                require(
+                    canvas.undo() &&
+                        payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")) ==
+                            QStringLiteral("abc"),
+                    "document undo restores text before the edit");
+                require(canvas.redo(), "document redo reapplies the committed text edit");
+            }
+            if (attached) {
+                require(records(runtime, QStringLiteral("Arrow")).size() == 1,
+                        "editing a label preserves its arrow");
+            }
+            // With no active editor, Delete still follows normal element selection semantics.
+            require(canvas.setCanvasTool(SnowCanvasTool::Select), "activate element selection");
+            const auto id = records(runtime, QStringLiteral("Text"))[0]
+                                .toObject()
+                                .value(QStringLiteral("id"))
+                                .toObject();
+            SnowCanvasRuntimeEditor editor(runtime);
+            require(
+                editor.select(static_cast<quint32>(id.value(QStringLiteral("index")).toInt()),
+                              static_cast<quint32>(id.value(QStringLiteral("generation")).toInt())),
+                "select text before testing element deletion");
+            key(canvas, Qt::Key_Delete);
+            require(records(runtime, QStringLiteral("Text")).isEmpty(),
+                    "Delete outside text editing still deletes selected elements");
+        }
+    }
+}
+
+void commandResolverPreservesTextAndEngineCommands() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    canvas.setCommandKeyResolver([](const QKeyEvent& event) {
+        switch (event.nativeVirtualKey()) {
+        case 0:
+            return Qt::Key_A;
+        case 6:
+            return Qt::Key_Z;
+        case 36:
+            return Qt::Key_Return;
+        default:
+            return Qt::Key_unknown;
+        }
+    });
+    const auto send = [&](int logical, quint32 physical, Qt::KeyboardModifiers modifiers,
+                          const QString& text = QString()) {
+        QKeyEvent event(QEvent::KeyPress, logical, modifiers, 1, physical, 0, text);
+        QApplication::sendEvent(&canvas, &event);
+    };
+    openLabel(canvas);
+    send(Qt::Key_Q, 0, Qt::NoModifier, QStringLiteral("layout text"));
+    send(Qt::Key_Q, 0, Qt::ControlModifier); // physical Select All
+    send(Qt::Key_Q, 0, Qt::NoModifier, QStringLiteral("replacement"));
+    QInputMethodEvent ime;
+    ime.setCommitString(QString::fromUtf8("è¿žæŽ¥"));
+    QApplication::sendEvent(&canvas, &ime);
+    send(Qt::Key_unknown, 36, Qt::ControlModifier);
+    require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")).toString() ==
+                QString::fromUtf8("replacementè¿žæŽ¥"),
+            "resolved commands must preserve layout text and IME commits");
+    send(Qt::Key_Z, 0, Qt::ControlModifier, QStringLiteral("z"));
+    require(records(runtime, QStringLiteral("Text")).size() == 1,
+            "logical Z at another physical position must not undo in the engine");
+    send(Qt::Key_Q, 6, Qt::ControlModifier, QStringLiteral("q"));
+    require(records(runtime, QStringLiteral("Text")).isEmpty(),
+            "engine undo must use the resolved command key, not event text");
+    send(Qt::Key_Q, 6, Qt::ControlModifier | Qt::ShiftModifier, QStringLiteral("Q"));
+    require(records(runtime, QStringLiteral("Text")).size() == 1,
+            "engine redo must use the same physical command identity");
+}
+
+void widgetLifecycle() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    const QByteArray before = runtime.serializeDocumentHistory();
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("cancelled"));
+    require(canvas.cancelActiveTextEditing(), "explicit cancellation ends the draft");
+    require(!canvas.hasActiveTextEditing(), "explicit cancellation closes the draft");
+    require(runtime.serializeDocumentHistory() == before,
+            "cancel leaves document and history untouched");
+
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("Request"));
+    key(canvas, Qt::Key_Return);
+    QInputMethodEvent preedit(QString::fromUtf8("è¿žæŽ¥"), {});
+    QApplication::sendEvent(&canvas, &preedit);
+    require(records(runtime, QStringLiteral("Text")).isEmpty(),
+            "IME draft remains outside document");
+    QInputMethodEvent committed;
+    committed.setCommitString(QString::fromUtf8("è¿žæŽ¥ â†’ response"));
+    QApplication::sendEvent(&canvas, &committed);
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    const auto text = payload(runtime, QStringLiteral("Text"));
+    require(text.value(QStringLiteral("text")).toString() ==
+                QString::fromUtf8("Request\nè¿žæŽ¥ â†’ response"),
+            "multiline IME text commits without content changes");
+    require(text.value(QStringLiteral("rotation")).toDouble() == 0.0, "label stays horizontal");
+    require(payload(runtime, QStringLiteral("Arrow"))
+                .value(QStringLiteral("text_element_id"))
+                .isObject(),
+            "committed label has persisted ownership");
+    require(canvas.canvasStyleToolbarState().canEditArrowText,
+            "selected arrow exposes edit action");
+    require(canvas.undo(), "undo label creation");
+    require(records(runtime, QStringLiteral("Text")).isEmpty(), "one undo removes the label");
+    require(records(runtime, QStringLiteral("Arrow")).size() == 1, "undo preserves arrow");
+    require(canvas.redo(), "redo label creation");
+
+    key(canvas, Qt::Key_Return);
+    require(canvas.hasActiveTextEditing(), "Enter reopens the selected arrow label");
+    key(canvas, Qt::Key_A, Qt::ControlModifier);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("replacement"));
+    key(canvas, Qt::Key_Escape);
+    require(!canvas.hasActiveTextEditing(), "Escape ends existing label editing");
+    require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")).toString() ==
+                QStringLiteral("replacement"),
+            "Escape commits existing label edits");
+    require(canvas.undo(), "restore original label after checking Escape");
+    require(canvas.editSelectedArrowText(), "reopen label for explicit cancellation");
+    require(canvas.cancelActiveTextEditing(), "explicit cancellation ends the draft");
+    require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")) ==
+                text.value(QStringLiteral("text")),
+            "cancelling existing label restores original text");
+    const auto ownerStyle = payload(runtime, QStringLiteral("Arrow"));
+    require(canvas.editSelectedArrowText(), "open label style editing");
+    auto style = canvas.canvasStyleToolbarState().textStyle;
+    style.color = QColor(194, 36, 62);
+    style.fontSize = 36.0;
+    require(canvas.setCanvasTextStyle(style), "change label font and color");
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(
+        payload(runtime, QStringLiteral("Text")).value(QStringLiteral("font_size")).toDouble() ==
+            36.0,
+        "label style commits with text layout");
+    require(payload(runtime, QStringLiteral("Arrow")) == ownerStyle,
+            "label style preserves arrow style and geometry");
+    require(canvas.undo(), "undo label style and measured layout together");
+    require(payload(runtime, QStringLiteral("Text")) == text,
+            "style undo restores exact original label");
+    require(canvas.editSelectedArrowText(), "public action opens existing label");
+    key(canvas, Qt::Key_A, Qt::ControlModifier);
+    key(canvas, Qt::Key_Backspace);
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(records(runtime, QStringLiteral("Text")).isEmpty(), "empty commit removes label");
+    require(records(runtime, QStringLiteral("Arrow")).size() == 1, "empty commit keeps arrow");
+    require(canvas.undo(), "undo restores cleared label");
+    require(canvas.duplicateSelected(), "duplicate arrow and label");
+    require(records(runtime, QStringLiteral("Text")).size() == 2, "duplicate includes text");
+    require(canvas.deleteSelected(), "delete duplicated pair");
+    require(records(runtime, QStringLiteral("Text")).size() == 1, "delete removes owned label");
+    const QByteArray saved = runtime.serializeDocumentSession();
+    SnowCanvasRuntime restored;
+    require(restored.restoreDocumentSession(saved), "saved arrow text and history restore");
+    require(payload(restored, QStringLiteral("Text")).value(QStringLiteral("text")) ==
+                text.value(QStringLiteral("text")),
+            "restored text matches original");
+}
+
+void arrowLabelWheelChangesFontSizeWhileSelecting() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("Label"));
+
+    const double initialFontSize = canvas.canvasStyleToolbarState().textStyle.fontSize;
+    const QTransform initialTransform = canvas.canvasToViewTransform();
+    const QPointF position(280.0, 180.0);
+    const auto wheel = [&](int delta) {
+        QWheelEvent event(position, canvas.mapToGlobal(position.toPoint()), QPoint(),
+                          QPoint(0, delta), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(&canvas, &event);
+    };
+    wheel(120);
+    require(canvas.canvasStyleToolbarState().textStyle.fontSize == initialFontSize + 1.0,
+            "wheel increases an arrow label draft's font size with Select active");
+    require(canvas.canvasToViewTransform() == initialTransform,
+            "font-size wheel does not zoom while editing an arrow label");
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(
+        payload(runtime, QStringLiteral("Text")).value(QStringLiteral("font_size")).toDouble() ==
+            initialFontSize + 1.0,
+        "wheel-adjusted arrow label font size commits");
+
+    require(canvas.editSelectedArrowText(), "reopen the committed arrow label");
+    wheel(-120);
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(
+        payload(runtime, QStringLiteral("Text")).value(QStringLiteral("font_size")).toDouble() ==
+            initialFontSize,
+        "wheel decreases an existing arrow label's font size");
+}
+
+void wrappingAndFinalPointerPosition() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    require(canvas.setCanvasTool(SnowCanvasTool::Text), "activate text tool");
+    mouse(canvas, QEvent::MouseButtonPress, {280.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+    require(canvas.hasActiveTextEditing(), "Text tool creates an attached label");
+    const QString original = QStringLiteral("A long label with several words and emoji ") +
+                             QString::fromUtf8("ðŸ™‚ ä¸­æ–‡ ").repeated(32);
+    key(canvas, Qt::Key_A, Qt::NoModifier, original);
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    auto text = payload(runtime, QStringLiteral("Text"));
+    require(text.value(QStringLiteral("text")).toString() == original,
+            "wrapping preserves original text");
+    const double font = text.value(QStringLiteral("font_size")).toDouble();
+    require(text.value(QStringLiteral("width")).toDouble() <= qMax(420.0 * 0.7, font * 11.0) + 0.01,
+            "label obeys reference maximum width");
+    require(canvas.setCanvasTool(SnowCanvasTool::Select), "select arrow for endpoint drag");
+    mouse(canvas, QEvent::MouseButtonPress, {80.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {80.0, 180.0}, Qt::LeftButton, Qt::NoButton);
+    mouse(canvas, QEvent::MouseButtonPress, {490.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseMove, {390.0, 180.0}, Qt::NoButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {360.0, 180.0}, Qt::LeftButton, Qt::NoButton);
+    const auto arrow = payload(runtime, QStringLiteral("Arrow"));
+    text = payload(runtime, QStringLiteral("Text"));
+    require(std::abs(arrow.value(QStringLiteral("width")).toDouble() - 290.0) < 0.01,
+            "endpoint uses the final release coordinate");
+    require(text.value(QStringLiteral("width")).toDouble() <= qMax(290.0 * 0.7, font * 11.0) + 0.01,
+            "final arrow geometry and label wrapping commit together");
+    const auto center = text.value(QStringLiteral("center")).toObject();
+    const QPointF view =
+        canvas.canvasToViewTransform().map(QPointF(center.value(QStringLiteral("x")).toDouble(),
+                                                   center.value(QStringLiteral("y")).toDouble()));
+    require(std::abs(view.x() - 215.0) < 0.01, "label follows final midpoint");
+    require(canvas.undo(), "undo endpoint edit");
+    require(
+        std::abs(
+            payload(runtime, QStringLiteral("Arrow")).value(QStringLiteral("width")).toDouble() -
+            420.0) < 0.01,
+        "one undo restores arrow and measured label");
+}
+
+void gapPreservesBackground() {
+    for (const SnowArrowType type :
+         {SNOW_ARROW_TYPE_STRAIGHT, SNOW_ARROW_TYPE_CURVE, SNOW_ARROW_TYPE_ELBOW}) {
+        for (const SnowStrokeStyle style :
+             {SNOW_STROKE_STYLE_SOLID, SNOW_STROKE_STYLE_DASHED, SNOW_STROKE_STYLE_DOTTED}) {
+            for (int head = SNOW_ARROWHEAD_NONE; head <= SNOW_ARROWHEAD_INDENTED_TRIANGLE; ++head) {
+                for (const QColor background : {QColor(19, 103, 157), QColor(Qt::transparent)}) {
+                    QImage image(200, 100, QImage::Format_ARGB32_Premultiplied);
+                    image.fill(background);
+                    SceneDisplayInfo info{};
+                    info.surface_width = 200;
+                    info.surface_height = 100;
+                    info.camera_zoom = 1.0;
+                    SnowArrowPoint points[] = {{-80.0, 0.0}, {80.0, 0.0}};
+                    SnowSceneDisplayItem raw{};
+                    raw.kind = SNOW_SCENE_DISPLAY_ITEM_ARROW;
+                    raw.stroke = {255, 0, 0, 255};
+                    raw.stroke_width = 4.0;
+                    raw.opacity = 1.0;
+                    raw.arrow_points = points;
+                    raw.arrow_point_count = 2;
+                    raw.arrow_type = type;
+                    raw.arrow_stroke_style = style;
+                    raw.arrow_start_head = static_cast<SnowArrowhead>(head);
+                    raw.arrow_end_head = static_cast<SnowArrowhead>(head);
+                    raw.has_bound_text_element = 1;
+                    raw.arrow_text_bounds[0] = -25.0;
+                    raw.arrow_text_bounds[1] = -10.0;
+                    raw.arrow_text_bounds[2] = 25.0;
+                    raw.arrow_text_bounds[3] = 10.0;
+                    SnowCanvasSceneItem item(raw);
+                    QPainter painter(&image);
+                    snow_canvas_renderer::SceneRenderRequest request;
+                    request.painter = &painter;
+                    request.displayInfo = &info;
+                    request.sceneItems = &item;
+                    request.sceneItemCount = 1;
+                    request.exposedRegion = QRegion(image.rect());
+                    request.clearBackgroundEnabled = false;
+                    snow_canvas_renderer::renderSceneItems(request);
+                    painter.end();
+                    require(image.pixelColor(100, 50) == background,
+                            "arrow gap preserves original background and alpha");
+                    bool visible = false;
+                    for (int x = 35; x < 65; ++x) {
+                        visible = visible || image.pixelColor(x, 50).red() > 230;
+                    }
+                    require(visible, "arrow remains visible outside label gap");
+                }
+            }
+        }
+    }
+}
+
+void arrowTypesDragLabelAlongPathAndEraseAsPair() {
+    for (const auto type :
+         {SnowCanvasArrowType::Straight, SnowCanvasArrowType::Curve, SnowCanvasArrowType::Elbow}) {
+        SnowCanvasRuntime runtime;
+        SnowCanvasWidget canvas(runtime);
+        canvas.resize(600, 360);
+        canvas.show();
+        QApplication::processEvents();
+        createArrow(canvas, runtime, type);
+        openLabel(canvas);
+        key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("first\nsecond\nthird"));
+        // Clicking outside commits without needing a keyboard shortcut.
+        mouse(canvas, QEvent::MouseButtonPress, {550.0, 310.0}, Qt::LeftButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseButtonRelease, {550.0, 310.0}, Qt::LeftButton, Qt::NoButton);
+        require(!canvas.hasActiveTextEditing(), "outside click commits arrow label");
+        const auto before = payload(runtime, QStringLiteral("Text"));
+        const auto beforeArrow = payload(runtime, QStringLiteral("Arrow"));
+        const QString previewDirectory = qEnvironmentVariable("SNOW_ARROW_TEXT_PREVIEW_DIR");
+        if (!previewDirectory.isEmpty()) {
+            require(canvas.grab().save(
+                        previewDirectory +
+                        QStringLiteral("/arrow-text-%1.png").arg(static_cast<int>(type))),
+                    "save requested rendering artifact");
+        }
+        const auto center = before.value(QStringLiteral("center")).toObject();
+        const QPointF point = canvas.canvasToViewTransform().map(
+                                  QPointF(center.value(QStringLiteral("x")).toDouble(),
+                                          center.value(QStringLiteral("y")).toDouble())) +
+                              QPointF(0.0, 20.0);
+        mouse(canvas, QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseMove, point + QPointF(30.0, 40.0), Qt::NoButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseButtonRelease, point + QPointF(30.0, 40.0), Qt::LeftButton,
+              Qt::NoButton);
+        const auto after = payload(runtime, QStringLiteral("Text"));
+        const auto moved = after.value(QStringLiteral("center")).toObject();
+        require(std::abs(moved.value(QStringLiteral("x")).toDouble() -
+                         center.value(QStringLiteral("x")).toDouble() - 30.0) < 0.01,
+                "dragging label moves it along the arrow");
+        require(std::abs(moved.value(QStringLiteral("y")).toDouble() -
+                         center.value(QStringLiteral("y")).toDouble()) < 0.01,
+                "dragging off the path keeps the label on the arrow");
+        const auto afterArrow = payload(runtime, QStringLiteral("Arrow"));
+        require(afterArrow.value(QStringLiteral("x")) == beforeArrow.value(QStringLiteral("x")) &&
+                    afterArrow.value(QStringLiteral("y")) ==
+                        beforeArrow.value(QStringLiteral("y")) &&
+                    afterArrow.value(QStringLiteral("points")) ==
+                        beforeArrow.value(QStringLiteral("points")) &&
+                    afterArrow.contains(QStringLiteral("text_path_fraction")),
+                "dragging the label preserves arrow geometry and stores its path position");
+        require(after.value(QStringLiteral("font_size")) ==
+                    before.value(QStringLiteral("font_size")),
+                "dragging the label preserves font size");
+        require(canvas.setCanvasTool(SnowCanvasTool::Eraser), "activate eraser");
+        const QPointF erasePoint = canvas.canvasToViewTransform().map(
+                                       QPointF(moved.value(QStringLiteral("x")).toDouble(),
+                                               moved.value(QStringLiteral("y")).toDouble())) +
+                                   QPointF(0.0, 20.0);
+        mouse(canvas, QEvent::MouseButtonPress, erasePoint, Qt::LeftButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseButtonRelease, erasePoint, Qt::LeftButton, Qt::NoButton);
+        require(records(runtime, QStringLiteral("Arrow")).isEmpty() &&
+                    records(runtime, QStringLiteral("Text")).isEmpty(),
+                "erasing label deletes the pair");
+        require(canvas.undo(), "undo pair erasure");
+        require(records(runtime, QStringLiteral("Text")).size() == 1, "undo restores owned text");
+    }
+}
+
+void deleteAllElementsClearsDocumentAsOneUndoEntry() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(600, 360);
+    canvas.show();
+    QApplication::processEvents();
+    createArrow(canvas, runtime);
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("label"));
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate shape tool");
+    mouse(canvas, QEvent::MouseButtonPress, {20.0, 20.0}, Qt::LeftButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseMove, {120.0, 90.0}, Qt::NoButton, Qt::LeftButton);
+    mouse(canvas, QEvent::MouseButtonRelease, {120.0, 90.0}, Qt::LeftButton, Qt::NoButton);
+    require(records(runtime, QStringLiteral("Arrow")).size() == 1 &&
+                records(runtime, QStringLiteral("Text")).size() == 1 &&
+                records(runtime, QStringLiteral("Rectangle")).size() == 1,
+            "arrow, label, and rectangle exist before deleting all");
+
+    require(canvas.deleteAllElements(), "delete all elements should succeed");
+    require(records(runtime, QStringLiteral("Arrow")).isEmpty() &&
+                records(runtime, QStringLiteral("Text")).isEmpty() &&
+                records(runtime, QStringLiteral("Rectangle")).isEmpty(),
+            "delete all removes every element kind");
+    require(canvas.canvasHistoryState().canUndo, "delete all keeps history for undo");
+
+    require(canvas.undo(), "undo delete all");
+    require(records(runtime, QStringLiteral("Arrow")).size() == 1 &&
+                records(runtime, QStringLiteral("Text")).size() == 1 &&
+                records(runtime, QStringLiteral("Rectangle")).size() == 1,
+            "one undo restores every element");
+
+    require(canvas.redo(), "redo delete all");
+    require(records(runtime, QStringLiteral("Arrow")).isEmpty() &&
+                records(runtime, QStringLiteral("Text")).isEmpty() &&
+                records(runtime, QStringLiteral("Rectangle")).isEmpty(),
+            "redo clears the document again");
+}
+
+void sharedViewsAndLongOffscreenText() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    SnowCanvasWidget second(runtime);
+    canvas.resize(600, 360);
+    second.resize(600, 360);
+    canvas.show();
+    second.show();
+    QApplication::processEvents();
+    require(second.setViewportCamera(0.0, 0.0, 0.65), "shared viewport uses an independent zoom");
+    createArrow(canvas, runtime);
+    openLabel(canvas);
+    require(canvas.cancelActiveTextEditing(), "explicit cancellation ends the draft");
+    const QImage before = second.grab().toImage();
+    const QByteArray history = runtime.serializeDocumentHistory();
+    openLabel(canvas);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("Shared draft"));
+    const QImage draft = second.grab().toImage();
+    require(draft != before, "draft text and arrow gap refresh other viewports");
+    require(canvas.cancelActiveTextEditing(), "explicit cancellation ends the draft");
+    require(second.grab().toImage() == before, "cancellation removes shared draft and gap");
+    require(runtime.serializeDocumentHistory() == history, "shared draft adds no undo records");
+    openLabel(canvas);
+    const QString original = QString::fromUtf8("é•¿æ–‡æœ¬ðŸ™‚ with words\n").repeated(100);
+    key(canvas, Qt::Key_A, Qt::NoModifier, original);
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(canvas.setViewportCamera(10000.0, 10000.0, 0.7), "pan label outside scene cache");
+    require(canvas.editSelectedArrowText(), "reopen complete offscreen label");
+    key(canvas, Qt::Key_End, Qt::ControlModifier);
+    key(canvas, Qt::Key_A, Qt::NoModifier, QStringLiteral("END"));
+    key(canvas, Qt::Key_Return, Qt::ControlModifier);
+    require(payload(runtime, QStringLiteral("Text")).value(QStringLiteral("text")).toString() ==
+                original + QStringLiteral("END"),
+            "offscreen reopening preserves text beyond metadata buffer");
+}
+
+void boundShapeReroutesAndMeasuresLabel() {
+    for (const auto type :
+         {SnowCanvasArrowType::Straight, SnowCanvasArrowType::Curve, SnowCanvasArrowType::Elbow}) {
+        SnowCanvasRuntime runtime;
+        SnowCanvasWidget canvas(runtime);
+        canvas.resize(600, 360);
+        canvas.show();
+        QApplication::processEvents();
+        for (const QRectF rect :
+             {QRectF(20.0, 145.0, 45.0, 70.0), QRectF(495.0, 145.0, 65.0, 70.0)}) {
+            require(canvas.setCanvasTool(SnowCanvasTool::Shape), "activate bound shape tool");
+            mouse(canvas, QEvent::MouseButtonPress, rect.topLeft(), Qt::LeftButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseMove, rect.bottomRight(), Qt::NoButton, Qt::LeftButton);
+            mouse(canvas, QEvent::MouseButtonRelease, rect.bottomRight(), Qt::LeftButton,
+                  Qt::NoButton);
+        }
+        createArrow(canvas, runtime, type);
+        require(payload(runtime, QStringLiteral("Arrow"))
+                    .value(QStringLiteral("end_binding"))
+                    .isObject(),
+                "arrow endpoint binds to target shape");
+        openLabel(canvas);
+        key(canvas, Qt::Key_A, Qt::NoModifier,
+            QStringLiteral("Bound arrow label with wrapping and preserved words ").repeated(5));
+        key(canvas, Qt::Key_Return, Qt::ControlModifier);
+        const auto original = payload(runtime, QStringLiteral("Text"));
+        mouse(canvas, QEvent::MouseButtonPress, {558.0, 180.0}, Qt::LeftButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseMove, {390.0, 270.0}, Qt::NoButton, Qt::LeftButton);
+        mouse(canvas, QEvent::MouseButtonRelease, {360.0, 280.0}, Qt::LeftButton, Qt::NoButton);
+        const auto arrow = payload(runtime, QStringLiteral("Arrow"));
+        const auto text = payload(runtime, QStringLiteral("Text"));
+        require(text.value(QStringLiteral("center")) != original.value(QStringLiteral("center")),
+                "label follows arrow when bound shape moves");
+        require(text.value(QStringLiteral("width")).toDouble() <=
+                    qMax(arrow.value(QStringLiteral("width")).toDouble() * 0.7,
+                         text.value(QStringLiteral("font_size")).toDouble() * 11.0) +
+                        0.01,
+                "bound shape release includes final label wrapping");
+        require(text.value(QStringLiteral("text")) == original.value(QStringLiteral("text")),
+                "rerouting preserves label content");
+        require(canvas.undo(), "undo bound shape move");
+        require(payload(runtime, QStringLiteral("Text")) == original,
+                "one undo restores exact label before rerouting");
+    }
+}
+} // namespace
+
+int main(int argc, char** argv) {
+#ifdef Q_OS_WIN
+    // The static offscreen plugin uses FreeType, so point it at installed fonts.
+    if (qEnvironmentVariableIsEmpty("QT_QPA_FONTDIR")) {
+        qputenv("QT_QPA_FONTDIR", qgetenv("WINDIR") + "/Fonts");
+    }
+#endif
+    QApplication app(argc, argv);
+    if (QCoreApplication::arguments().contains(QStringLiteral("--arrow-outline-only"))) {
+        arrowOutlineEditsRenderAndRoundTrip();
+        return 0;
+    }
+
+    if (app.arguments().contains(QStringLiteral("--delete-text-only"))) {
+        deleteKeyRemovesEditedText();
+        enabledDeleteKeepsEditedTextAndItsOwner();
+        return 0;
+    }
+    retainedTextLayoutsPreservePixelsAndRespectInvalidationAndBudget();
+    naturalLayoutCacheTracksTypographyAndHasABoundedBudget();
+    documentCleanupReleasesTextDraftHistoryStorage();
+    documentClearRebuildsArrowLabelLayouts();
+    if (app.arguments().contains(QStringLiteral("--layout-cache-only")))
+        return 0;
+    arrowLabelRemeasuresAfterHostFontChange();
+    arrowRatioEditsRenderAndRoundTrip();
+    arrowOutlineEditsRenderAndRoundTrip();
+    arrowRatioFallbackRendering();
+    taperedShaftsRenderAndRoundTrip();
+    if (app.arguments().contains(QStringLiteral("--shafts-only")))
+        return 0;
+    indentedTriangleStyleRoundTrips();
+    escapeKeyCommitsEditedText();
+    deleteKeyRemovesEditedText();
+    enabledDeleteKeepsEditedTextAndItsOwner();
+    commandResolverPreservesTextAndEngineCommands();
+    widgetLifecycle();
+    arrowLabelWheelChangesFontSizeWhileSelecting();
+    wrappingAndFinalPointerPosition();
+    gapPreservesBackground();
+    arrowTypesDragLabelAlongPathAndEraseAsPair();
+    deleteAllElementsClearsDocumentAsOneUndoEntry();
+    sharedViewsAndLongOffscreenText();
+    boundShapeReroutesAndMeasuresLabel();
+    std::cout << "Arrow text tests passed\n";
+}

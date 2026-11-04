@@ -1,0 +1,982 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOW_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOW_H
+
+#include "snow_shot/presentation/screenshotclouduploadservice.h"
+#include "snow_shot/app/editionfeatures.h"
+
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+#include "snow_shot/presentation/screenshotclipboardcontent.h"
+#include "snow_shot/presentation/screenshotclipboardservice.h"
+#include "snow_shot/presentation/screenshotexportcoordinator.h"
+#include "snow_shot/presentation/screenshotimagesource.h"
+#include "snow_shot/presentation/screenshotpinnedimagesnapshot.h"
+#include "snow_shot/image/screenshotanimationsource.h"
+#include "snow_shot/presentation/screenshotwheelinput.h"
+#include "snow_shot/presentation/screenshotrecognitionresults.h"
+#include "snow_shot/presentation/screenshotrecognitionfileexport.h"
+#include "snow_shot/presentation/screenshotresultcompositor.h"
+#include "snow_shot/storage/pinnedwindowtypes.h"
+#include "snow_shot/storage/pinnedwindowplacement.h"
+#include "snow_shot/presentation/screenshottextannotation.h"
+#include "snow_shot/presentation/screenshottextannotationrenderer.h"
+
+#include <QByteArray>
+#include <QJsonObject>
+#include "snow_shot/presentation/mousereleaseactioncontroller.h"
+
+#include <QColor>
+#include <QDeadlineTimer>
+#include <QImage>
+#include <QMap>
+#include <QMetaObject>
+#include <QPoint>
+#include <QPointer>
+#include <QRect>
+#include <QRectF>
+#include <QSize>
+#include <QString>
+#include <QTransform>
+#include <QWidget>
+
+#include <memory>
+#include <optional>
+#include <functional>
+#include <vector>
+
+template <typename T> class QFutureWatcher;
+
+namespace adqt::widgets {
+class AdButton;
+class AdContextMenu;
+class AdModal;
+class AdSlider;
+class AdMessageHandle;
+} // namespace adqt::widgets
+namespace snow_shot::presentation {
+struct ImageEditingSource;
+class WindowShortcutManager;
+class PinnedWindowGroupManager;
+class PinnedWindowSelectionController;
+class PinnedWindowPlatform;
+class PinnedWindowStackingCoordinator;
+class LiveWindowSource;
+} // namespace snow_shot::presentation
+namespace snow_shot::platform {
+class PhysicalCursor;
+} // namespace snow_shot::platform
+
+class QAction;
+class QActionGroup;
+class QFrame;
+class QLabel;
+class CanvasStatusReadout;
+class QCloseEvent;
+class QContextMenuEvent;
+class QEvent;
+class QHideEvent;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDragLeaveEvent;
+class QDropEvent;
+class QKeyEvent;
+class QMouseEvent;
+class ScreenshotQuickTextAnnotationToolbar;
+class QMoveEvent;
+class QResizeEvent;
+class QScreen;
+class QShowEvent;
+class QTimer;
+class QVariantAnimation;
+class QWheelEvent;
+class SnowCanvasWidget;
+class ScreenshotCanvasRenderer;
+class ScreenshotOcrPresentation;
+class ScreenshotOcrRecognitionPort;
+class ScreenshotQrRecognitionPort;
+class SnowShotApiClient;
+class ScreenshotRecognitionWindow;
+class ScreenshotRecognitionSessionController;
+class ScreenshotPinnedEditController;
+class ScreenshotFloatingToolPaletteWindow;
+class ScreenshotExportArtifact;
+class ScreenshotExportSource;
+struct ScreenshotPinnedViewportExportSource;
+class ScreenshotPrintService;
+class ScreenshotAirDropService;
+struct ScreenshotExportImageResult;
+class ScreenshotPinnedDragExport;
+class ScreenshotAnimationPlayback;
+class ScreenshotPinnedHideToTopController;
+class ScreenshotPinnedControlsPresence;
+struct ScreenshotPinnedShakeGesture;
+class ScreenshotPinnedNativeGeometryController;
+class QTextDocument;
+class QAbstractButton;
+
+// GUI-thread MIME access. Native snapshots retain platform-specific image formats.
+class ScreenshotPinnedClipboard {
+  public:
+    virtual ~ScreenshotPinnedClipboard() = default;
+    virtual const QMimeData* mimeData() const = 0;
+    virtual std::optional<ScreenshotClipboardContentSnapshot> snapshot(qreal devicePixelRatio) = 0;
+    virtual void setMimeData(std::unique_ptr<QMimeData> data) = 0;
+};
+
+struct ScreenshotPinnedRecognitionProviders {
+    ScreenshotOcrRecognitionPort* recognition = nullptr;
+    ScreenshotQrRecognitionPort* qrRecognition = nullptr;
+    SnowShotApiClient* tableRecognition = nullptr;
+};
+
+class ScreenshotPinnedWindow final : public QWidget {
+    Q_OBJECT
+
+  public:
+    QRectF autoFilterSourceBounds() const {
+        return m_cropRect ? visibleCanvasRect() : m_backgroundCanvasRect;
+    }
+    void requestAutoFilterSource(std::function<void(QImage)> completion);
+    [[nodiscard]] const snow_shot::storage::PinnedSourceIdentity& sourceIdentity() const {
+        return m_sourceIdentity;
+    }
+    [[nodiscard]] bool sourcePinAvailable() const {
+        return m_sourcePinAvailable && !m_closing;
+    }
+    [[nodiscard]] QDateTime sourceCreatedUtc() const {
+        return m_createdUtc;
+    }
+    void shakeForAttention();
+    [[nodiscard]] bool isLiveWindow() const {
+        return m_liveSource != nullptr;
+    }
+    [[nodiscard]] bool liveFrameAvailable() const;
+    Q_INVOKABLE void closeLiveWindow();
+    struct OtherWindowsVisibilityResult {
+        enum class Action { Hide, Show };
+        bool success = false;
+        // Includes changing desired visibility for a pending presentation/restore.
+        bool changed = false;
+        Action action = Action::Hide;
+    };
+    enum class PresentationPolicy { Activate, PreserveFocus };
+    struct Config {
+        PresentationPolicy presentationPolicy = PresentationPolicy::Activate;
+        QPointer<snow_shot::presentation::PinnedWindowStackingCoordinator> stackingCoordinator;
+        snow_shot::storage::PinnedSourceIdentity sourceIdentity;
+        QDateTime sourceCreatedUtc;
+        snow_shot::storage::PinnedWindowPlacement placement;
+        // Content rectangle in platform units, without the permanent decoration margin.
+        // Native platform/controller rectangles include that margin.
+        QRect nativeGeometry;
+        QRectF canvasSourceRect;
+        QRectF contentCanvasRect;
+        QRectF surfaceCanvasRect;
+        ScreenshotResultStyle resultStyle;
+        std::optional<snow_shot::storage::PinnedBorderAppearance> borderAppearance;
+        // Known from a selection's shape or rendered text. Imported images
+        // with unknown opacity use their alpha capability conservatively.
+        std::optional<bool> checkerboardEnabled;
+        std::optional<bool> initialBorderVisible;
+        std::optional<bool> initialShadowVisible;
+        QSize initialWindowSize;
+        QString mouseWheelZoomMode = QStringLiteral("mouse_position");
+        ScreenshotImageSource imageSource;
+        std::shared_ptr<snow_shot::presentation::LiveWindowSource> liveSource;
+        std::shared_ptr<const ScreenshotAnimationSource> animationSource;
+        // Identity-transform sRGB view of imageSource; original pixels remain available.
+        QImage preparedDisplayImage;
+        QImage initialPreparedAnimationFrame;
+        QTransform initialPreparedAnimationTransform;
+        ScreenshotImageLoader imageLoader;
+        ScreenshotPrintService* printService = nullptr;
+        ScreenshotAirDropService* airDropService = nullptr;
+        QScreen* screen = nullptr;
+        bool enableEditing = true;
+        bool initialAnnotationMode = false;
+        bool automaticTextRecognition = !snow_shot::app::edition::isMini;
+        std::shared_ptr<QTextDocument> formattedTextDocument;
+        QString formattedPlainText;
+        qreal formattedTextDevicePixelRatio = 1.0;
+        ScreenshotClipboardOriginalContent originalClipboardContent;
+        ScreenshotOcrRecognitionPort* recognition = nullptr;
+        ScreenshotQrRecognitionPort* qrRecognition = nullptr;
+        SnowShotApiClient* tableRecognition = nullptr;
+        std::function<ScreenshotPinnedRecognitionProviders()> recognitionProvider;
+        ScreenshotRecognitionResults recognitionResults;
+        bool recognitionVisible = false;
+        bool translationVisible = false;
+        QString persistenceId;
+        bool restorePersistentState = false;
+        int persistedAnimationSpeedPercent = 100;
+        bool persistedAnimationPlaying = true;
+        double persistedFirstCreationTextDpi = 1.0;
+        int persistedOpacityPercent = 100;
+        int persistedClickThroughOpacityPercent = 50;
+        QSizeF persistedExactInitialWindowSize;
+        double persistedScalePercent = 0;
+        std::optional<QRectF> persistedCropRect;
+        QTransform persistedImageTransform;
+        int persistedQuarterTurns = 0;
+        bool persistedHideToTopMode = false;
+        QRect persistedHideToTopHandleNativeGeometry;
+        int persistedHideToTopAccentIndex = -1;
+        bool persistedThumbnailMode = false;
+        bool persistedClickThroughMode = false;
+        bool persistedLockedMode = false;
+        bool persistedAlwaysOnTop = true;
+        bool persistedShowBorder = true;
+        bool persistedShowShadow = false;
+        QRect persistedPreThumbnailNativeGeometry;
+        snow_shot::storage::PinnedWindowPlacement persistedPreThumbnailPlacement;
+        QByteArray persistedCanvasSession;
+        QByteArray persistedRecognitionResults;
+        QByteArray persistedTextAnnotations;
+        std::optional<snow_shot::storage::PinnedTextType> persistedTextType;
+        bool persistedRecognitionVisible = false;
+        bool persistedTranslationVisible = false;
+        std::function<void(const snow_shot::storage::PinnedWindowRecord&)> persistenceWriter;
+        std::function<void(const snow_shot::storage::PinnedWindowRecord&)>
+            replacementPersistenceWriter;
+        std::function<void(const QString&)> persistenceRemover;
+        std::function<void(const snow_shot::storage::PinnedWindowRecord&)> persistenceCloser;
+        std::function<bool(const snow_shot::storage::PinnedWindowRecord&)> persistenceHider;
+        std::function<void()> showAllWindowsRequested;
+        std::function<void(const QString&)> hideOtherWindowsRequested;
+        std::function<OtherWindowsVisibilityResult(const QString&)>
+            shakeToggleOtherWindowsRequested;
+        snow_shot::storage::PinnedWindowCreationSource creationSource =
+            snow_shot::storage::PinnedWindowCreationSource::Other;
+        snow_shot::presentation::PinnedWindowGroupManager* groupManager = nullptr;
+        QPointer<snow_shot::presentation::PinnedWindowSelectionController> selectionController;
+        QString groupId = QStringLiteral("default");
+        // Editable document imports seed the model without restoring window preferences.
+        QByteArray initialCanvasSession;
+        QByteArray initialCanvasHistory;
+        QString initialCanvasTool;
+    };
+
+    explicit ScreenshotPinnedWindow(QWidget* parent = nullptr);
+    ~ScreenshotPinnedWindow() override;
+
+    bool present(const Config& config, std::function<void(bool, QImage)> completion = {});
+    [[nodiscard]] QTransform contentReplacementTransform() const;
+    [[nodiscard]] bool animationTransformPending() const;
+    bool prewarm(QScreen* screen = nullptr);
+    QRect currentNativeGeometry() const;
+    [[nodiscard]] snow_shot::storage::PinnedWindowRecord persistenceSnapshot() const;
+    void requestRenderedImageSnapshot(std::function<void(ScreenshotPinnedImageSnapshot)> ready);
+    void checkpointStorage();
+    [[nodiscard]] ScreenshotPinnedImageSnapshot stitchingSnapshot();
+    [[nodiscard]] ScreenshotPinnedImageSnapshot splittingSnapshot();
+    void suspendStorageWrites();
+    void resumeStorageWrites(const QString& oldRoot, const QString& newRoot);
+    [[nodiscard]] QString persistenceId() const {
+        return m_persistenceId;
+    }
+    [[nodiscard]] QString groupId() const {
+        return m_groupId;
+    }
+    [[nodiscard]] QJsonObject automationState() const;
+    [[nodiscard]] bool blocksMemoryTrimming() const;
+    [[nodiscard]] bool automationUpdate(const QJsonObject& properties, QString* error);
+    [[nodiscard]] bool automationAction(const QString& action);
+    [[nodiscard]] QJsonObject automationEdit(const QString& action, const QJsonObject& payload,
+                                             QString* error);
+    [[nodiscard]] bool automationReplaceContent(ScreenshotClipboardContent content);
+    [[nodiscard]] std::shared_ptr<ScreenshotExportArtifact>
+    automationArtifact(bool original = false, bool viewport = false);
+    [[nodiscard]] std::unique_ptr<QMimeData> automationClipboardMimeData(bool original) const;
+    [[nodiscard]] std::optional<ScreenshotRecognitionFileSnapshot> automationFileSnapshot() const;
+    [[nodiscard]] ScreenshotRecognitionResults recognitionSnapshot() const;
+    [[nodiscard]] static ScreenshotRecognitionResults
+    decodeRecognitionSnapshot(const QByteArray& data);
+    [[nodiscard]] static ScreenshotRecognitionResults
+    transformedRecognitionSnapshot(ScreenshotRecognitionResults results, const QRectF& sourceRect,
+                                   const QSize& sourcePixels, const QTransform& imageTransform,
+                                   const QSize& transformedPixels, const QRectF& contentRect);
+    [[nodiscard]] ScreenshotClipboardOriginalContent automationOriginalContent() const;
+    void cancelAutomationRecognition();
+    [[nodiscard]] bool automationWorkflowBusy() const;
+
+    // nullopt means the surface does not belong to a pin. Owned surfaces route
+    // through the pin's command so its controls and persisted state stay in sync.
+    [[nodiscard]] static std::optional<bool> toggleAlwaysOnTopForSurface(WId id);
+
+  public slots:
+    void setAlwaysOnTop(bool enabled);
+    void setGroupId(const QString& id);
+    void closeForInactiveGroup();
+    Q_INVOKABLE bool requestHide();
+    void requestDestroy();
+    void showFromManagement();
+    void showPreservingStacking();
+    void cancelDeferredInactiveGroupClose();
+
+  public:
+    static void setRuntimeBorderColor(const QColor& color);
+    static void setRuntimeBorderActiveColor(const QColor& color);
+    static void setRuntimeLockedBorderColor(const QColor& color);
+    static void setRuntimeShadowColor(const QColor& color);
+    static void setRuntimeShadowActiveColor(const QColor& color);
+    static void setRuntimeLockedShadowColor(const QColor& color);
+    static void setRuntimeTrayEnabled(bool enabled);
+
+  signals:
+    void renderedImageSnapshotInvalidated();
+    void automationWorkflowStateChanged() const;
+    void showMainWindowRequested();
+    void splitRequested(const ScreenshotPinnedImageSnapshot& snapshot);
+    void imageEditingRequested(const QString& recordId);
+    void imageEditingSnapshotRequested(const snow_shot::presentation::ImageEditingSource& source);
+    void closingForPersistence(const snow_shot::storage::PinnedWindowRecord& snapshot,
+                               snow_shot::storage::PinnedWindowCloseIntent intent);
+
+  private:
+    friend class ScreenshotPinnedEditController;
+    friend class ScreenshotPinnedWindowTestAccess;
+    friend class ScreenshotLivePinnedWindowTestAccess;
+    friend class ScreenshotPinnedBatchSaveSession;
+    friend class PinnedWindowWindowsEvents;
+    bool m_destroying = false;
+    std::shared_ptr<snow_shot::presentation::LiveWindowSource> m_liveSource;
+    QWidget* m_liveStatusView = nullptr;
+    quint64 m_liveFrameGeneration = 0;
+    bool m_livePresentationUpdatePending = false;
+    bool m_liveNativePresentation = false;
+    bool m_liveSnapshotPending = false;
+    friend class snow_shot::presentation::PinnedWindowSelectionController;
+
+    enum class GeometryMutation {
+        Move,
+        Scale,
+        ImageTransform,
+        ImageTransformRollback,
+        Thumbnail,
+        Animation,
+        Attention,
+        HideToTop,
+        ContentReplacement,
+    };
+
+    bool event(QEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
+    void changeEvent(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
+    void contextMenuEvent(QContextMenuEvent* event) override;
+    void paintEvent(QPaintEvent* event) override;
+    void setWindowSelected(bool selected);
+    void updateSelectionIndicator();
+    void resizeEvent(QResizeEvent* event) override;
+    void moveEvent(QMoveEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dragMoveEvent(QDragMoveEvent* event) override;
+    void dragLeaveEvent(QDragLeaveEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
+    [[nodiscard]] bool acceptsDrop(const QDropEvent& event) const;
+    void setFileDragActive(bool active);
+
+    [[nodiscard]] QRectF visibleCanvasRect() const;
+    [[nodiscard]] QRectF exportVisibleCanvasRect() const;
+    [[nodiscard]] QSizeF scaleReferenceSize() const;
+    [[nodiscard]] bool cropSelectionAllowed() const;
+    [[nodiscard]] bool cropApplyAllowed() const;
+    bool beginCropSelection(const QPointF& nativePosition);
+    void updateCropSelection(const QPointF& nativePosition);
+    void endCropSelection(bool cancel, const QPoint& menuPosition = {});
+    bool handleCropPointer(QObject* watched, QEvent* event);
+    bool setCropCanvasRect(const QRectF& rect);
+    void applyCrop();
+    bool commitPreparedCrop(const QRect& pixels, QImage original, QImage transformed,
+                            const QTransform& transform,
+                            std::shared_ptr<const ScreenshotAnimationSource> animation,
+                            bool bakedStyle);
+    bool m_cropApplying = false;
+    [[nodiscard]] QRectF cropSelectionViewRect(const QWidget* target) const;
+    void paintCropSelection(QPainter& painter, const QWidget* target) const;
+    void updateCropPresentation();
+    QSizeF m_exactInitialWindowSize;
+    std::optional<QRectF> m_cropRect;
+    std::optional<QPointF> m_cropSelectionOrigin;
+    QPointF m_cropSelectionEnd;
+    QRect m_cropSelectionGeometry;
+    QRectF m_cropSelectionCanvas;
+    QRectF m_cropSelectionBounds;
+    qreal m_cropSelectionScale = 1;
+    bool m_cropContextSuppressed = false;
+    std::optional<QRectF> m_interactionCropRect;
+    QRectF m_interactionCropCanvas;
+    QRectF m_liveAppliedCrop;
+
+    void createUi();
+    void registerWindowShortcuts();
+    void reloadPinnedWindowShortcuts();
+    void refreshMenuShortcutDisplays();
+    void createContextMenu();
+    void resetContextMenuActions();
+    [[nodiscard]] bool liveCommandAllowed(const QString& command) const;
+    [[nodiscard]] QRectF liveSourceViewport() const;
+    bool initializeLivePresentation(QString* error = nullptr);
+    void scheduleLivePresentation();
+    bool synchronizeLivePresentation(QString* error = nullptr);
+    void updateLiveState();
+    void queueLiveFrame(QImage frame);
+    void installLiveFrame(QImage original);
+    [[nodiscard]] std::shared_ptr<ScreenshotExportArtifact>
+    liveViewportArtifact(bool applyWindowOpacity = true);
+    [[nodiscard]] ScreenshotExportSource liveExportSource(bool applyWindowOpacity = true);
+    void requestLiveSnapshot(std::function<void(QImage, QString)> completion,
+                             bool applyWindowOpacity = true);
+    void convertLiveToImage();
+    void splitLiveImage();
+    void editLiveImage();
+    void finishLiveConversion(QImage image);
+    void stopLiveSource();
+    void executeImageCommand(const QString& id);
+    void confirmDestroy();
+    void rebuildGroupMenu();
+    void refreshContextMenuIfVisible();
+    void refreshContextMenuForGroup(const QString& groupId);
+    void deleteIfInGroup(const QString& groupId);
+    void applyRuntimeBorderColor();
+    void updateShowMainInterfaceAction();
+    void retranslateUi();
+    [[nodiscard]] ScreenshotPinnedImageSnapshot processedImageSnapshot(bool finishEditing);
+    void refreshContextMenu();
+    void configureAnimationPlayback(int speedPercent = 100, bool playing = true);
+    void updateAnimationSuspension();
+    void executeAnimationCommand(const QString& id);
+    void acknowledgeAnimationPaint();
+    void restorePaintedAnimationTransform();
+    [[nodiscard]] bool animatedImage() const;
+    void showContextMenu(const QPoint& globalPosition);
+    void updateCanvasViewport();
+    void updateBorderOutline();
+    void updateChildStackingOrder();
+    void updateControlsGeometry();
+    void refreshControlsPointerPresence();
+    void setControlsPointerInside(bool inside);
+    void updateControlsVisibility();
+    void destroyCanvas();
+    void hideForClosing();
+    using MaterializationCallback = std::function<void(bool)>;
+    using PresentationCompletion = std::function<void(bool, QImage)>;
+    void requestMaterializedImage(MaterializationCallback callback);
+    void finishMaterializedImage(ScreenshotExportTaskResult result);
+    void requestFirstContentFramePaint();
+    void handleFirstContentFramePainted();
+    void finishMaterializationCallbacks(bool succeeded);
+    bool installMaterializedImage(QImage image);
+    void configureRecognitionTarget();
+    void scheduleDeferredPresentationSetup();
+    void finishDeferredPresentationSetup(quint64 generation);
+    void finishPresentation(bool succeeded, QImage image = {});
+    void commitClipboardPayload(ScreenshotClipboardPayload payload,
+                                ScreenshotClipboardService::PublicationId publicationId);
+    void ensureEditController();
+    void configureEditToolbar(ScreenshotFloatingToolPaletteWindow* toolbarWindow);
+    void setEditMode(bool enabled);
+    void stopRecognition();
+    void configureRecognitionSession();
+    ScreenshotRecognitionWindow* ensureRecognitionContent();
+    void synchronizeHiddenTextSelection();
+    void synchronizeTextAnnotations(bool bindEmptySource = false);
+    void synchronizeQuickTextAnnotationToolbar();
+    void destroyQuickTextAnnotationToolbar();
+    void clearTextAnnotations();
+    void textAnnotationsChanged();
+    [[nodiscard]] ScreenshotTextAnnotationRenderSnapshot textAnnotationSnapshot() const;
+    [[nodiscard]] bool copyHiddenTextSelection();
+    void updateOcrPresentation();
+    void updateRecognitionContentGeometry();
+    void updateOriginalImagePreviewVisibility();
+    void beginAuxiliaryWindowInteraction();
+    void endAuxiliaryWindowInteraction();
+    void activateRecognitionMode(int mode, bool showToolbar = true);
+    void toggleTextRecognitionResults();
+    void initializeTextType(const Config& config);
+    void setTextType(snow_shot::storage::PinnedTextType type);
+    void activateSelectedTextResults();
+    void completePendingTextTranslation();
+    void ensureRecognitionProviders();
+    void deactivateRecognition();
+    void updateRecognitionToolbarState();
+    [[nodiscard]] bool recognitionModeAvailable(int mode) const;
+    void activateTextTranslation();
+    void handleTextEditingRequested();
+    void handleTextTranslationRequested();
+    void handleTextResetRequested();
+    void handleTextSettingsRequested();
+    void handleTextFormattingRequested(const QString& value);
+    void handleTextPunctuationRequested(const QString& value);
+    void handleTableMergeRequested();
+    void handleTableSplitRequested();
+    void handleTableResetRequested();
+    QPointF canvasPositionForViewPosition(const QPointF& position) const;
+    void copyEditToolbarContent();
+    void copyCurrentViewport();
+    struct CopyOutputOptions;
+    void copyCurrentViewportWithOptions(CopyOutputOptions output);
+    void copyOriginalContent();
+    void copyOriginalImage(ScreenshotClipboardService::PublicationId publicationId);
+    void loadImageFile();
+    void loadClipboardContent();
+    void requestContentReplacement(QStringList paths,
+                                   std::optional<ScreenshotClipboardContentSnapshot> snapshot = {});
+    bool replaceContent(ScreenshotClipboardContent content, bool* rejectedByLock = nullptr);
+    void finishContentReplacement(ScreenshotClipboardContent content, quint64 generation);
+    void finishQueuedContentReplacement();
+    void cancelContentReplacement();
+    void printContent();
+    void airDropContent();
+    void requestVisibleContentSnapshot(std::function<void(ScreenshotExportImageResult)> ready);
+    void saveAsFile();
+    void saveDisplayedPinnedWindows();
+    void saveDisplayedPinnedWindowsToDirectory(const QString& directory);
+    void savePinnedWindows(const QList<QPointer<ScreenshotPinnedWindow>>& targets, bool selected);
+    void copyPinnedWindowFiles(const QList<QPointer<ScreenshotPinnedWindow>>& targets);
+    void stitchDisplayedPinnedWindows();
+    [[nodiscard]] static bool batchSavePending();
+    void uploadToCloud();
+    void cancelCloudUpload();
+    [[nodiscard]] std::shared_ptr<ScreenshotExportArtifact> fileSaveArtifact();
+    enum class ViewportExportMode { Complete, RecognitionBackground };
+    [[nodiscard]] ScreenshotPinnedImageSnapshot
+    renderedImageSnapshot(ViewportExportMode mode = ViewportExportMode::Complete);
+    [[nodiscard]] std::shared_ptr<ScreenshotExportArtifact>
+    viewportArtifact(ViewportExportMode mode = ViewportExportMode::Complete);
+    [[nodiscard]] ScreenshotExportSource
+    cachedPinnedExportSource(ScreenshotPinnedViewportExportSource request,
+                             ScreenshotPinnedImageSnapshot& snapshot);
+    [[nodiscard]] std::optional<QByteArray> exportDocumentSnapshot() const;
+    void quickSave();
+    void invalidatePendingCopy();
+    [[nodiscard]] ScreenshotClipboardService::PublicationId beginCopyRequest();
+    void copyRenderedImage(std::shared_ptr<ScreenshotExportArtifact> artifact);
+    void copyRenderedImage(std::shared_ptr<ScreenshotExportArtifact> artifact,
+                           const CopyOutputOptions& output,
+                           ScreenshotClipboardService::PublicationId publicationId);
+    void applyImageOperation(const QTransform& operation, int quarterTurnDelta = 0);
+    void resetImageTransform();
+    void applyImageTransform(const QTransform& transform, int quarterTurns);
+    bool commitImageTransformGeometry(const QTransform& transform, int quarterTurns);
+    void commitPreparedAnimationTransform(const QTransform& transform, int quarterTurns,
+                                          QImage original, QImage transformed, int frameIndex,
+                                          quint64 token);
+    [[nodiscard]] QRect imageTransformGeometry(int quarterTurns) const;
+    void rebuildTransformedImage();
+    void applyScale(int percent);
+    void applyWheelScale(double percent, const QPointF& nativeCursor);
+    void applyWheelScaleSteps(int steps, const QPointF& nativeCursor);
+    bool handleOpacityWheel(QObject* watched, QWheelEvent* event);
+    bool handleScaleWheel(QObject* watched, QWheelEvent* event);
+    QSize orientedInitialWindowSize() const;
+    QRect logicalRectForNativeRect(const QRect& nativeRect) const;
+    void setEffectiveScale(double percent, bool showReadout);
+    void showScaleReadout();
+    void showOpacityReadout();
+    void showLockedReadout();
+    void setLockedMode(bool enabled);
+    [[nodiscard]] bool rejectLockedGeometryChange(const QRect& target);
+    void scheduleNativeScaleAdoption();
+    void adoptSettledNativeScale();
+    void setOpacityPercent(int percent);
+    void schedulePersistence();
+    void persistNow();
+    void removePersistence();
+    [[nodiscard]] snow_shot::storage::PinnedWindowRecord persistenceRecord() const;
+    void restorePersistentState(const Config& config);
+    [[nodiscard]] QRect intendedNativeGeometry() const;
+    [[nodiscard]] QRect authoritativeNativeGeometry() const;
+    [[nodiscard]] QRect currentContentNativeGeometry() const;
+    [[nodiscard]] QRect authoritativeContentNativeGeometry() const;
+    [[nodiscard]] QRectF contentViewRect() const;
+    [[nodiscard]] QRect contentWidgetRect() const;
+    [[nodiscard]] std::optional<int> resizeHandleAt(const QPointF& position) const;
+    [[nodiscard]] QRect observedNativeGeometry() const;
+    void toggleHideToTop();
+    void exitHideToTop();
+    [[nodiscard]] bool hideToTopActive() const;
+    [[nodiscard]] bool setClickThroughMode(bool enabled);
+    void toggleClickThrough();
+    void toggleAlwaysOnTop();
+    void setShowBorder(bool enabled);
+    void toggleShowBorder();
+    void setShowShadow(bool enabled);
+    void toggleShowShadow();
+    [[nodiscard]] bool ensureClickThroughExitButton();
+    [[nodiscard]] bool updateClickThroughExitButtonGeometry();
+    void setClickThroughScreen(QScreen* screen);
+    void shutdownClickThrough();
+    void applyEffectiveOpacity();
+    void setClickThroughOpacityPercent(int percent);
+    void updateThumbnailPresentation();
+    void setThumbnailMode(bool enabled, bool animate = true);
+    void restoreFromThumbnailImmediately();
+    void animateGeometryTo(const QRect& nativeTarget);
+    void stopAttentionShake();
+    bool applyWindowGeometry(const QRect& nativeGeometry, GeometryMutation mutation);
+    bool applyAndVerifyNativeGeometry(const QRect& target);
+    void commitNativeGeometry(bool adoptScale = false);
+    void handleNativeGeometryObservation();
+    bool finishNativeGeometryInteraction();
+    bool reconcilePassiveNativeGeometry();
+    bool restoreCommittedNativeGeometry(bool closeOnFailure = true);
+    [[nodiscard]] QList<QPointer<ScreenshotPinnedWindow>> displayedPinnedWindows() const;
+    void selectAllDisplayedPinnedWindows();
+    void createBatchActionsMenu(adqt::widgets::AdContextMenu* menu);
+    void refreshBatchActionsMenu();
+    void showAllPinnedWindows();
+    void hideOtherPinnedWindows();
+    void closeOtherPinnedWindows();
+    void closeAllPinnedWindows();
+    void requestUserClose();
+    void closeAfterConfirmation();
+    [[nodiscard]] std::optional<QPoint> physicalCursorPosition() const;
+    bool cursorMovementEnabled() const;
+    bool moveCursorOnePixel(const QPoint& direction);
+    bool startWindowMove();
+    void finishWindowMove(bool cancel = false);
+    void beginWindowShake(const QPointF& pointer, bool physical);
+    void sampleWindowShake(const QPointF& pointer);
+    void updateWindowShake(const QPointF& pointer, qint64 timeMs);
+    void endWindowShake(bool cancel);
+    [[nodiscard]] OtherWindowsVisibilityResult toggleOtherWindowsForShake();
+    void showShakeMessage(bool restart = true);
+    void setShowWithoutActivating(bool enabled);
+    bool windowDragEnabled() const;
+    bool windowDragEligible() const;
+    bool windowDragEligibleAt(const QPoint& position,
+                              Qt::KeyboardModifiers modifiers = Qt::NoModifier) const;
+    bool windowDragEnabledAt(const QPoint& position,
+                             Qt::KeyboardModifiers modifiers = Qt::NoModifier) const;
+    bool windowMoveEligibleForPointer(const QPoint& position,
+                                      Qt::KeyboardModifiers modifiers) const;
+    bool windowMoveEnabledForPointer(const QPoint& position, Qt::KeyboardModifiers modifiers) const;
+    bool handleDoubleClick(const QPoint& position);
+    bool handleMiddleClick(const QPoint& position);
+    void updateWindowDragCursor(const QPoint& position,
+                                Qt::KeyboardModifiers modifiers = Qt::NoModifier);
+    void setWindowDragCursor(Qt::CursorShape shape);
+    void clearWindowDragCursor();
+    bool nativeTrackSizeConstraintsEnabled() const;
+    bool interactiveResizingEnabled() const;
+    QPointF windowPositionForEvent(QObject* watched, const QPointF& position) const;
+    QPointF nativePositionForWindowPosition(const QPointF& position) const;
+    QPoint globalPositionForNativePosition(const QPoint& position) const;
+    bool isControlsPanelPosition(const QPoint& position) const;
+    void refreshColorSwatch();
+    void updateColorSwatchControls();
+    std::array<QAbstractButton*, 3> m_colorSwatchButtons{};
+    std::array<QRectF, 3> m_colorSwatchCopyRects{};
+
+    void reconcilePlatformEnvironment(bool layoutChanged = false);
+    bool handleControlledPointer(QObject* watched, QEvent* event);
+    bool handleLockedPointer(QObject* watched, QEvent* event);
+    bool handleExportDrag(QObject* watched, QEvent* event);
+    bool exportDragEnabledAt(const QPoint& position,
+                             Qt::KeyboardModifiers modifiers = Qt::NoModifier) const;
+    void beginExportDrag();
+    void cancelExportDrag();
+    std::unique_ptr<ScreenshotPinnedDragExport> m_dragExport;
+    std::optional<QPoint> m_exportDragOrigin;
+    bool m_exportDragSpontaneous = false;
+    bool m_exportDragAborted = false;
+    bool m_exportDragPreparing = false;
+    quint64 m_exportDragGeneration = 0;
+    void resetPinnedGestures();
+    bool handlePinnedGesture(QObject* watched, QEvent* event);
+    bool beginControlledInteraction(const QPointF& desktopPosition,
+                                    std::optional<int> resizeHandle);
+    void updateControlledInteraction(const QPointF& desktopPosition);
+    void endControlledInteraction(bool cancel);
+    std::unique_ptr<snow_shot::presentation::PinnedWindowPlatform> m_platform;
+    std::unique_ptr<ScreenshotPinnedClipboard> m_clipboard;
+    bool m_platformReconciliationPending = false;
+    bool m_platformRecoveryPending = false;
+    bool m_platformApplying = false;
+    bool m_nativeRestoreInFlight = false;
+    std::optional<snow_shot::storage::PinnedWindowPlacement> m_platformPlacement;
+    std::optional<snow_shot::storage::PinnedWindowPlacement> m_interactionPlacement;
+    QPointF m_interactionPointer;
+    QPointF m_interactionAnchor;
+    std::optional<int> m_interactionResizeHandle;
+    int m_interactionEffectiveResizeHandle = 0;
+    std::optional<QPoint> m_interactionNativePointer;
+    QPointer<QWidget> m_interactionGrabber;
+    snow_shot::presentation::WheelStepAccumulator m_scrollWheelSteps;
+    double m_scrollOpacity = 0;
+    bool m_pinchActive = false;
+    bool m_controlledEscapeRelease = false;
+    SnowCanvasRuntime m_runtime;
+    quint64 m_automationRevision = 0;
+    std::unique_ptr<snow_shot::presentation::WindowShortcutManager> m_shortcutManager;
+    snow_shot::presentation::MouseReleaseActionController m_mouseReleaseAction;
+    std::unique_ptr<snow_shot::platform::PhysicalCursor> m_physicalCursor;
+    QMap<QString, quint64> m_pinnedShortcutBindings;
+    QHash<QString, QString> m_pinnedShortcutDisplays;
+    std::shared_ptr<ScreenshotExportArtifact> m_exportArtifact;
+    ScreenshotClipboardService::PublicationId m_copyPublicationId = 0;
+    struct PinnedRenderCache;
+    std::unique_ptr<PinnedRenderCache> m_pinnedRenderCache;
+    std::shared_ptr<ScreenshotExportArtifact> m_nativeExportArtifact;
+    QPointer<ScreenshotPrintService> m_printService;
+    bool m_printPending = false;
+    QPointer<ScreenshotAirDropService> m_airDropService;
+    bool m_airDropPending = false;
+    ScreenshotExportJobHandle m_materializationJob;
+    ScreenshotExportJobHandle m_contentReplacementJob;
+    quint64 m_contentReplacementGeneration = 0;
+    ScreenshotExportJobHandle m_fileSaveJob;
+    std::shared_ptr<ScreenshotExportArtifact> m_quickSaveArtifact;
+    bool m_quickSavePending = false;
+    QPointer<ScreenshotCloudUploadJob> m_cloudUploadJob;
+    bool m_cloudUploadPreparing = false;
+    ScreenshotClipboardCommitHandle m_clipboardCommit;
+    std::vector<MaterializationCallback> m_materializationCallbacks;
+    PresentationCompletion m_presentationCompletion;
+    ScreenshotImageLoader m_imageLoader;
+    bool m_materializationLoading = false;
+    bool m_firstContentFramePublished = false;
+    bool m_firstFramePaintPending = false;
+    bool m_firstFramePaintSucceeded = true;
+    bool m_deferFirstFrameNativeFlush = false;
+    bool m_completePresentationAfterFirstFrame = false;
+    bool m_recognitionTargetReady = false;
+    bool m_deferredPresentationSetupScheduled = false;
+    bool m_initialAnnotationMode = false;
+    quint64 m_presentationGeneration = 0;
+    SnowCanvasWidget* m_canvas = nullptr;
+    std::unique_ptr<ScreenshotCanvasRenderer> m_screenshotRenderer;
+    QFrame* m_borderFrame = nullptr;
+    QFrame* m_controlsPanel = nullptr;
+    CanvasStatusReadout* m_scaleLabel = nullptr;
+    QTimer* m_nativeScaleSettleTimer = nullptr;
+    ScreenshotPinnedEditController* m_editController = nullptr;
+    adqt::widgets::AdButton* m_editButton = nullptr;
+    adqt::widgets::AdButton* m_closeButton = nullptr;
+    std::unique_ptr<adqt::widgets::AdButton> m_clickThroughMoveButton;
+    std::optional<QPoint> m_clickThroughDragOrigin;
+    QRect m_clickThroughDragGeometry;
+    std::unique_ptr<adqt::widgets::AdButton> m_clickThroughExitButton;
+    std::unique_ptr<QWidget> m_clickThroughOpacityEditor;
+    adqt::widgets::AdSlider* m_clickThroughOpacitySlider = nullptr;
+    QPointer<adqt::widgets::AdContextMenu> m_contextMenu;
+    QPointer<adqt::widgets::AdModal> m_destroyConfirmation;
+    QPointer<adqt::widgets::AdModal> m_closeConfirmation;
+    QPointer<adqt::widgets::AdContextMenu> m_groupMenu;
+    QPointer<adqt::widgets::AdContextMenu> m_batchActionsMenu;
+    QPointer<QAction> m_groupMenuAction;
+    QPointer<QAction> m_ocrAction;
+    QPointer<QAction> m_textTypeAction;
+    QPointer<QActionGroup> m_textTypeActions;
+    QPointer<QAction> m_applyCropAction;
+    QPointer<QAction> m_drawingAction;
+    QPointer<QAction> m_animationToggleAction;
+    QPointer<QAction> m_animationSpeedAction;
+    QPointer<QAction> m_animationDecreaseAction;
+    QPointer<QAction> m_animationIncreaseAction;
+    QPointer<QAction> m_thumbnailAction;
+    QPointer<QAction> m_hideToTopAction;
+    QPointer<QAction> m_clickThroughAction;
+    QPointer<QAction> m_lockAction;
+    QPointer<QAction> m_alwaysOnTopAction;
+    QPointer<QAction> m_showBorderAction;
+    QPointer<QAction> m_showShadowAction;
+    QPointer<QAction> m_showMainInterfaceAction;
+    QPointer<QAction> m_closeAction;
+    QPointer<QAction> m_loadContentAction;
+    QPointer<QAction> m_splitImageAction;
+    QPointer<QAction> m_imageEditingAction;
+    QPointer<QActionGroup> m_opacityActions;
+    QPointer<QActionGroup> m_scaleActions;
+    QPointer<QAction> m_scaleMenuAction;
+    QPointer<QAction> m_opacityReadoutAction;
+    QPointer<QAction> m_scaleReadoutAction;
+    std::unique_ptr<ScreenshotPinnedHideToTopController> m_hideToTop;
+    QVariantAnimation* m_geometryAnimation = nullptr;
+    QVariantAnimation* m_attentionAnimation = nullptr;
+    QRect m_attentionOrigin;
+    std::optional<snow_shot::storage::PinnedWindowPlacement> m_attentionPlacement;
+    bool m_attentionPending = false;
+    bool m_sourcePinAvailable = false;
+    snow_shot::storage::PinnedSourceIdentity m_sourceIdentity;
+    QRectF m_canvasSourceRect;
+    QRectF m_backgroundCanvasRect;
+    QRectF m_resultSurfaceCanvasRect;
+    ScreenshotResultStyle m_resultStyle;
+    std::optional<snow_shot::storage::PinnedBorderAppearance> m_borderAppearance;
+    ScreenshotImageSource m_imageSource;
+    QImage m_originalImage;
+    QImage m_transformedImage;
+    std::shared_ptr<const ScreenshotAnimationSource> m_animationSource;
+    std::unique_ptr<ScreenshotAnimationPlayback> m_animationPlayback;
+    QPointer<QScreen> m_animationScreen;
+    QMetaObject::Connection m_animationRefreshRateConnection;
+    QImage m_pendingAnimationOriginal;
+    QImage m_pendingAnimationTransformed;
+    quint64 m_pendingAnimationToken = 0;
+    struct AnimationTransformSnapshot {
+        QRectF backgroundRect;
+        QRectF surfaceRect;
+        QTransform transform;
+        QRect contentGeometry;
+        int quarterTurns = 0;
+    };
+    std::optional<AnimationTransformSnapshot> m_animationTransformSnapshot;
+    std::optional<QTransform> m_requestedAnimationTransform;
+    int m_requestedAnimationQuarterTurns = 0;
+    std::optional<ScreenshotClipboardContent> m_queuedAnimationReplacement;
+    int m_animationSpeedPercent = 100;
+    bool m_animationPlaying = true;
+    bool m_staticEditingEnabled = true;
+    bool m_staticAutomaticTextRecognition = true;
+    std::optional<bool> m_checkerboardEnabled;
+    QTransform m_imageTransform;
+    std::shared_ptr<ScreenshotOcrPresentation> m_originalOcrPresentation;
+    std::shared_ptr<ScreenshotOcrPresentation> m_displayOcrPresentation;
+    std::shared_ptr<QTextDocument> m_formattedTextDocument;
+    QString m_formattedPlainText;
+    qreal m_formattedTextDevicePixelRatio = 1.0;
+    ScreenshotClipboardOriginalContent m_originalClipboardContent;
+    QPointer<ScreenshotOcrRecognitionPort> m_recognition;
+#if SNOW_SHOT_ENABLE_QR_RECOGNITION
+    QPointer<ScreenshotQrRecognitionPort> m_qrRecognition;
+#endif
+#if SNOW_SHOT_ENABLE_TABLE_RECOGNITION || SNOW_SHOT_ENABLE_LATEX_RECOGNITION ||                    \
+    SNOW_SHOT_ENABLE_IMAGE_CONVERSION || SNOW_SHOT_ENABLE_TEXT_TRANSLATION
+    QPointer<SnowShotApiClient> m_tableRecognition;
+#endif
+    std::function<ScreenshotPinnedRecognitionProviders()> m_recognitionProvider;
+    ScreenshotRecognitionResults m_recognitionResults;
+    ScreenshotTextAnnotationDocument m_textAnnotations;
+    ScreenshotTextAnnotationRenderer m_textAnnotationRenderer;
+    ScreenshotTextAnnotationRenderSnapshot m_textAnnotationSnapshot;
+    ScreenshotQuickTextAnnotationToolbar* m_quickTextAnnotationToolbar = nullptr;
+    QVector<ScreenshotTextSelectionRange> m_quickTextAnnotationSelection;
+    quint64 m_quickTextAnnotationSelectionRevision = 0;
+    quint64 m_quickTextAnnotationModelRevision = ~quint64(0);
+    bool m_quickTextAnnotationSelectionSuperseded = false;
+    bool m_synchronizingQuickTextAnnotation = false;
+    const void* m_hiddenTextSelectionSource = nullptr;
+    bool m_hiddenTextSelectionFormatted = false;
+    QTransform m_hiddenTextSelectionSourceTransform;
+    quint64 m_textAnnotationRenderedRevision = ~quint64(0);
+    QTransform m_textAnnotationRenderedTransform;
+    const ScreenshotOcrPresentation* m_textAnnotationSourceOcr = nullptr;
+    const QTextDocument* m_textAnnotationSourceDocument = nullptr;
+    int m_textAnnotationSourceDocumentRevision = -1;
+    bool m_textAnnotationSourceAvailable = false;
+    QPointer<QTextDocument> m_textAnnotationObservedDocument;
+    QMetaObject::Connection m_textAnnotationDocumentConnection;
+    ScreenshotRecognitionWindow* m_recognitionContent = nullptr;
+    std::optional<bool> m_recognitionEmptyViewportVisibility;
+    // Scale is 100 * current content width / oriented initial content width.
+    // Content units are logical pixels on macOS and physical pixels on Windows;
+    // source image density and formatted-text DPR affect rendering only.
+    QSize m_initialWindowSize;
+    QSize m_originalPixelSize;
+    QRect m_preThumbnailNativeGeometry;
+    snow_shot::storage::PinnedWindowPlacement m_preThumbnailPlacement;
+    std::unique_ptr<ScreenshotPinnedNativeGeometryController> m_nativeGeometryController;
+    std::function<void(const snow_shot::storage::PinnedWindowRecord&)> m_persistenceWriter;
+    std::function<void(const snow_shot::storage::PinnedWindowRecord&)>
+        m_replacementPersistenceWriter;
+    std::function<void(const QString&)> m_persistenceRemover;
+    std::function<void(const snow_shot::storage::PinnedWindowRecord&)> m_persistenceCloser;
+    std::function<bool(const snow_shot::storage::PinnedWindowRecord&)> m_persistenceHider;
+    std::function<void()> m_showAllWindowsRequested;
+    std::function<void(const QString&)> m_hideOtherWindowsRequested;
+    std::function<OtherWindowsVisibilityResult(const QString&)> m_shakeToggleOtherWindowsRequested;
+    std::unique_ptr<ScreenshotPinnedShakeGesture> m_shakeGesture;
+    QPointer<adqt::widgets::AdMessageHandle> m_shakeMessage;
+    OtherWindowsVisibilityResult::Action m_shakeMessageAction =
+        OtherWindowsVisibilityResult::Action::Hide;
+    QDeadlineTimer m_shakeMessageDeadline{0};
+    snow_shot::storage::PinnedWindowCreationSource m_creationSource =
+        snow_shot::storage::PinnedWindowCreationSource::Other;
+    QDateTime m_createdUtc;
+    snow_shot::storage::PinnedWindowCloseIntent m_closeIntent =
+        snow_shot::storage::PinnedWindowCloseIntent::Preserve;
+    QPointer<snow_shot::presentation::PinnedWindowGroupManager> m_groupManager;
+    QPointer<snow_shot::presentation::PinnedWindowStackingCoordinator> m_stackingCoordinator;
+    QPointer<snow_shot::presentation::PinnedWindowSelectionController> m_selectionController;
+    adqt::widgets::AdButton* m_selectionIndicator = nullptr;
+    bool m_windowSelected = false;
+    bool m_selectionGeometryActive = false;
+    bool m_selectionPersistenceDirty = false;
+    std::unique_ptr<ScreenshotRecognitionSessionController> m_recognitionSession;
+    double m_viewportZoom = 1.0;
+    QPointF m_viewportCenter;
+    bool m_synchronizingViewportGeometry = false;
+    // Derived value: 100 * expanded native width / oriented initial window
+    // width. In thumbnail mode the saved expansion rectangle supplies that
+    // width. Never carries an externally computed or DPI-translated percent.
+    double m_scalePercent = 100.0;
+    QString m_mouseWheelZoomMode = QStringLiteral("mouse_position");
+    int m_wheelAngleRemainder = 0;
+    int m_opacityWheelAngleRemainder = 0;
+    int m_opacityPercent = 100;
+    int m_clickThroughOpacityPercent = 50;
+    int m_quarterTurns = 0;
+    bool m_ocrReady = false;
+    bool m_ocrSupported = false;
+    bool m_formattedTextAvailable = false;
+    bool m_ocrMode = false;
+    bool m_hiddenTextSelection = false;
+    bool m_initialRecognitionVisible = false;
+    bool m_initialTranslationVisible = false;
+    snow_shot::storage::PinnedTextType m_textType =
+        snow_shot::storage::PinnedTextType::RecognitionResults;
+    bool m_translateAfterRecognition = false;
+    bool m_preferCachedTranslation = false;
+    bool m_automaticTextRecognition = !snow_shot::app::edition::isMini;
+    bool m_automationRecognition = false;
+    bool m_editingEnabled = true;
+    bool m_thumbnailMode = false;
+    bool m_clickThroughActive = false;
+    bool m_lockedMode = false;
+    bool m_alwaysOnTop = true;
+    bool m_showBorder = true;
+    bool m_showShadow = false;
+#if defined(Q_OS_WIN) || defined(_WIN32)
+    unsigned int m_windowsNativeDpi = 0;
+#endif
+    bool m_geometryAnimating = false;
+    bool m_preserveScaleForSettledGeometry = false;
+    bool m_presented = false;
+    bool m_closing = false;
+    std::optional<snow_shot::storage::PinnedWindowRecord> m_closeSnapshot;
+    bool m_closeStatePersisted = false;
+    bool m_deferredInactiveGroupClose = false;
+    bool m_inactiveGroupClosing = false;
+    QString m_persistenceId;
+    QString m_groupId = QStringLiteral("default");
+    bool m_persistenceEnabled = true;
+    bool m_storageWritesSuspended = false;
+    bool m_persistenceRemovalRequested = false;
+    qreal m_firstCreationTextDpi = 1.0;
+    QTimer* m_persistenceTimer = nullptr;
+    bool m_systemSizingActive = false;
+    bool m_windowDragActive = false;
+    bool m_auxiliaryWindowInteractionActive = false;
+    bool m_windowDragCursorSet = false;
+    QPointer<QScreen> m_clickThroughScreen;
+    QMetaObject::Connection m_clickThroughScreenGeometryConnection;
+    QMetaObject::Connection m_clickThroughScreenDpiConnection;
+    std::unique_ptr<ScreenshotPinnedControlsPresence> m_pointerPresence;
+    bool m_nonClientPointerInside = false;
+    bool m_nonClientTrackingPending = false;
+    bool m_windowActive = false;
+    bool m_fileDragActive = false;
+    bool m_passiveGeometryReconciliationActive = false;
+    bool m_forwardingNativeExposeEvent = false;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOW_H

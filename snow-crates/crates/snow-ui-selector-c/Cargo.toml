@@ -1,0 +1,17 @@
+[package]
+name = "snow-ui-selector-c"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+snow-core = { path = "../snow-core" }
+snow-ui-selector = { path = "../snow-ui-selector" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+] }

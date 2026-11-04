@@ -1,0 +1,824 @@
+#include "snow_shot/storage/configurationarchive.h"
+#include "snow_shot/storage/configurationschema.h"
+#include "snow_shot/storage/configurationstore.h"
+#include "snow_shot/platform/minizippath.h"
+#include "snow_shot/customaimodelconfiguration.h"
+
+#include <QCoreApplication>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStringList>
+#include <QTemporaryDir>
+
+#include <mz.h>
+#include <mz_strm.h>
+#include <mz_zip.h>
+#include <mz_zip_rw.h>
+
+#include <iostream>
+
+namespace storage = snow_shot::storage;
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+void writeZip(const QString& path, const QMap<QString, QByteArray>& entries) {
+    void* writer = mz_zip_writer_create();
+    require(writer != nullptr, "test zip writer could not be created");
+    require(mz_zip_writer_open_file(writer, snow_shot::platform::minizipPath(path).constData(), 0,
+                                    0) == MZ_OK,
+            "test zip could not be opened");
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
+        const QByteArray name = it.key().toUtf8();
+        mz_zip_file info{};
+        info.filename = name.constData();
+        info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+        require(mz_zip_writer_add_buffer(writer, const_cast<char*>(it.value().constData()),
+                                         static_cast<int32_t>(it.value().size()), &info) == MZ_OK,
+                "test zip entry could not be written");
+    }
+    require(mz_zip_writer_close(writer) == MZ_OK, "test zip must finalize successfully");
+    mz_zip_writer_delete(&writer);
+}
+
+QJsonObject readZipConfiguration(const QString& path) {
+    void* reader = mz_zip_reader_create();
+    require(reader != nullptr, "test zip reader could not be created");
+    require(mz_zip_reader_open_file(reader, snow_shot::platform::minizipPath(path).constData()) ==
+                    MZ_OK &&
+                mz_zip_reader_locate_entry(reader, "config.json", 0) == MZ_OK,
+            "the exported configuration entry must be readable");
+    const int32_t length = mz_zip_reader_entry_save_buffer_length(reader);
+    require(length > 0, "the exported configuration entry must not be empty");
+    QByteArray payload(length, '\0');
+    require(mz_zip_reader_entry_save_buffer(reader, payload.data(), length) == MZ_OK,
+            "the exported configuration bytes must be readable");
+    mz_zip_reader_delete(&reader);
+    const QJsonDocument document = QJsonDocument::fromJson(payload);
+    require(document.isObject(), "the exported configuration must be a JSON object");
+    return document.object();
+}
+
+QByteArray manifestBytes(int schemaVersion, const QByteArray& format = "snow-shot-configuration",
+                         int formatVersion = 1) {
+    return QJsonDocument(QJsonObject{{QStringLiteral("format"), QString::fromUtf8(format)},
+                                     {QStringLiteral("format_version"), formatVersion},
+                                     {QStringLiteral("schema_version"), schemaVersion}})
+        .toJson(QJsonDocument::Compact);
+}
+
+QByteArray configurationBytes(const QJsonObject& configuration) {
+    return QJsonDocument(configuration).toJson(QJsonDocument::Compact);
+}
+
+QJsonObject sampleConfiguration() {
+    QJsonObject configuration;
+    const auto& entries = storage::ConfigurationSchema::entries();
+    int added = 0;
+    for (const storage::ConfigurationSchemaEntry& entry : entries) {
+        if (added >= 12) {
+            break;
+        }
+        configuration.insert(entry.key, entry.defaultValue);
+        ++added;
+    }
+    return configuration;
+}
+
+void roundTripPreservesValuesAndSchemaVersion(const QTemporaryDir& temporary) {
+    const QJsonObject configuration = sampleConfiguration();
+    QMap<QString, QJsonValue> values;
+    for (auto it = configuration.begin(); it != configuration.end(); ++it) {
+        values.insert(it.key(), it.value());
+    }
+    values.insert(QStringLiteral("storage/schema_version"),
+                  storage::ConfigurationStore::currentSchemaVersion());
+
+    const QString path = temporary.filePath(QStringLiteral("config-export.zip"));
+    require(storage::ConfigurationArchive::write(
+                path, values, storage::ConfigurationStore::currentSchemaVersion())
+                .isEmpty(),
+            "writing a configuration archive must succeed");
+
+    const storage::ConfigurationArchiveReadResult read = storage::ConfigurationArchive::read(path);
+    require(read.isValid(), "reading a just-written archive must succeed");
+    require(read.schemaVersion == storage::ConfigurationStore::currentSchemaVersion(),
+            "the schema version must round trip");
+    require(!read.values.contains(QStringLiteral("storage/schema_version")),
+            "the store-managed schema version must not be importable");
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        if (it.key() == QStringLiteral("storage/schema_version")) {
+            continue;
+        }
+        require(read.values.value(it.key()) == it.value(),
+                "exported values must survive the round trip");
+    }
+}
+
+void exportsOmitLocalDirectories(const QTemporaryDir& temporary) {
+    const QStringList directoryKeys{QStringLiteral("screenshot/image_save_directory"),
+                                    QStringLiteral("screen_recording/video_save_directory"),
+                                    QStringLiteral("screenshot/last_manual_save_directory")};
+    const QMap<QString, QJsonValue> portableValues{
+        {QStringLiteral("drawing/remember_last_used_tool"), true},
+        {QStringLiteral("interface/skin_path"), QStringLiteral("D:/shared/skin.json")},
+        {QStringLiteral("screenshot/save_path_shortcuts"),
+         QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("Shared")},
+                                {QStringLiteral("path"), QStringLiteral("D:/shared/images")}}}}};
+    for (int variant = 0; variant < 3; ++variant) {
+        auto values = portableValues;
+        for (const auto& key : directoryKeys) {
+            values.insert(key, variant == 0
+                                   ? storage::ConfigurationSchema::defaultValue(key)
+                                   : QJsonValue(variant == 1 ? QStringLiteral("D:/custom/output")
+                                                             : QString()));
+        }
+        for (const bool redactCredentials : {false, true}) {
+            const QString path = temporary.filePath(
+                QStringLiteral("local-directories-%1-%2.zip").arg(variant).arg(redactCredentials));
+            require(storage::ConfigurationArchive::write(
+                        path, values, storage::ConfigurationStore::currentSchemaVersion(),
+                        redactCredentials)
+                        .isEmpty(),
+                    "directory fixtures must export with either credential policy");
+            const QJsonObject configuration = readZipConfiguration(path);
+            for (const auto& key : directoryKeys) {
+                require(!configuration.contains(key),
+                        "raw exported JSON must omit default, custom, and empty directories");
+            }
+            for (auto it = portableValues.cbegin(); it != portableValues.cend(); ++it) {
+                require(configuration.value(it.key()) == it.value(),
+                        "exports must retain ordinary settings, skin paths, and path shortcuts");
+            }
+            require(storage::ConfigurationArchive::read(path).isValid(),
+                    "an archive without local directories must remain readable");
+        }
+    }
+}
+
+void importsPreserveOmittedDirectories(const QTemporaryDir& temporary) {
+    const QString imageKey = QStringLiteral("screenshot/image_save_directory");
+    const QString videoKey = QStringLiteral("screen_recording/video_save_directory");
+    const QString manualKey = QStringLiteral("screenshot/last_manual_save_directory");
+    const QString archivedKey = QStringLiteral("drawing/remember_last_used_tool");
+    const QString replacedKey = QStringLiteral("screenshot/show_save_result");
+    const QMap<QString, QJsonValue> receivingDirectories{
+        {imageKey, QStringLiteral("D:/receiving/images")},
+        {videoKey, QStringLiteral("D:/receiving/videos")},
+        {manualKey, QString()}};
+    const QString file = temporary.filePath(QStringLiteral("receiving-directories.json"));
+    storage::ConfigurationStore store(file, true, true, 60000);
+    require(store.setValues(receivingDirectories) &&
+                store.setValue(replacedKey, !store.defaultValue(replacedKey).toBool()),
+            "the receiving configuration must accept directory and ordinary fixtures");
+    const QString path = temporary.filePath(QStringLiteral("omitted-directories.zip"));
+    require(storage::ConfigurationArchive::write(
+                path, {{archivedKey, true}}, storage::ConfigurationStore::currentSchemaVersion())
+                .isEmpty(),
+            "an archive omitting local directories must be writable");
+    auto imported = storage::ConfigurationArchive::read(path);
+    require(imported.isValid(), "the directory import fixture must be readable");
+    imported.preserveOmittedDirectories(store.snapshot());
+    require(store.applySnapshot(imported.values, imported.schemaVersion) &&
+                store.flushNow().success,
+            "an archive preserving directories must apply and persist successfully");
+    storage::ConfigurationStore restored(file, true, true, 60000);
+    for (auto it = receivingDirectories.cbegin(); it != receivingDirectories.cend(); ++it) {
+        require(
+            store.value(it.key()) == it.value() && restored.value(it.key()) == it.value(),
+            "omitted local directories, including empty values, must survive import and reload");
+    }
+    require(store.value(archivedKey).toBool() &&
+                store.value(replacedKey) == store.defaultValue(replacedKey),
+            "directory preservation must not preserve other missing settings");
+
+    for (const bool empty : {false, true}) {
+        require(store.setValues(receivingDirectories), "legacy import directories must be seeded");
+        const QJsonObject configuration{
+            {archivedKey, true},
+            {imageKey, empty ? QString() : QStringLiteral("D:/legacy/images")},
+            {manualKey, empty ? QString() : QStringLiteral("D:/legacy/manual")}};
+        const QString legacyPath =
+            temporary.filePath(QStringLiteral("explicit-directories-%1.zip").arg(empty));
+        writeZip(legacyPath, {{QStringLiteral("manifest.json"),
+                               manifestBytes(storage::ConfigurationStore::currentSchemaVersion())},
+                              {QStringLiteral("config.json"), configurationBytes(configuration)}});
+        auto legacy = storage::ConfigurationArchive::read(legacyPath);
+        require(legacy.isValid(), "older archives with explicit directories must remain readable");
+        legacy.preserveOmittedDirectories(store.snapshot());
+        require(store.applySnapshot(legacy.values, legacy.schemaVersion) &&
+                    store.flushNow().success,
+                "older archives with explicit directories must apply and persist");
+        storage::ConfigurationStore reloaded(file, true, true, 60000);
+        for (auto it = receivingDirectories.cbegin(); it != receivingDirectories.cend(); ++it) {
+            const auto expected =
+                configuration.contains(it.key()) ? configuration.value(it.key()) : it.value();
+            require(
+                store.value(it.key()) == expected && reloaded.value(it.key()) == expected,
+                "explicit legacy directories, including empty values, must override local ones");
+        }
+    }
+}
+
+void autoSaveAfterExecutionArchivesMigrateAndRoundTrip(const QTemporaryDir& temporary) {
+    const QString key = QStringLiteral("screenshot/auto_save_after_execution_actions");
+    const QString legacyKey = QStringLiteral("screenshot/auto_save_after_copy");
+    const QJsonArray legacyActions{
+        QStringLiteral("copy_screenshot"), QStringLiteral("copy_scrolling_screenshot"),
+        QStringLiteral("copy_pinned_image"), QStringLiteral("capture_focused_window"),
+        QStringLiteral("capture_current_monitor")};
+    struct Case {
+        QJsonValue legacy;
+        QJsonValue current;
+        QJsonArray expected;
+    };
+    const QVector<Case> cases{
+        {true, QJsonValue(QJsonValue::Undefined), legacyActions},
+        {false, QJsonValue(QJsonValue::Undefined), {}},
+        {QStringLiteral("invalid"), QJsonValue(QJsonValue::Undefined), {}},
+        {QJsonValue(QJsonValue::Undefined), QJsonValue(QJsonValue::Undefined), {}},
+        {true, QJsonArray{}, {}},
+        {true, QJsonArray{QStringLiteral("pin_to_screen")},
+         QJsonArray{QStringLiteral("pin_to_screen")}},
+        {true, true, {}},
+    };
+    for (qsizetype index = 0; index < cases.size(); ++index) {
+        const Case& testCase = cases.at(index);
+        QJsonObject configuration{
+            {QStringLiteral("screenshot/copy_image_file_to_clipboard"), true}};
+        if (!testCase.legacy.isUndefined()) {
+            configuration.insert(legacyKey, testCase.legacy);
+        }
+        if (!testCase.current.isUndefined()) {
+            configuration.insert(key, testCase.current);
+        }
+        const QString archive =
+            temporary.filePath(QStringLiteral("legacy-auto-save-%1.zip").arg(index));
+        writeZip(archive, {{QStringLiteral("manifest.json"), manifestBytes(3)},
+                           {QStringLiteral("config.json"), configurationBytes(configuration)}});
+        const auto imported = storage::ConfigurationArchive::read(archive);
+        require(imported.isValid() && !imported.values.contains(legacyKey),
+                "legacy archives must migrate before unknown schema keys are discarded");
+        const QString path = temporary.filePath(QStringLiteral("auto-save-%1.json").arg(index));
+        storage::ConfigurationStore store(path, true, true, 60000);
+        require(
+            store.applySnapshot(imported.values, imported.schemaVersion) &&
+                store.value(key) == testCase.expected &&
+                store.value(QStringLiteral("screenshot/copy_image_file_to_clipboard")).toBool() &&
+                store.flushNow().success,
+            "archive import must preserve old scenarios and honor present new preferences");
+        storage::ConfigurationStore restored(path, true, true, 60000);
+        require(restored.value(key) == testCase.expected &&
+                    !restored.snapshot().contains(legacyKey),
+                "migrated archive preferences must persist with only the new key");
+    }
+
+    const QString snapshotPath = temporary.filePath(QStringLiteral("auto-save-snapshot.json"));
+    storage::ConfigurationStore snapshot(snapshotPath, true, true, 60000);
+    require(
+        snapshot.applySnapshot({{legacyKey, true}}, 3) && snapshot.value(key) == legacyActions &&
+            snapshot.applySnapshot({{legacyKey, true}, {key, QJsonArray{}}}, 3) &&
+            snapshot.value(key) == QJsonArray{} &&
+            snapshot.applySnapshot({{legacyKey, false}}, 3) && snapshot.value(key) == QJsonArray{},
+        "snapshot replacement must migrate legacy booleans and preserve explicit emptiness");
+    QJsonArray allActions = legacyActions;
+    allActions.push_back(QStringLiteral("pin_to_screen"));
+    require(snapshot.setValue(key, allActions),
+            "all six scenarios must be stored for archive export");
+    const QString exported = temporary.filePath(QStringLiteral("auto-save-round-trip.zip"));
+    require(storage::ConfigurationArchive::write(exported, snapshot.snapshot(),
+                                                 storage::ConfigurationSchema::currentVersion())
+                .isEmpty(),
+            "selected execution scenarios must export successfully");
+    const auto imported = storage::ConfigurationArchive::read(exported);
+    require(imported.isValid() && imported.values.value(key) == allActions &&
+                !imported.values.contains(legacyKey),
+            "all six independent scenarios must survive archive round trip");
+}
+
+void recognitionModelPreferencesSurviveRestart(const QTemporaryDir& temporary) {
+    const QString tableKey = QStringLiteral("screenshot_table/model");
+    const QString latexKey = QStringLiteral("screenshot_latex/model");
+    const QString path = temporary.filePath(QStringLiteral("recognition-models.json"));
+    const QString custom = QStringLiteral("custom:11111111-1111-4111-8111-111111111111");
+    {
+        storage::ConfigurationStore store(path, true, true);
+        require(store.value(tableKey).toString() == QStringLiteral("dedicated") &&
+                    store.value(latexKey).toString() == QStringLiteral("dedicated"),
+                "Table and LaTeX both default to dedicated recognition models");
+        require(store.setValue(tableKey, custom) &&
+                    store.value(latexKey).toString() == QStringLiteral("dedicated"),
+                "saving a table model must preserve the LaTeX model preference");
+        require(store.setValue(latexKey, QStringLiteral("snow-shot:vision")),
+                "LaTeX supports an independently saved vision model");
+        for (const QString& invalid :
+             {QString(), QStringLiteral("bad\nmodel"), QStringLiteral("model with spaces"),
+              QString(257, u'x'), QString(QChar(0))}) {
+            require(!store.setValue(tableKey, invalid) &&
+                        store.value(tableKey).toString() == custom,
+                    "invalid recognition identities must not overwrite a saved selection");
+        }
+        require(store.flushNow().success, "recognition preferences flush to storage");
+    }
+    storage::ConfigurationStore restored(path, true, true);
+    require(restored.value(tableKey).toString() == custom &&
+                restored.value(latexKey).toString() == QStringLiteral("snow-shot:vision"),
+            "both recognition preferences survive a fresh configuration store");
+    const QString archive = temporary.filePath(QStringLiteral("recognition-models.zip"));
+    require(storage::ConfigurationArchive::write(
+                archive, restored.snapshot(), storage::ConfigurationStore::currentSchemaVersion())
+                .isEmpty(),
+            "recognition preferences export through configuration archives");
+    const auto imported = storage::ConfigurationArchive::read(archive);
+    require(imported.isValid() && imported.values.value(tableKey).toString() == custom &&
+                imported.values.value(latexKey).toString() == QStringLiteral("snow-shot:vision"),
+            "configuration archives retain both model identities");
+}
+
+void readRejectsInvalidArchives(const QTemporaryDir& temporary) {
+    const QString garbage = temporary.filePath(QStringLiteral("garbage.zip"));
+    {
+        QFile file(garbage);
+        require(file.open(QIODevice::WriteOnly), "garbage fixture could not be written");
+        file.write("this is not a zip archive");
+    }
+    require(!storage::ConfigurationArchive::read(garbage).isValid(),
+            "random bytes must not read as a configuration archive");
+    require(!storage::ConfigurationArchive::read(temporary.filePath(QStringLiteral("missing.zip")))
+                 .isValid(),
+            "a missing file must not read as a configuration archive");
+
+    const QJsonObject configuration = sampleConfiguration();
+    const QString withoutManifest = temporary.filePath(QStringLiteral("no-manifest.zip"));
+    writeZip(withoutManifest, {{QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(withoutManifest).isValid(),
+            "an archive without a manifest must be rejected");
+
+    const QString withoutConfiguration = temporary.filePath(QStringLiteral("no-config.zip"));
+    writeZip(withoutConfiguration,
+             {{QStringLiteral("manifest.json"),
+               manifestBytes(storage::ConfigurationStore::currentSchemaVersion())}});
+    require(!storage::ConfigurationArchive::read(withoutConfiguration).isValid(),
+            "an archive without configuration values must be rejected");
+
+    const QString foreignFormat = temporary.filePath(QStringLiteral("foreign.zip"));
+    writeZip(foreignFormat, {{QStringLiteral("manifest.json"),
+                              manifestBytes(storage::ConfigurationStore::currentSchemaVersion(),
+                                            "some-other-format")},
+                             {QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(foreignFormat).isValid(),
+            "an archive with a foreign format marker must be rejected");
+
+    const QString futureFormat = temporary.filePath(QStringLiteral("future-format.zip"));
+    writeZip(futureFormat, {{QStringLiteral("manifest.json"),
+                             manifestBytes(storage::ConfigurationStore::currentSchemaVersion(),
+                                           "snow-shot-configuration", 2)},
+                            {QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(futureFormat).isValid(),
+            "an archive with a newer archive format must be rejected");
+
+    const QString fractionalFormat = temporary.filePath(QStringLiteral("fractional-format.zip"));
+    writeZip(fractionalFormat,
+             {{QStringLiteral("manifest.json"),
+               QJsonDocument(QJsonObject{{QStringLiteral("format"),
+                                          QStringLiteral("snow-shot-configuration")},
+                                         {QStringLiteral("format_version"), 1.5},
+                                         {QStringLiteral("schema_version"),
+                                          storage::ConfigurationStore::currentSchemaVersion()}})
+                   .toJson(QJsonDocument::Compact)},
+              {QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(fractionalFormat).isValid(),
+            "a non-integer archive format version must be rejected");
+
+    const QString missingFormat = temporary.filePath(QStringLiteral("missing-format.zip"));
+    writeZip(missingFormat,
+             {{QStringLiteral("manifest.json"),
+               QJsonDocument(QJsonObject{{QStringLiteral("format"),
+                                          QStringLiteral("snow-shot-configuration")},
+                                         {QStringLiteral("schema_version"),
+                                          storage::ConfigurationStore::currentSchemaVersion()}})
+                   .toJson(QJsonDocument::Compact)},
+              {QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(missingFormat).isValid(),
+            "a manifest without a format version must be rejected");
+
+    const QString futureSchema = temporary.filePath(QStringLiteral("future-schema.zip"));
+    writeZip(futureSchema,
+             {{QStringLiteral("manifest.json"),
+               manifestBytes(storage::ConfigurationStore::currentSchemaVersion() + 1)},
+              {QStringLiteral("config.json"), configurationBytes(configuration)}});
+    require(!storage::ConfigurationArchive::read(futureSchema).isValid(),
+            "an archive from a newer application version must be rejected");
+
+    const QString invalidJson = temporary.filePath(QStringLiteral("invalid-json.zip"));
+    writeZip(invalidJson, {{QStringLiteral("manifest.json"),
+                            manifestBytes(storage::ConfigurationStore::currentSchemaVersion())},
+                           {QStringLiteral("config.json"), QByteArray("{ not json")}});
+    require(!storage::ConfigurationArchive::read(invalidJson).isValid(),
+            "malformed configuration JSON must be rejected");
+
+    const QString unknownKeys = temporary.filePath(QStringLiteral("unknown-keys.zip"));
+    writeZip(unknownKeys,
+             {{QStringLiteral("manifest.json"),
+               manifestBytes(storage::ConfigurationStore::currentSchemaVersion())},
+              {QStringLiteral("config.json"),
+               configurationBytes(QJsonObject{{QStringLiteral("not/a_key"), 1},
+                                              {QStringLiteral("also/unknown"), true}})}});
+    require(!storage::ConfigurationArchive::read(unknownKeys).isValid(),
+            "an archive without any compatible settings must be rejected");
+
+    const QString oversized = temporary.filePath(QStringLiteral("oversized.zip"));
+    writeZip(oversized, {{QStringLiteral("manifest.json"),
+                          manifestBytes(storage::ConfigurationStore::currentSchemaVersion())},
+                         {QStringLiteral("config.json"), QByteArray(9 * 1024 * 1024, ' ')}});
+    require(!storage::ConfigurationArchive::read(oversized).isValid(),
+            "an oversized configuration entry must be rejected");
+
+    QMap<QString, QByteArray> manyEntries;
+    manyEntries.insert(QStringLiteral("manifest.json"),
+                       manifestBytes(storage::ConfigurationStore::currentSchemaVersion()));
+    for (int index = 0; index < 20; ++index) {
+        manyEntries.insert(QStringLiteral("extra-%1.bin").arg(index), QByteArray("x"));
+    }
+    const QString tooManyEntries = temporary.filePath(QStringLiteral("too-many-entries.zip"));
+    writeZip(tooManyEntries, manyEntries);
+    require(!storage::ConfigurationArchive::read(tooManyEntries).isValid(),
+            "archives with unexpected entries must be rejected");
+}
+
+void writeRejectsUnwritableTargets(const QTemporaryDir& temporary) {
+    const QString blocker = temporary.filePath(QStringLiteral("blocker"));
+    {
+        QFile file(blocker);
+        require(file.open(QIODevice::WriteOnly), "blocker fixture could not be written");
+    }
+    const QString nested = QDir(blocker).filePath(QStringLiteral("nested/export.zip"));
+    require(!storage::ConfigurationArchive::write(nested, {}, 1).isEmpty(),
+            "writing under a regular file must fail");
+    require(!storage::ConfigurationArchive::write(QString(), {}, 1).isEmpty(),
+            "writing without a target path must fail");
+
+    const QString directoryTarget = temporary.filePath(QStringLiteral("directory.zip"));
+    require(QDir().mkpath(directoryTarget), "a directory target must be available");
+    require(!storage::ConfigurationArchive::write(directoryTarget, {}, 1).isEmpty(),
+            "publishing an archive over a directory must fail");
+    require(QFileInfo(directoryTarget).isDir(), "failed publication must preserve the directory");
+    require(QDir(temporary.path())
+                .entryList({QStringLiteral("*.part")}, QDir::Files | QDir::Hidden)
+                .isEmpty(),
+            "failed publication must remove temporary archives");
+}
+
+void unicodePathRoundTrip(const QString& name) {
+    QTemporaryDir unicodeDirectory(QDir::tempPath() + QStringLiteral("/snow-%1-XXXXXX").arg(name));
+    require(unicodeDirectory.isValid(), "a unicode temporary directory must be available");
+    const QJsonObject configuration = sampleConfiguration();
+    QMap<QString, QJsonValue> values;
+    for (auto it = configuration.begin(); it != configuration.end(); ++it) {
+        values.insert(it.key(), it.value());
+    }
+
+    const QString path = QDir(unicodeDirectory.path()).filePath(name + QStringLiteral(".zip"));
+    require(storage::ConfigurationArchive::write(
+                path, values, storage::ConfigurationStore::currentSchemaVersion())
+                .isEmpty(),
+            "writing a configuration archive under a unicode path must succeed");
+    require(QFileInfo::exists(path), "the archive must exist at the exact requested Unicode path");
+    const storage::ConfigurationArchiveReadResult read = storage::ConfigurationArchive::read(path);
+    require(read.isValid(), "reading a configuration archive from a unicode path must succeed");
+    require(read.schemaVersion == storage::ConfigurationStore::currentSchemaVersion(),
+            "unicode-path archives must preserve the schema version");
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        if (it.key() == QStringLiteral("storage/schema_version")) {
+            continue;
+        }
+        require(read.values.value(it.key()) == it.value(),
+                "unicode-path archives must preserve values");
+    }
+}
+
+void unicodePathsRoundTrip() {
+    // Test both ANSI-representable characters whose bytes differ from UTF-8 and
+    // characters outside legacy code pages, in both directory and archive names.
+    unicodePathRoundTrip(QStringLiteral("caf\u00e9"));
+    unicodePathRoundTrip(QStringLiteral("配置归档-\U0001F9CA"));
+    unicodePathRoundTrip(QStringLiteral("cafe\u0301"));
+}
+
+void applySnapshotReplacesConfiguration(const QTemporaryDir& temporary) {
+    const QString file = temporary.filePath(QStringLiteral("snapshot-config.json"));
+    storage::ConfigurationStore store(file, true, true);
+    require(store.isWritable(), "a writable store must accept snapshots");
+
+    QString archivedKey;
+    QJsonValue archivedValue;
+    QString revertedKey;
+    QJsonValue revertedValue;
+    for (const storage::ConfigurationSchemaEntry& entry : storage::ConfigurationSchema::entries()) {
+        if (entry.key == QStringLiteral("storage/schema_version") ||
+            entry.valueKind != storage::ConfigurationValueKind::Boolean) {
+            continue;
+        }
+        const QJsonValue flipped = !entry.defaultValue.toBool();
+        if (archivedKey.isEmpty()) {
+            archivedKey = entry.key;
+            archivedValue = flipped;
+        } else {
+            revertedKey = entry.key;
+            revertedValue = flipped;
+            break;
+        }
+    }
+    require(!archivedKey.isEmpty() && !revertedKey.isEmpty(),
+            "the schema must expose at least two boolean settings");
+    require(store.setValue(archivedKey, archivedValue) &&
+                store.setValue(revertedKey, revertedValue),
+            "seeding the store must succeed");
+
+    QStringList changedKeys;
+    QObject::connect(
+        &store, &storage::ConfigurationStore::valueChanged,
+        [&changedKeys](const QString& key, const QJsonValue&) { changedKeys.push_back(key); });
+
+    require(store.applySnapshot({{archivedKey, archivedValue}}),
+            "applying a snapshot must succeed");
+    require(store.value(archivedKey) == archivedValue, "snapshot values must be applied");
+    require(store.value(revertedKey) == storage::ConfigurationSchema::defaultValue(revertedKey),
+            "keys absent from the snapshot must revert to schema defaults");
+    require(changedKeys == QStringList{revertedKey},
+            "only settings that actually differ must announce changes");
+
+    require(store.applySnapshot({{archivedKey, QStringLiteral("not a boolean")}}),
+            "invalid snapshot values must be tolerated");
+    require(store.value(archivedKey) == storage::ConfigurationSchema::defaultValue(archivedKey),
+            "invalid snapshot values must revert to schema defaults");
+
+    require(store.applySnapshot(
+                {{QStringLiteral("not/a_key"), 1}, {QStringLiteral("storage/schema_version"), 99}}),
+            "unknown snapshot keys must be ignored");
+    require(store.value(QStringLiteral("storage/schema_version")).toInt() ==
+                storage::ConfigurationStore::currentSchemaVersion(),
+            "the store-managed schema version must be preserved");
+
+    require(!store.applySnapshot({{archivedKey, archivedValue}},
+                                 storage::ConfigurationSchema::currentVersion() + 1),
+            "snapshots from a newer schema must be rejected");
+    require(store.value(archivedKey) == storage::ConfigurationSchema::defaultValue(archivedKey),
+            "rejecting a future schema must leave the current configuration unchanged");
+
+    require(store.setValue(archivedKey, archivedValue) &&
+                store.setValue(revertedKey, revertedValue),
+            "reseeding after a future-schema rejection must succeed");
+    require(store.applySnapshot({{archivedKey, archivedValue}}, 1),
+            "older schema snapshots must be accepted");
+    require(store.value(archivedKey) == archivedValue, "older snapshots must apply carried values");
+    require(store.value(revertedKey) == storage::ConfigurationSchema::defaultValue(revertedKey),
+            "older snapshots must restore unspecified keys");
+    require(store.value(QStringLiteral("storage/schema_version")).toInt() ==
+                storage::ConfigurationStore::currentSchemaVersion(),
+            "older snapshots must upgrade to the current schema version");
+
+    require(store.flushNow().success, "flushing an applied snapshot must succeed");
+    storage::ConfigurationStore reloaded(file, true, true);
+    require(reloaded.value(archivedKey) == archivedValue &&
+                reloaded.value(revertedKey) ==
+                    storage::ConfigurationSchema::defaultValue(revertedKey) &&
+                reloaded.value(QStringLiteral("storage/schema_version")).toInt() ==
+                    storage::ConfigurationStore::currentSchemaVersion(),
+            "applied snapshots must persist across reloads");
+
+    storage::ConfigurationStore readOnly(
+        temporary.filePath(QStringLiteral("snapshot-read-only.json")), true, false);
+    require(!readOnly.applySnapshot({{archivedKey, archivedValue}}),
+            "read-only stores must reject snapshots");
+}
+
+void pinnedShortcutDefaultsRespectExclusiveContexts(const QTemporaryDir& temporary) {
+    const QString drawingKey = QStringLiteral("pin_to_screen_shortcuts/drawing_mode");
+    const QString playbackKey = QStringLiteral("pin_to_screen_shortcuts/toggle_playback");
+    const auto space = storage::ConfigurationSchema::defaultValue(drawingKey);
+    require(!space.toArray().isEmpty() &&
+                storage::ConfigurationSchema::defaultValue(playbackKey) == space,
+            "static drawing and animation playback must share their contextual default");
+    struct Case {
+        QMap<QString, QJsonValue> values;
+        bool drawing = true;
+        bool playback = true;
+    };
+    const QList<Case> cases{
+        {{}, true, true},
+        {{{drawingKey, space}}, true, true},
+        {{{playbackKey, space}}, true, true},
+        {{{QStringLiteral("pin_to_screen_shortcuts/resize_window"), space}}, false, true},
+        {{{QStringLiteral("pin_to_screen_shortcuts/next_frame"), space}}, true, false},
+        {{{QStringLiteral("pin_to_screen_shortcuts/print"), space}}, false, false},
+    };
+    for (qsizetype index = 0; index < cases.size(); ++index) {
+        const auto& testCase = cases.at(index);
+        storage::ConfigurationStore store(
+            temporary.filePath(QStringLiteral("pinned-shortcut-snapshot-%1.json").arg(index)), true,
+            true, 60000);
+        require(store.applySnapshot(testCase.values) &&
+                    store.value(drawingKey) == (testCase.drawing ? space : QJsonArray{}) &&
+                    store.value(playbackKey) == (testCase.playback ? space : QJsonArray{}),
+                "snapshot defaults must preserve exclusive contexts and yield to real conflicts");
+    }
+
+    auto document = storage::ConfigurationSchema::completeDefaultDocument();
+    auto pinned = document.value(QStringLiteral("pin_to_screen_shortcuts")).toObject();
+    pinned.remove(QStringLiteral("toggle_playback"));
+    document.insert(QStringLiteral("pin_to_screen_shortcuts"), pinned);
+    const QString path = temporary.filePath(QStringLiteral("pinned-playback-upgrade.json"));
+    QFile file(path);
+    require(file.open(QIODevice::WriteOnly), "open the legacy pinned shortcut fixture");
+    const auto bytes = QJsonDocument(document).toJson();
+    require(file.write(bytes) == bytes.size(), "write the legacy pinned shortcut fixture");
+    file.close();
+    {
+        storage::ConfigurationStore upgraded(path, true, true, 60000);
+        require(upgraded.value(drawingKey) == space && upgraded.value(playbackKey) == space &&
+                    upgraded.flushNow().success,
+                "adding animation shortcuts must preserve Space in the existing drawing context");
+    }
+    storage::ConfigurationStore reloaded(path, true, true, 60000);
+    require(reloaded.value(drawingKey) == space && reloaded.value(playbackKey) == space &&
+                !reloaded.isDirty(),
+            "contextual shortcut migration must remain stable after reload");
+}
+
+void selectionAspectRatioArchivesPreservePreferences(const QTemporaryDir& temporary) {
+    const QString ratioKey = QStringLiteral("screenshot_selection/aspect_ratio");
+    const QString lockKey = QStringLiteral("screenshot_selection/lock_aspect_ratio");
+    const QString archivePath = temporary.filePath(QStringLiteral("aspect-ratio.zip"));
+    const QString configurationPath =
+        temporary.filePath(QStringLiteral("aspect-ratio-import.json"));
+    const QMap<QString, QJsonValue> preferences{{ratioKey, QStringLiteral("3:4")}, {lockKey, true}};
+    require(storage::ConfigurationArchive::write(
+                archivePath, preferences, storage::ConfigurationStore::currentSchemaVersion())
+                .isEmpty(),
+            "aspect ratio preferences must export successfully");
+    const auto imported = storage::ConfigurationArchive::read(archivePath);
+    require(imported.isValid() && imported.values == preferences,
+            "a nondefault aspect ratio and lock must round trip through configuration archives");
+    storage::ConfigurationStore store(configurationPath, true, true, 60000);
+    require(store.applySnapshot(imported.values, imported.schemaVersion) &&
+                store.value(ratioKey) == QStringLiteral("3:4") && store.value(lockKey).toBool(),
+            "importing a ratio archive must apply both preferences");
+    require(
+        store.applySnapshot({{lockKey, true}}, 1) &&
+            store.value(ratioKey) == QStringLiteral("free") && store.value(lockKey).toBool(),
+        "legacy archives must retain custom aspect locking while defaulting the preset to Free");
+    require(store.applySnapshot({{ratioKey, QStringLiteral("16:10")}, {lockKey, true}}) &&
+                store.value(ratioKey) == QStringLiteral("free") && store.value(lockKey).toBool(),
+            "invalid archived presets must reset to Free without discarding a valid lock");
+    require(store.applySnapshot({}) && store.value(ratioKey) == QStringLiteral("free") &&
+                !store.value(lockKey).toBool(),
+            "archives omitting selection preferences must restore both defaults");
+}
+} // namespace
+
+void mcpCredentialRedactionAndRevision(const QTemporaryDir& temporary) {
+    const QString key = QStringLiteral("api_configuration/custom_models");
+    const snow_shot::CustomAiModelConfiguration model{
+        QStringLiteral("11111111-1111-4111-8111-111111111111"),
+        QStringLiteral("Example"),
+        QStringLiteral("https://example.invalid/v1"),
+        QStringLiteral("private-test-secret"),
+        QStringLiteral("model"),
+        false,
+        false,
+        4,
+        QStringLiteral("doubao")};
+    const QMap<QString, QJsonValue> original{{key, snow_shot::customAiModelsToJson({model})}};
+    const auto path = temporary.filePath(QStringLiteral("mcp-redacted.zip"));
+    require(storage::ConfigurationArchive::write(
+                path, original, storage::ConfigurationStore::currentSchemaVersion(), true)
+                .isEmpty(),
+            "MCP archive export must succeed with redacted credentials");
+    auto imported = storage::ConfigurationArchive::read(path);
+    require(imported.isValid() && imported.redactedCredentialIds.contains(model.id),
+            "redacted archives identify omitted credentials");
+    require(snow_shot::customAiModelsFromJson(imported.values.value(key)).first().provider ==
+                model.provider,
+            "redacted archives retain the custom model provider");
+    require(snow_shot::customAiModelsFromJson(imported.values.value(key)).first().apiKey.isEmpty(),
+            "an MCP archive must not contain the stored credential");
+    imported.preserveOmittedCredentials(original);
+    require(snow_shot::customAiModelsFromJson(imported.values.value(key)).first().apiKey ==
+                model.apiKey,
+            "redacted import must preserve matching existing credentials");
+    auto unrelated = model;
+    unrelated.baseUrl = QStringLiteral("https://other.invalid/v1");
+    imported = storage::ConfigurationArchive::read(path);
+    imported.preserveOmittedCredentials({{key, snow_shot::customAiModelsToJson({unrelated})}});
+    require(snow_shot::customAiModelsFromJson(imported.values.value(key)).first().apiKey.isEmpty(),
+            "redacted imports must not copy credentials to a different provider URL");
+
+    storage::ConfigurationStore store(temporary.filePath(QStringLiteral("mcp-cas.json")), true,
+                                      true);
+    const auto revision = store.revision();
+    bool conflict = true;
+    require(store.mutateIfRevision(
+                revision, [&] { return store.setValue(QStringLiteral("mcp/enabled"), true); },
+                &conflict) &&
+                !conflict,
+            "revision transaction permits nested runtime backend writes");
+    require(store.revision() > revision, "semantic configuration writes advance the revision");
+    bool called = false;
+    require(!store.mutateIfRevision(
+                revision,
+                [&] {
+                    called = true;
+                    return true;
+                },
+                &conflict) &&
+                conflict && !called,
+            "stale revisions must reject before any runtime side effect");
+    const auto current = store.revision();
+    require(store.mutateIfRevision(
+                current, [&] { return store.setValue(QStringLiteral("mcp/enabled"), true); }) &&
+                store.revision() == current,
+            "no-op writes preserve revision");
+}
+
+void smartSelectionArchivesMigrateAndRoundTrip(const QTemporaryDir& temporary) {
+    const QString key = QStringLiteral("screenshot_selection/smart_selection");
+    const QString targetKey = QStringLiteral("screenshot_selection/selection_target");
+    const QString archive = temporary.filePath(QStringLiteral("smart-selection.zip"));
+    for (const auto& value :
+         {QJsonValue(false), QJsonValue(true), QJsonValue(QStringLiteral("disabled")),
+          QJsonValue(QStringLiteral("window_sub_element"))}) {
+        const QString expected = value.isBool() ? QStringLiteral("window") : value.toString();
+        require(storage::ConfigurationArchive::write(
+                    archive, {{key, value}, {targetKey, QStringLiteral("window")}},
+                    storage::ConfigurationSchema::currentVersion())
+                    .isEmpty(),
+                "write smart-selection archive");
+        const auto exported = storage::ConfigurationArchive::read(archive);
+        require(exported.isValid() && exported.values.value(key) == expected &&
+                    !exported.values.contains(targetKey),
+                "exports must consolidate the smart-selection preference");
+        // Construct the old wire document directly so reader migration is exercised too.
+        writeZip(archive,
+                 {{QStringLiteral("manifest.json"),
+                   manifestBytes(storage::ConfigurationSchema::currentVersion())},
+                  {QStringLiteral("config.json"),
+                   configurationBytes({{key, value}, {targetKey, QStringLiteral("window")}})}});
+        const auto imported = storage::ConfigurationArchive::read(archive);
+        require(imported.isValid() && imported.values.value(key) == expected &&
+                    !imported.values.contains(targetKey),
+                "archives must migrate booleans and preserve new modes");
+        storage::ConfigurationStore store(
+            temporary.filePath(QStringLiteral("smart-selection.json")), true, true, 60000);
+        require(store.applySnapshot(imported.values, imported.schemaVersion) &&
+                    store.value(key) == expected,
+                "import must apply the migrated smart selection mode");
+    }
+}
+
+int main(int argc, char** argv) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("SnowShotTests"));
+    QCoreApplication::setApplicationName(QStringLiteral("configuration-archive-tests"));
+
+    require(storage::ConfigurationStore::currentSchemaVersion() >= 1,
+            "the current schema version must be positive");
+
+    QTemporaryDir temporary;
+    require(temporary.isValid(), "temporary directory unavailable");
+    if (application.arguments().contains(QStringLiteral("--auto-save-after-execution-only"))) {
+        autoSaveAfterExecutionArchivesMigrateAndRoundTrip(temporary);
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--selection-aspect-ratio-only"))) {
+        selectionAspectRatioArchivesPreservePreferences(temporary);
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--recognition-models-only"))) {
+        recognitionModelPreferencesSurviveRestart(temporary);
+        return 0;
+    }
+    smartSelectionArchivesMigrateAndRoundTrip(temporary);
+    roundTripPreservesValuesAndSchemaVersion(temporary);
+    exportsOmitLocalDirectories(temporary);
+    importsPreserveOmittedDirectories(temporary);
+    autoSaveAfterExecutionArchivesMigrateAndRoundTrip(temporary);
+    readRejectsInvalidArchives(temporary);
+    writeRejectsUnwritableTargets(temporary);
+    unicodePathsRoundTrip();
+    applySnapshotReplacesConfiguration(temporary);
+    pinnedShortcutDefaultsRespectExclusiveContexts(temporary);
+    selectionAspectRatioArchivesPreservePreferences(temporary);
+    recognitionModelPreferencesSurviveRestart(temporary);
+    mcpCredentialRedactionAndRevision(temporary);
+    return 0;
+}

@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Generate a typed, embedded Qt icon pack from a JSON manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+MODELS = {
+    "monochrome": "IconColorModel::Monochrome",
+    "twoTone": "IconColorModel::TwoTone",
+    "threeTone": "IconColorModel::ThreeTone",
+    "fullColor": "IconColorModel::FullColor",
+}
+FITS = {"contain": "IconFit::Contain", "stretch": "IconFit::Stretch"}
+IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CANONICAL = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+CPP_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm"}
+FORBIDDEN_ELEMENTS = {"script", "foreignObject", "iframe", "animate", "animateMotion", "animateTransform", "set"}
+PLACEHOLDERS = {
+    "primary": "__ADQT_SLOT_PRIMARY__",
+    "secondary": "__ADQT_SLOT_SECONDARY__",
+    "tertiary": "__ADQT_SLOT_TERTIARY__",
+}
+
+
+class ManifestError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Entry:
+    variant: str
+    symbol: str
+    name: str
+    model: str
+    fit: str
+    defaults: dict[str, str]
+    allow_data_images: bool
+    normalized_svg: str
+    source_hash: str
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _cpp_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _string_view_expression(value: str, index: int) -> str:
+    # Keep raw segments below MSVC's individual literal limit. Adjacent literals are folded by the
+    # compiler into one read-only array, so the descriptor still points at immutable contiguous
+    # storage and no QByteArray construction is emitted.
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for character in value:
+        character_bytes = len(character.encode("utf-8"))
+        if current and current_bytes + character_bytes > 12_000:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(character)
+        current_bytes += character_bytes
+    if current:
+        chunks.append("".join(current))
+
+    literals: list[str] = []
+    for chunk_index, chunk in enumerate(chunks):
+        delimiter = f"ADQT_SVG_{index}" if len(chunks) == 1 else f"ADQT_SVG_{index}_{chunk_index}"
+        if f"){delimiter}\"" in chunk:
+            raise ManifestError("SVG contains the generator raw-string delimiter")
+        literals.append(f'R"{delimiter}({chunk}){delimiter}"')
+    return "std::string_view(" + " ".join(literals) + ")"
+
+
+
+def _replace_attr(tag: str, attribute: str, placeholder: str) -> tuple[str, bool]:
+    expression = re.compile(rf"\b{attribute}\s*=\s*(['\"])([^'\"]*)\1", re.IGNORECASE)
+    match = expression.search(tag)
+    if not match or match.group(2).lower() == "none":
+        return tag, False
+    return tag[: match.start()] + f'{attribute}="{placeholder}"' + tag[match.end() :], True
+
+
+def _normalize_slots(svg: str, model: str) -> str:
+    if model == "fullColor":
+        if re.search(r"data-adqt-slot|currentColor", svg, re.IGNORECASE):
+            raise ManifestError("fullColor assets cannot contain theme slots")
+        return svg
+
+    slot_tag = re.compile(
+        r"<([A-Za-z_:][A-Za-z0-9:._-]*)([^>]*)\bdata-adqt-slot\s*=\s*(['\"])(primary|secondary|tertiary)\3([^>]*)>",
+        re.IGNORECASE,
+    )
+    slot_attr = re.compile(r"\s*data-adqt-slot\s*=\s*(['\"])(primary|secondary|tertiary)\1", re.IGNORECASE)
+
+    def replace(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        placeholder = PLACEHOLDERS[match.group(4).lower()]
+        tag = slot_attr.sub("", tag)
+        tag, fill_changed = _replace_attr(tag, "fill", placeholder)
+        tag, stroke_changed = _replace_attr(tag, "stroke", placeholder)
+        changed = fill_changed or stroke_changed
+        if re.search("currentColor", tag, re.IGNORECASE):
+            tag = re.sub("currentColor", placeholder, tag, flags=re.IGNORECASE)
+            changed = True
+        if not changed:
+            position = tag.rfind(">")
+            if tag[position - 1] == "/":
+                position -= 1
+            tag = tag[:position] + f' fill="{placeholder}"' + tag[position:]
+        return tag
+
+    normalized = slot_tag.sub(replace, svg)
+    normalized = re.sub("currentColor", PLACEHOLDERS["primary"], normalized, flags=re.IGNORECASE)
+    present = {name for name, placeholder in PLACEHOLDERS.items() if placeholder in normalized}
+    expected = {
+        "monochrome": {"primary"},
+        "twoTone": {"primary", "secondary"},
+        "threeTone": {"primary", "secondary", "tertiary"},
+    }[model]
+    if not present and model == "monochrome":
+        root = re.search(r"<svg\b[^>]*>", normalized, re.IGNORECASE)
+        if root:
+            tag = root.group(0)
+            position = tag.rfind(">")
+            tag = tag[:position] + f' fill="{PLACEHOLDERS["primary"]}"' + tag[position:]
+            normalized = normalized[: root.start()] + tag + normalized[root.end() :]
+            present = {"primary"}
+    if present != expected:
+        raise ManifestError(f"declared {model} model requires slots {sorted(expected)}, found {sorted(present)}")
+    return normalized
+
+
+def _validate_svg(path: Path, model: str, allow_data_images: bool) -> str:
+    try:
+        source = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n").strip()
+    except OSError as error:
+        raise ManifestError(f"cannot read SVG {path}: {error}") from error
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError as error:
+        raise ManifestError(f"invalid SVG XML in {path}: {error}") from error
+    if _local_name(root.tag) != "svg":
+        raise ManifestError(f"{path} does not have an svg root")
+    view_box = root.attrib.get("viewBox")
+    if not view_box:
+        raise ManifestError(f"{path} has no viewBox")
+    try:
+        values = [float(item) for item in re.split(r"[\s,]+", view_box.strip())]
+    except ValueError as error:
+        raise ManifestError(f"{path} has an invalid viewBox") from error
+    if len(values) != 4 or values[2] <= 0 or values[3] <= 0:
+        raise ManifestError(f"{path} must have a positive four-value viewBox")
+
+    image_count = 0
+    for element in root.iter():
+        local = _local_name(element.tag)
+        if local in FORBIDDEN_ELEMENTS:
+            raise ManifestError(f"{path} uses unsupported element <{local}>")
+        for attribute, value in element.attrib.items():
+            attr = _local_name(attribute)
+            if attr not in {"href", "src"}:
+                continue
+            if re.match(r"^(?:https?:)?//", value, re.IGNORECASE):
+                raise ManifestError(f"{path} contains an external network reference")
+            if local == "image":
+                image_count += 1
+                if not value.startswith("data:"):
+                    raise ManifestError(f"{path} contains a non-data image reference")
+    if image_count and (model != "fullColor" or not allow_data_images):
+        raise ManifestError(f"{path} embeds data images without fullColor allowEmbeddedDataImages")
+    return _normalize_slots(source, model) + "\n"
+
+
+def _load_manifest(path: Path) -> tuple[dict[str, Any], list[Entry]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ManifestError(f"cannot parse manifest: {error}") from error
+    if data.get("schemaVersion") != 1:
+        raise ManifestError("schemaVersion must be 1")
+    pack = data.get("pack")
+    namespace = data.get("cppNamespace")
+    raw_entries = data.get("entries")
+    if not isinstance(pack, str) or not CANONICAL.fullmatch(pack):
+        raise ManifestError("pack must be a canonical lower-case name")
+    if not isinstance(namespace, str) or not namespace or any(
+        not IDENTIFIER.fullmatch(part) for part in namespace.split("::")
+    ):
+        raise ManifestError("cppNamespace must contain valid C++ identifiers")
+    export_macro = data.get("exportMacro", "")
+    if not isinstance(export_macro, str) or (export_macro and not IDENTIFIER.fullmatch(export_macro)):
+        raise ManifestError("exportMacro must be empty or a valid C++ identifier")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ManifestError("entries must be a non-empty array")
+
+    entries: list[Entry] = []
+    keys: set[tuple[str, str]] = set()
+    symbols: set[tuple[str, str]] = set()
+    base = path.parent
+    for index, raw in enumerate(raw_entries):
+        if not isinstance(raw, dict):
+            raise ManifestError(f"entry {index} must be an object")
+        variant, symbol, name = raw.get("variant"), raw.get("symbol"), raw.get("name")
+        model = raw.get("colorModel")
+        fit = raw.get("fit", "contain")
+        if not isinstance(variant, str) or not CANONICAL.fullmatch(variant):
+            raise ManifestError(f"entry {index} has an invalid variant")
+        if not isinstance(symbol, str) or not IDENTIFIER.fullmatch(symbol):
+            raise ManifestError(f"entry {index} has an invalid exported symbol")
+        if not isinstance(name, str) or not CANONICAL.fullmatch(name):
+            raise ManifestError(f"entry {index} has an invalid canonical name")
+        if model not in MODELS or fit not in FITS:
+            raise ManifestError(f"entry {index} has an unsupported colorModel or fit")
+        if (variant, name) in keys:
+            raise ManifestError(f"duplicate icon key {variant}/{name}")
+        if (variant, symbol) in symbols:
+            raise ManifestError(f"duplicate exported symbol {variant}::{symbol}")
+        keys.add((variant, name))
+        symbols.add((variant, symbol))
+
+        defaults = raw.get("defaultColors", {})
+        if not isinstance(defaults, dict) or any(
+            key not in PLACEHOLDERS or not isinstance(value, str)
+            for key, value in defaults.items()
+        ):
+            raise ManifestError(f"entry {index} has invalid defaultColors")
+        allowed_slots = {"monochrome": 1, "twoTone": 2, "threeTone": 3, "fullColor": 0}[model]
+        slot_order = ["primary", "secondary", "tertiary"]
+        if any(key in defaults for key in slot_order[allowed_slots:]):
+            raise ManifestError(f"entry {index} default colors do not match {model}")
+        allow_data = raw.get("allowEmbeddedDataImages", False)
+        if not isinstance(allow_data, bool):
+            raise ManifestError(f"entry {index} allowEmbeddedDataImages must be boolean")
+        source_value = raw.get("source")
+        if not isinstance(source_value, str) or not source_value:
+            raise ManifestError(f"entry {index} has no source")
+        normalized = _validate_svg((base / source_value).resolve(), model, allow_data)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        entries.append(Entry(variant, symbol, name, model, fit, defaults, allow_data, normalized, digest))
+    entries.sort(key=lambda item: (item.variant, item.name, item.symbol))
+    return data, entries
+
+
+def _colors_expression(defaults: dict[str, str]) -> str:
+    values = [f"std::string_view({_cpp_string(defaults.get(slot_name, ''))})"
+              for slot_name in ("primary", "secondary", "tertiary")]
+    return "IconStaticColors{" + ", ".join(values) + "}"
+
+
+def _select_used_entries(entries: list[Entry], roots: list[Path]) -> tuple[list[Entry], dict[str, Any]]:
+    """Conservatively retain helper calls, function pointers and name-based variants.
+
+    Matching known identifiers instead of a specific namespace spelling also covers namespace
+    aliases and ``using namespace``. False positives cost a few icons; false negatives could
+    break an application. Pack enumeration/registration retains the full pack because arbitrary
+    runtime keys cannot be inferred from source. Generated packs are data, not usage sites.
+    """
+    symbols: set[str] = set()
+    names: set[str] = set()
+    full_pack = False
+    full_pack_files: list[str] = []
+    scanned: list[str] = []
+    for root in sorted(set(path.resolve() for path in roots)):
+        if not root.is_dir():
+            raise ManifestError(f"icon usage root is not a directory: {root}")
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in CPP_SUFFIXES:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError) as error:
+                raise ManifestError(f"cannot read icon usage source {path}: {error}") from error
+            if source.startswith("// Generated by tools/generate_icon_pack.py."):
+                continue
+            scanned.append(path.relative_to(root).as_posix())
+            # Any spelling of a known helper is retained, including bare
+            # function pointers and macro arguments. Do not assume call syntax.
+            symbols.update(re.findall(r"\b[A-Za-z_]\w*\b", source))
+            names.update(re.findall(r'"([a-z0-9]+(?:-[a-z0-9]+)*)"', source))
+            # Icon metadata has a .pack string field; it is not access to the
+            # generated namespace's pack() function or a pointer to that API.
+            pack_usage = re.sub(r"\.\s*pack\b(?!\s*\()", ".metadata_pack", source)
+            if re.search(r"\b(?:pack|registerWith|ensureRegistered)\b", pack_usage):
+                full_pack = True
+                full_pack_files.append(path.relative_to(root).as_posix())
+    selected = [entry for entry in entries if full_pack or entry.symbol in symbols or entry.name in names]
+    if not selected:
+        raise ManifestError("icon usage roots contain no icons from this pack")
+    report = {
+        "schemaVersion": 1,
+        "fullPackRequired": full_pack,
+        "fullPackUsageFiles": sorted(set(full_pack_files)),
+        "availableCount": len(entries),
+        "retainedCount": len(selected),
+        "availableSvgBytes": sum(len(entry.normalized_svg.encode("utf-8")) for entry in entries),
+        "retainedSvgBytes": sum(len(entry.normalized_svg.encode("utf-8")) for entry in selected),
+        "scannedFiles": sorted(set(scanned)),
+        "icons": [{"variant": entry.variant, "name": entry.name, "symbol": entry.symbol} for entry in selected],
+    }
+    return selected, report
+
+
+def _render_header(data: dict[str, Any], entries: list[Entry], header_name: str) -> str:
+    guard = re.sub(r"[^A-Za-z0-9]", "_", f"ADQT_GENERATED_{data['pack']}_{header_name}").upper()
+    namespace = data["cppNamespace"]
+    export = (data.get("exportMacro", "") + " ") if data.get("exportMacro") else ""
+    variants = sorted({entry.variant for entry in entries})
+    lines = [
+        "// Generated by tools/generate_icon_pack.py. DO NOT EDIT.",
+        f"#ifndef {guard}", f"#define {guard}", "", '#include "external_icon_pack.h"', "",
+        f"namespace {namespace} {{", "",
+        f"{export}const adqt::icons::ExternalIconPack& pack();",
+        f"{export}adqt::icons::IconPackRegistrationResult registerWith(adqt::icons::IconRenderer& renderer);",
+        f"{export}adqt::icons::IconPackRegistrationResult ensureRegistered();", "",
+    ]
+    for variant in variants:
+        lines.append(f"namespace {variant} {{")
+        for entry in entries:
+            if entry.variant == variant:
+                lines.append(f"[[nodiscard]] {export}adqt::icons::IconRef {entry.symbol}(const adqt::icons::IconColors& colors = {{}});")
+        lines.extend([f"}}  // namespace {variant}", ""])
+    lines.extend([f"}}  // namespace {namespace}", "", f"#endif  // {guard}", ""])
+    return "\n".join(lines)
+
+
+def _render_source(data: dict[str, Any], entries: list[Entry], header_name: str) -> str:
+    namespace = data["cppNamespace"]
+    header_include = data.get("headerInclude", header_name)
+    pack_hash_input = "".join(f"{e.variant}\0{e.name}\0{e.source_hash}\n" for e in entries)
+    pack_hash = hashlib.sha256(pack_hash_input.encode("utf-8")).hexdigest()
+    lines = [
+        "// Generated by tools/generate_icon_pack.py. DO NOT EDIT.",
+        f'#include "{header_include}"', "", "#include <cstddef>", "#include <string_view>", "",
+        f"namespace {namespace} {{", "", "namespace {", "",
+        "using adqt::icons::IconColorModel;",
+        "using adqt::icons::IconDescriptor;",
+        "using adqt::icons::IconFit;",
+        "using adqt::icons::IconPack;",
+        "using adqt::icons::IconStaticColors;",
+        "",
+        "constexpr IconDescriptor kEntries[] = {",
+    ]
+    for index, entry in enumerate(entries):
+        lines.extend([
+            "  {",
+            f"    std::string_view({_cpp_string(data['pack'])}), std::string_view({_cpp_string(entry.variant)}), std::string_view({_cpp_string(entry.name)}),",
+            f"    {_string_view_expression(entry.normalized_svg, index)}, std::string_view({_cpp_string(entry.source_hash)}),",
+            f"    {MODELS[entry.model]}, {FITS[entry.fit]}, {_colors_expression(entry.defaults)}, {'true' if entry.allow_data_images else 'false'}",
+            "  },",
+        ])
+    lines.extend([
+        "};", "",
+        f"constexpr IconPack kStaticPack{{std::string_view({_cpp_string(data['pack'])}), std::string_view({_cpp_string(data.get('source', 'project-owned manifest'))}), std::string_view({_cpp_string(pack_hash)}), kEntries, sizeof(kEntries) / sizeof(kEntries[0])}};",
+        "",
+        "}  // namespace", "",
+        "const adqt::icons::ExternalIconPack& pack() {",
+        "  static const adqt::icons::ExternalIconPack value(kStaticPack);",
+        "  return value;", "}", "",
+        "adqt::icons::IconPackRegistrationResult registerWith(adqt::icons::IconRenderer& renderer) {",
+        "  return pack().registerWith(renderer);", "}", "",
+        "adqt::icons::IconPackRegistrationResult ensureRegistered() {",
+        "  return pack().ensureRegistered();", "}", "",
+    ])
+    current_variant = None
+    for index, entry in enumerate(entries):
+        if current_variant != entry.variant:
+            if current_variant is not None:
+                lines.extend([f"}}  // namespace {current_variant}", ""])
+            current_variant = entry.variant
+            lines.extend([f"namespace {current_variant} {{", ""])
+        lines.extend([
+            f"adqt::icons::IconRef {entry.symbol}(const adqt::icons::IconColors& colors) {{",
+            f"  return pack().icon({index}, colors);",
+            "}", "",
+        ])
+    if current_variant is not None:
+        lines.extend([f"}}  // namespace {current_variant}", ""])
+    lines.extend([f"}}  // namespace {namespace}", ""])
+    return "\n".join(lines)
+
+
+def _clang_format(content: str, path: Path) -> str:
+    """Format generated output with the .clang-format governing ``path``.
+
+    ``--assume-filename`` makes clang-format read stdin while resolving the
+    style configuration from the destination file's directory, so packs under
+    different projects pick up that project's nested .clang-format. Reformat
+    until the output stabilizes: a first pass over long raw-string literals can
+    leave lines that only a second pass learns to break.
+    """
+    for _ in range(5):
+        try:
+            completed = subprocess.run(
+                ["clang-format", "--style=file", f"--assume-filename={path}"],
+                # Pass bytes: text mode would translate \n to \r\n on Windows
+                # and clang-format reaches a different fixpoint on CRLF input.
+                input=content.encode("utf-8"),
+                capture_output=True,
+            )
+        except FileNotFoundError as error:
+            raise ManifestError(
+                "clang-format was not found on PATH; it is required to keep generated icon packs format-clean"
+            ) from error
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip() or (
+                f"exit code {completed.returncode}"
+            )
+            raise ManifestError(f"clang-format failed for {path}: {detail}")
+        formatted = completed.stdout.decode("utf-8").replace("\r\n", "\n")
+        if formatted == content:
+            return formatted
+        content = formatted
+    raise ManifestError(f"clang-format output for {path} did not stabilize")
+
+
+def _check_or_write(path: Path, expected: str, check: bool) -> bool:
+    if check:
+        try:
+            actual = path.read_text(encoding="utf-8")
+        except OSError:
+            actual = ""
+        if actual != expected:
+            print(f"stale generated output: {path}", file=sys.stderr)
+            return False
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A source scan can keep the same icon set. Preserve unchanged timestamps so
+    # the build does not recompile the pack after unrelated source edits.
+    if path.exists() and path.read_text(encoding="utf-8") == expected:
+        return True
+    path.write_text(expected, encoding="utf-8", newline="\n")
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("manifest", type=Path)
+    parser.add_argument("--header", type=Path, required=True)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--usage-root", type=Path, action="append", default=[],
+                        help="retain icons referenced by C++ under this directory (repeatable)")
+    parser.add_argument("--usage-report", type=Path,
+                        help="write the retained icon inventory and raw SVG footprint as JSON")
+    parser.add_argument("--no-format", action="store_true",
+                        help="skip clang-format for build-tree generated sources")
+    parser.add_argument("--cpp-namespace",
+                        help="override the C++ namespace for an isolated generated test pack")
+    args = parser.parse_args()
+    try:
+        data, entries = _load_manifest(args.manifest.resolve())
+        if args.cpp_namespace:
+            if any(not IDENTIFIER.fullmatch(part) for part in args.cpp_namespace.split("::")):
+                raise ManifestError("--cpp-namespace must contain valid C++ identifiers")
+            data["cppNamespace"] = args.cpp_namespace
+        header = _render_header(data, entries, args.header.name)
+        report = None
+        if args.usage_root:
+            entries, report = _select_used_entries(entries, args.usage_root)
+        elif args.usage_report:
+            raise ManifestError("--usage-report requires --usage-root")
+        source = _render_source(data, entries, args.header.name)
+        if not args.no_format:
+            header = _clang_format(header, args.header)
+            source = _clang_format(source, args.source)
+    except ManifestError as error:
+        print(f"icon manifest error: {error}", file=sys.stderr)
+        return 2
+    valid = _check_or_write(args.header, header, args.check)
+    valid = _check_or_write(args.source, source, args.check) and valid
+    if args.usage_report and report is not None:
+        valid = _check_or_write(args.usage_report, json.dumps(report, indent=2) + "\n", args.check) and valid
+    return 0 if valid else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

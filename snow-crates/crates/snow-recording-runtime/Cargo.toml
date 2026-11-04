@@ -1,0 +1,103 @@
+[package]
+name = "snow-recording-runtime"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+snow-webcam = { path = "../snow-webcam" }
+snow-memory = { path = "../snow-memory" }
+tempfile.workspace = true
+snow-media = { path = "../snow-media" }
+snow-recording-effects = { path = "../snow-recording-effects" }
+snow-core = { path = "../snow-core" }
+snow-pipeline = { path = "../snow-pipeline", optional = true }
+snow-capture = { path = "../snow-capture" }
+snow-cursor = { path = "../snow-cursor" }
+snow-audio-recorder = { path = "../snow-audio-recorder" }
+snow-recording-model = { path = "../snow-recording-model" }
+snow-recording-export = { path = "../snow-recording-export" }
+crossbeam-channel.workspace = true
+ffmpeg-next.workspace = true
+rayon.workspace = true
+num_cpus.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+snow-d3d11 = { path = "../snow-d3d11" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+] }
+
+[dev-dependencies]
+snow-recording-effects = { path = "../snow-recording-effects", features = ["bench-experiments"] }
+snow-recording-export = { path = "../snow-recording-export", features = ["bench-experiments"] }
+anyhow.workspace = true
+proptest = "1.11.0"
+
+# Drives the overlays without OS input injection; skipped entirely in builds
+# that do not opt into the bench feature.
+[[example]]
+name = "realtime_recording_benchmark"
+required-features = ["bench-synthetic-input"]
+
+[[example]]
+name = "deferred_recording_benchmark"
+required-features = ["bench-synthetic-input"]
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+] }
+
+[features]
+default = ["legacy-capture"]
+# Compatibility capture APIs are excluded from the Snow Shot archive.
+legacy-capture = ["dep:snow-pipeline"]
+# Compile-time metric groups for the realtime recording benchmark. Each group
+# is independently selectable so one measurement is not perturbed by the
+# instrumentation overhead of the others, and production builds (which enable
+# none of them) compile every marker to nothing.
+#
+# Forwards snow-capture's per-backend capture stage instrumentation; direct
+# recording sessions then enable `CaptureOptions::record_stage_timings` and
+# aggregate the per-frame stage breakdown into `DirectRecordingReport`.
+bench-stage-timing = ["snow-capture/stage-timing"]
+# Times each overlay compositing stage (resize, trail, clicks, cursor,
+# keyboard) for every composited frame.
+bench-compositor-timing = ["snow-recording-effects/bench-timing"]
+# Measures per-frame pipeline latency (queue dwell, compose, encode push,
+# capture-to-encode end to end), counts synthetic overlay frames, and copies
+# capture stream statistics into the report.
+bench-pipeline-timing = ["snow-capture/stage-timing", "snow-recording-export/bench-timing"]
+# Lets the realtime recording benchmark drive a direct session's overlay
+# inputs (cursor, clicks, keys) with synthetic observations instead of OS
+# input injection. Sessions opt in explicitly; production builds that enable
+# none of the bench features compile the hooks-only path unchanged.
+bench-synthetic-input = ["snow-recording-effects/bench-synthetic-input", "snow-recording-effects/bench-experiments", "snow-recording-export/bench-experiments"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+snow-macos = { path = "../snow-macos" }
+
+[[example]]
+name = "macos_record"
+required-features = ["legacy-capture"]

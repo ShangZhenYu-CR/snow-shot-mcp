@@ -1,0 +1,4875 @@
+use snow_draw_engine_core::{
+    ColorRgba8, CornerRadii, ErrorCode, Point,
+    arrow::{ArrowType, Arrowhead, StrokeStyle},
+};
+use snow_draw_engine_document::{
+    ArrowData, FillStyle, FilterData, HighlightShape, MIN_SERIAL_NUMBER_FONT_SIZE,
+    MIN_TEXT_FONT_SIZE, RectangleData, SerialNumberData, SpotlightConfig, TextData, Transaction,
+    WatermarkConfig, normalize_font_family, resolve_serial_number_data_diameter,
+    serial_number_rect_proxy, serial_number_with_label_style, text_with_auto_resize_layout,
+    text_with_wrapped_layout, validate_serial_number, validate_text,
+};
+use snow_draw_engine_interaction::Modifiers;
+use snow_draw_engine_model::DocumentModel;
+
+use crate::{
+    ActiveTool, ApplyTransactionCommand, ArrowStyle, Editor, EditorCommand, ElementCreationPreview,
+    FILTER_STYLE_PROPERTY_OPACITY, FILTER_STYLE_PROPERTY_STRENGTH,
+    FILTER_STYLE_PROPERTY_STROKE_WIDTH, FILTER_STYLE_PROPERTY_TYPE, FilterStyle,
+    RectangleShapeStyle, SERIAL_NUMBER_STYLE_MIXED_COLOR, SERIAL_NUMBER_STYLE_MIXED_FILL,
+    SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE, SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY,
+    SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE, SERIAL_NUMBER_STYLE_MIXED_NUMBER,
+    SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE, SERIAL_NUMBER_STYLE_MIXED_OPACITY,
+    SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE, SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE,
+    SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH, SERIAL_NUMBER_STYLE_MIXED_TYPE,
+    SHAPE_STYLE_MIXED_ARROW_TYPE, SHAPE_STYLE_MIXED_CORNER_RADII, SHAPE_STYLE_MIXED_END_ARROWHEAD,
+    SHAPE_STYLE_MIXED_FILL, SHAPE_STYLE_MIXED_FILL_STYLE, SHAPE_STYLE_MIXED_HIGHLIGHT_SHAPE,
+    SHAPE_STYLE_MIXED_OPACITY, SHAPE_STYLE_MIXED_SHAPE, SHAPE_STYLE_MIXED_START_ARROWHEAD,
+    SHAPE_STYLE_MIXED_STROKE, SHAPE_STYLE_MIXED_STROKE_STYLE, SHAPE_STYLE_MIXED_STROKE_WIDTH,
+    SHAPE_STYLE_PROPERTY_ARROW_TYPE, SHAPE_STYLE_PROPERTY_CORNER_RADII,
+    SHAPE_STYLE_PROPERTY_END_ARROWHEAD, SHAPE_STYLE_PROPERTY_FILL, SHAPE_STYLE_PROPERTY_FILL_STYLE,
+    SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE, SHAPE_STYLE_PROPERTY_OPACITY, SHAPE_STYLE_PROPERTY_SHAPE,
+    SHAPE_STYLE_PROPERTY_START_ARROWHEAD, SHAPE_STYLE_PROPERTY_STROKE,
+    SHAPE_STYLE_PROPERTY_STROKE_STYLE, SHAPE_STYLE_PROPERTY_STROKE_WIDTH, SelectionArrowState,
+    SelectionRectState, SerialNumberStyle, ShapeKind, ShapeStyle, ShapeStylePatch,
+    StyleToolbarSource, TEXT_STYLE_ALL_PROPERTIES, TEXT_STYLE_MIXED_BOLD, TEXT_STYLE_MIXED_COLOR,
+    TEXT_STYLE_MIXED_CORNER_RADII, TEXT_STYLE_MIXED_FILL, TEXT_STYLE_MIXED_FILL_STYLE,
+    TEXT_STYLE_MIXED_FONT_FAMILY, TEXT_STYLE_MIXED_FONT_SIZE, TEXT_STYLE_MIXED_HORIZONTAL_ALIGN,
+    TEXT_STYLE_MIXED_ITALIC, TEXT_STYLE_MIXED_OPACITY, TEXT_STYLE_MIXED_STROKE,
+    TEXT_STYLE_MIXED_STROKE_WIDTH, TEXT_STYLE_MIXED_VERTICAL_ALIGN, TextLayoutOverride, TextStyle,
+    arrow_with_style, selection_bounds_from_selection,
+    text::{text_layout_override_size, text_with_style_attributes},
+};
+
+const FONT_SIZE_STEPS: [f64; 5] = [MIN_TEXT_FONT_SIZE, 16.0, 21.0, 27.0, 42.0];
+const SERIAL_NUMBER_STYLE_ALL_PROPERTIES: u32 = SERIAL_NUMBER_STYLE_MIXED_NUMBER
+    | SERIAL_NUMBER_STYLE_MIXED_TYPE
+    | SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE
+    | SERIAL_NUMBER_STYLE_MIXED_COLOR
+    | SERIAL_NUMBER_STYLE_MIXED_FILL
+    | SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE
+    | SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE
+    | SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY
+    | SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH
+    | SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE
+    | SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE
+    | SERIAL_NUMBER_STYLE_MIXED_OPACITY;
+
+pub(crate) fn stepped_font_size(current: f64, increase: bool) -> f64 {
+    if increase {
+        FONT_SIZE_STEPS
+            .iter()
+            .copied()
+            .find(|step| *step > current + f64::EPSILON)
+            .unwrap_or(
+                *FONT_SIZE_STEPS
+                    .last()
+                    .expect("font size steps are nonempty"),
+            )
+    } else {
+        FONT_SIZE_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| *step < current - f64::EPSILON)
+            .unwrap_or(FONT_SIZE_STEPS[0])
+    }
+}
+
+impl ShapeStyle {
+    pub fn rectangle_shape_style(self) -> RectangleShapeStyle {
+        RectangleShapeStyle {
+            fill: self.fill,
+            fill_style: self.fill_style,
+            stroke: self.stroke,
+            stroke_width: self.stroke_width,
+            stroke_style: self.stroke_style,
+            stroke_rendering_style: self.stroke_rendering_style,
+            corner_radii: self.corner_radii,
+            shape: self.shape,
+        }
+    }
+
+    pub fn arrow_style(self) -> ArrowStyle {
+        ArrowStyle {
+            arrow_outline_color: self.arrow_outline_color,
+            arrow_outline_width: self.arrow_outline_width,
+            stroke: self.stroke,
+            stroke_width: self.stroke_width,
+            start_arrowhead: self.start_arrowhead,
+            end_arrowhead: self.end_arrowhead,
+            stroke_style: self.stroke_style,
+            stroke_rendering_style: self.stroke_rendering_style,
+            arrow_type: self.arrow_type,
+            arrow_shaft_type: self.arrow_shaft_type,
+            arrow_ratio: self.arrow_ratio,
+        }
+    }
+
+    pub fn with_rectangle_shape_style(mut self, style: RectangleShapeStyle) -> Self {
+        self.fill = style.fill;
+        self.fill_style = style.fill_style;
+        self.stroke = style.stroke;
+        self.stroke_width = style.stroke_width;
+        self.stroke_style = style.stroke_style;
+        self.stroke_rendering_style = style.stroke_rendering_style;
+        self.corner_radii = style.corner_radii;
+        self.shape = style.shape;
+        self
+    }
+
+    pub fn with_arrow_style(mut self, style: ArrowStyle) -> Self {
+        self.stroke = style.stroke;
+        self.stroke_width = style.stroke_width;
+        self.start_arrowhead = style.start_arrowhead;
+        self.end_arrowhead = style.end_arrowhead;
+        self.stroke_style = style.stroke_style;
+        self.stroke_rendering_style = style.stroke_rendering_style;
+        self.arrow_type = style.arrow_type;
+        self.arrow_shaft_type = style.arrow_shaft_type;
+        self.arrow_ratio = snow_draw_engine_core::arrow::normalize_arrow_ratio(style.arrow_ratio);
+        self.arrow_outline_color = style.arrow_outline_color;
+        self.arrow_outline_width =
+            snow_draw_engine_core::arrow::normalize_arrow_outline_width(style.arrow_outline_width);
+        self
+    }
+
+    pub(crate) fn from_rectangle(rect: &RectangleData) -> Self {
+        let mut style = Self::from_rectangle_shape_style(RectangleShapeStyle::from_rectangle(rect));
+        style.opacity = rect.opacity;
+        style.highlight_shape = rect.highlight_shape;
+        style.shape = rect.highlight_shape;
+        style
+    }
+
+    pub fn from_rectangle_shape_style(style: RectangleShapeStyle) -> Self {
+        Self {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(),
+            arrow_outline_width: 0.0,
+            brush_mode: Default::default(),
+            fill: style.fill,
+            fill_style: style.fill_style,
+            stroke: style.stroke,
+            stroke_width: style.stroke_width,
+            corner_radii: style.corner_radii,
+            start_arrowhead: None,
+            end_arrowhead: None,
+            stroke_style: style.stroke_style,
+            stroke_rendering_style: style.stroke_rendering_style,
+            arrow_type: ArrowType::Straight,
+            arrow_shaft_type: Default::default(),
+            arrow_ratio: 1.0,
+            opacity: 1.0,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            shape: style.shape,
+        }
+    }
+
+    pub(crate) fn with_opacity(mut self, opacity: f64) -> Self {
+        self.opacity = opacity;
+        self
+    }
+}
+
+impl ShapeStylePatch {
+    fn active_properties(self) -> u32 {
+        self.properties & self.kind.supported_properties()
+    }
+
+    fn is_empty(self) -> bool {
+        self.active_properties() == 0
+    }
+
+    fn has_unsupported_properties(self) -> bool {
+        self.properties & !self.kind.supported_properties() != 0
+    }
+
+    fn apply_to_rectangle_shape(self, mut current: RectangleShapeStyle) -> RectangleShapeStyle {
+        let properties = self.active_properties();
+        if properties & SHAPE_STYLE_PROPERTY_FILL != 0 {
+            current.fill = self.style.fill;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_FILL_STYLE != 0 {
+            current.fill_style = self.style.fill_style;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE != 0 {
+            current.stroke = self.style.stroke;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+            current.stroke_width = self.style.stroke_width;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_CORNER_RADII != 0 {
+            current.corner_radii = self.style.corner_radii;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_STYLE != 0 {
+            current.stroke_style = self.style.stroke_style;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE != 0 {
+            current.stroke_rendering_style = self.style.stroke_rendering_style;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_SHAPE != 0 {
+            current.shape = self.style.shape;
+        }
+        current
+    }
+
+    fn apply_to_arrow(self, mut current: ArrowStyle) -> ArrowStyle {
+        let properties = self.active_properties();
+        if properties & SHAPE_STYLE_PROPERTY_STROKE != 0 {
+            current.stroke = self.style.stroke;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+            current.stroke_width = self.style.stroke_width;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_START_ARROWHEAD != 0 {
+            current.start_arrowhead = self.style.start_arrowhead;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_END_ARROWHEAD != 0 {
+            current.end_arrowhead = self.style.end_arrowhead;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_STYLE != 0 {
+            current.stroke_style = self.style.stroke_style;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE != 0 {
+            current.stroke_rendering_style = self.style.stroke_rendering_style;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR != 0 {
+            current.arrow_outline_color = self.style.arrow_outline_color;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH != 0 {
+            current.arrow_outline_width =
+                snow_draw_engine_core::arrow::normalize_arrow_outline_width(
+                    self.style.arrow_outline_width,
+                );
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_ARROW_RATIO != 0 {
+            current.arrow_ratio =
+                snow_draw_engine_core::arrow::normalize_arrow_ratio(self.style.arrow_ratio);
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE != 0 {
+            current.arrow_shaft_type = self.style.arrow_shaft_type;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_ARROW_TYPE != 0 {
+            current.arrow_type = self.style.arrow_type;
+        }
+        current
+    }
+
+    fn apply_to_line(self, mut current: ShapeStyle) -> ShapeStyle {
+        let properties = self.active_properties();
+        if properties & SHAPE_STYLE_PROPERTY_FILL != 0 {
+            current.fill = self.style.fill;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_FILL_STYLE != 0 {
+            current.fill_style = self.style.fill_style;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE != 0 {
+            current.stroke = self.style.stroke;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+            current.stroke_width = self.style.stroke_width;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_STROKE_STYLE != 0 {
+            current.stroke_style = self.style.stroke_style;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE != 0 {
+            current.stroke_rendering_style = self.style.stroke_rendering_style;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_OPACITY != 0 {
+            current.opacity = self.style.opacity;
+        }
+        if properties & crate::SHAPE_STYLE_PROPERTY_BRUSH_MODE != 0 {
+            current.brush_mode = self.style.brush_mode;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_ARROW_TYPE != 0 {
+            current.arrow_type = normalized_line_arrow_type(self.style.arrow_type);
+        }
+        current.start_arrowhead = None;
+        current.end_arrowhead = None;
+        current.arrow_type = match self.kind {
+            ShapeKind::Line => normalized_line_arrow_type(current.arrow_type),
+            ShapeKind::PenHighlight => ArrowType::Straight,
+            _ => current.arrow_type,
+        };
+        current
+    }
+
+    fn apply_to_highlight(self, mut current: ShapeStyle) -> ShapeStyle {
+        let properties = self.active_properties();
+        let rectangle = self.apply_to_rectangle_shape(current.rectangle_shape_style());
+        current = current.with_rectangle_shape_style(rectangle);
+        if properties & SHAPE_STYLE_PROPERTY_OPACITY != 0 {
+            current.opacity = self.style.opacity;
+        }
+        if properties & SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE != 0 {
+            current.highlight_shape = self.style.highlight_shape;
+        }
+        current
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShapeStyleSample {
+    brush_mode: Option<snow_draw_engine_core::BrushMode>,
+    fill: Option<ColorRgba8>,
+    fill_style: Option<FillStyle>,
+    stroke: Option<ColorRgba8>,
+    stroke_width: Option<f64>,
+    corner_radii: Option<CornerRadii>,
+    stroke_style: Option<StrokeStyle>,
+    stroke_rendering_style: Option<snow_draw_engine_core::arrow::StrokeRenderingStyle>,
+    start_arrowhead: Option<Option<Arrowhead>>,
+    end_arrowhead: Option<Option<Arrowhead>>,
+    arrow_type: Option<ArrowType>,
+    arrow_shaft_type: Option<snow_draw_engine_core::arrow::ArrowShaftType>,
+    arrow_ratio: Option<f64>,
+    arrow_outline_color: Option<ColorRgba8>,
+    arrow_outline_width: Option<f64>,
+    opacity: f64,
+    highlight_shape: Option<snow_draw_engine_document::HighlightShape>,
+    shape: Option<snow_draw_engine_document::HighlightShape>,
+}
+
+impl ShapeStyleSample {
+    fn from_rectangle(rectangle: &RectangleData) -> Self {
+        Self {
+            arrow_outline_color: None,
+            arrow_outline_width: None,
+            brush_mode: None,
+            fill: Some(rectangle.fill),
+            fill_style: Some(rectangle.fill_style),
+            stroke: Some(rectangle.stroke),
+            stroke_width: Some(rectangle.stroke_width),
+            corner_radii: Some(rectangle.corner_radii),
+            stroke_style: Some(rectangle.stroke_style),
+            stroke_rendering_style: (!rectangle.is_highlight() && !rectangle.is_spotlight())
+                .then_some(rectangle.stroke_rendering_style),
+            start_arrowhead: None,
+            end_arrowhead: None,
+            arrow_type: None,
+            arrow_shaft_type: None,
+            arrow_ratio: None,
+            opacity: rectangle.opacity,
+            highlight_shape: rectangle
+                .is_highlight()
+                .then_some(rectangle.highlight_shape),
+            shape: (!rectangle.is_highlight()).then_some(rectangle.highlight_shape),
+        }
+    }
+
+    fn from_arrow(arrow: &ArrowData) -> Self {
+        Self {
+            arrow_outline_color: arrow
+                .is_regular_arrow()
+                .then_some(arrow.arrow_outline_color),
+            arrow_outline_width: arrow
+                .is_regular_arrow()
+                .then_some(arrow.arrow_outline_width),
+            brush_mode: None,
+            fill: arrow.is_line().then_some(arrow.fill),
+            fill_style: arrow.is_line().then_some(arrow.fill_style),
+            stroke: Some(arrow.stroke),
+            stroke_width: Some(arrow.stroke_width),
+            corner_radii: None,
+            stroke_style: Some(arrow.stroke_style),
+            stroke_rendering_style: (arrow.is_regular_arrow() || arrow.is_line())
+                .then_some(arrow.stroke_rendering_style),
+            start_arrowhead: (!arrow.is_line()).then_some(arrow.start_arrowhead),
+            end_arrowhead: (!arrow.is_line()).then_some(arrow.end_arrowhead),
+            arrow_type: (!arrow.is_pen_highlight()).then_some(arrow.arrow_type),
+            arrow_shaft_type: (arrow.is_regular_arrow()).then_some(arrow.arrow_shaft_type),
+            arrow_ratio: (arrow.is_regular_arrow()).then_some(arrow.arrow_ratio),
+            opacity: arrow.opacity,
+            highlight_shape: None,
+            shape: None,
+        }
+    }
+
+    fn from_free_draw(free_draw: &snow_draw_engine_document::FreeDrawData) -> Self {
+        Self {
+            arrow_outline_color: None,
+            arrow_outline_width: None,
+            brush_mode: Some(free_draw.brush_mode),
+            fill: Some(free_draw.fill),
+            fill_style: Some(free_draw.fill_style),
+            stroke: Some(free_draw.stroke),
+            stroke_width: Some(free_draw.stroke_width),
+            corner_radii: None,
+            stroke_style: Some(free_draw.stroke_style),
+            stroke_rendering_style: None,
+            start_arrowhead: None,
+            end_arrowhead: None,
+            arrow_type: None,
+            arrow_shaft_type: None,
+            arrow_ratio: None,
+            opacity: free_draw.opacity,
+            highlight_shape: None,
+            shape: None,
+        }
+    }
+}
+
+impl RectangleShapeStyle {
+    pub(crate) fn from_rectangle(rect: &RectangleData) -> Self {
+        Self {
+            fill: rect.fill,
+            fill_style: rect.fill_style,
+            stroke: rect.stroke,
+            stroke_width: rect.stroke_width,
+            stroke_style: rect.stroke_style,
+            stroke_rendering_style: rect.stroke_rendering_style,
+            corner_radii: rect.corner_radii,
+            shape: rect.highlight_shape,
+        }
+    }
+}
+
+impl ArrowStyle {
+    pub(crate) fn from_arrow(arrow: &ArrowData) -> Self {
+        Self {
+            arrow_outline_color: arrow.arrow_outline_color,
+            arrow_outline_width: arrow.arrow_outline_width,
+            stroke: arrow.stroke,
+            stroke_width: arrow.stroke_width,
+            start_arrowhead: arrow.start_arrowhead,
+            end_arrowhead: arrow.end_arrowhead,
+            stroke_style: arrow.stroke_style,
+            stroke_rendering_style: arrow.stroke_rendering_style,
+            arrow_type: arrow.arrow_type,
+            arrow_shaft_type: arrow.arrow_shaft_type,
+            arrow_ratio: arrow.arrow_ratio,
+        }
+    }
+}
+
+impl ShapeStyle {
+    pub(crate) fn from_line(line: &ArrowData) -> Self {
+        Self {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(),
+            arrow_outline_width: 0.0,
+            brush_mode: Default::default(),
+            fill: line.fill,
+            fill_style: line.fill_style,
+            stroke: line.stroke,
+            stroke_width: line.stroke_width,
+            corner_radii: CornerRadii::default(),
+            start_arrowhead: None,
+            end_arrowhead: None,
+            stroke_style: line.stroke_style,
+            stroke_rendering_style: line.stroke_rendering_style,
+            arrow_type: normalized_line_arrow_type(line.arrow_type),
+            arrow_shaft_type: Default::default(),
+            arrow_ratio: 1.0,
+            opacity: line.opacity,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            shape: snow_draw_engine_document::HighlightShape::Rectangle,
+        }
+    }
+
+    pub(crate) fn from_free_draw(free_draw: &snow_draw_engine_document::FreeDrawData) -> Self {
+        Self {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(),
+            arrow_outline_width: 0.0,
+            stroke_rendering_style: Default::default(),
+            brush_mode: free_draw.brush_mode,
+            fill: free_draw.fill,
+            fill_style: free_draw.fill_style,
+            stroke: free_draw.stroke,
+            stroke_width: free_draw.stroke_width,
+            corner_radii: CornerRadii::default(),
+            start_arrowhead: None,
+            end_arrowhead: None,
+            stroke_style: free_draw.stroke_style,
+            arrow_type: ArrowType::Curve,
+            arrow_shaft_type: Default::default(),
+            arrow_ratio: 1.0,
+            opacity: free_draw.opacity,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            shape: snow_draw_engine_document::HighlightShape::Rectangle,
+        }
+    }
+}
+
+impl SerialNumberStyle {
+    pub(crate) fn from_serial_number(serial: &SerialNumberData) -> Self {
+        Self {
+            number: serial.number.max(0),
+            serial_number_type: serial.serial_number_type,
+            numeric_type: serial.numeric_type,
+            color: serial.color,
+            fill: serial.fill,
+            fill_style: serial.fill_style,
+            font_size: serial.font_size,
+            font_family: serial.font_family.clone(),
+            stroke_width: serial.stroke_width,
+            stroke_style: serial.stroke_style,
+            stroke_rendering_style: serial.stroke_rendering_style,
+            opacity: serial.opacity,
+        }
+    }
+}
+
+pub(crate) fn normalized_line_arrow_type(arrow_type: ArrowType) -> ArrowType {
+    match arrow_type {
+        ArrowType::Straight | ArrowType::Curve => arrow_type,
+        ArrowType::Elbow => ArrowType::Curve,
+    }
+}
+fn validate_shape_style_patch(patch: ShapeStylePatch) -> Result<(), ErrorCode> {
+    if patch.has_unsupported_properties()
+        || (patch.kind != ShapeKind::SpeechBubble
+            && patch.style.shape == HighlightShape::ThoughtBubble)
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+
+    match patch.kind {
+        ShapeKind::SpeechBubble => {
+            validate_speech_bubble_style(patch.style.rectangle_shape_style())
+        }
+        ShapeKind::Rectangle => validate_rectangle_shape_style(patch.style.rectangle_shape_style()),
+        ShapeKind::Arrow => validate_arrow_style(patch.style.arrow_style()),
+        ShapeKind::Line
+        | ShapeKind::FreeDraw
+        | ShapeKind::RectangleHighlight
+        | ShapeKind::PenHighlight => validate_line_style(patch.style),
+        ShapeKind::Spotlight => validate_rectangle_shape_style(patch.style.rectangle_shape_style()),
+    }
+}
+
+pub(crate) fn validate_line_style(style: ShapeStyle) -> Result<(), ErrorCode> {
+    if style.shape == HighlightShape::ThoughtBubble
+        || style.highlight_shape == HighlightShape::ThoughtBubble
+        || !style.stroke_width.is_finite()
+        || style.stroke_width < 0.0
+        || !style.opacity.is_finite()
+        || !(0.0..=1.0).contains(&style.opacity)
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rectangle_shape_style(style: RectangleShapeStyle) -> Result<(), ErrorCode> {
+    if style.shape == HighlightShape::ThoughtBubble {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    validate_speech_bubble_style(style)
+}
+
+pub(crate) fn validate_speech_bubble_style(style: RectangleShapeStyle) -> Result<(), ErrorCode> {
+    let scalar_fields = [
+        style.stroke_width,
+        style.corner_radii.top_left,
+        style.corner_radii.top_right,
+        style.corner_radii.bottom_right,
+        style.corner_radii.bottom_left,
+    ];
+    if scalar_fields
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_arrow_style(style: ArrowStyle) -> Result<(), ErrorCode> {
+    if !style.stroke_width.is_finite() || style.stroke_width < 0.0 {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_text_style(style: &TextStyle) -> Result<(), ErrorCode> {
+    let scalar_fields = [
+        style.font_size,
+        style.stroke_width,
+        style.corner_radii.top_left,
+        style.corner_radii.top_right,
+        style.corner_radii.bottom_right,
+        style.corner_radii.bottom_left,
+        style.opacity,
+    ];
+    if scalar_fields
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+        || style.opacity > 1.0
+        || style.font_size < MIN_TEXT_FONT_SIZE
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_serial_number_style(style: &SerialNumberStyle) -> Result<(), ErrorCode> {
+    let scalar_fields = [style.font_size, style.stroke_width, style.opacity];
+    if style.number < 0
+        || scalar_fields
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        || style.font_size < MIN_SERIAL_NUMBER_FONT_SIZE
+        || style.opacity > 1.0
+    {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub(crate) fn rectangle_with_style(
+    rect: &RectangleData,
+    style: RectangleShapeStyle,
+) -> RectangleData {
+    RectangleData {
+        text_element_id: rect.text_element_id,
+        rectangle_kind: rect.rectangle_kind,
+        highlight_shape: style.shape,
+        center: rect.center,
+        width: rect.width,
+        height: rect.height,
+        rotation: rect.rotation,
+        fill: style.fill,
+        fill_style: style.fill_style,
+        stroke: style.stroke,
+        stroke_width: style.stroke_width,
+        stroke_style: style.stroke_style,
+        stroke_rendering_style: style.stroke_rendering_style,
+        stroke_rendering_seed: rect.stroke_rendering_seed,
+        corner_radii: snow_draw_engine_document::normalize_shape_corner_radii(
+            style.shape,
+            rect.width,
+            rect.height,
+            style.corner_radii,
+        ),
+        opacity: rect.opacity,
+    }
+}
+
+fn speech_bubble_body_with_style(
+    rect: &RectangleData,
+    style: RectangleShapeStyle,
+) -> RectangleData {
+    let mut body = rectangle_with_style(rect, style);
+    body.corner_radii = style.corner_radii;
+    body
+}
+
+fn line_with_style(line: &ArrowData, style: ShapeStyle) -> ArrowData {
+    let mut updated = line.clone();
+    updated.fill = style.fill;
+    updated.fill_style = style.fill_style;
+    updated.stroke = style.stroke;
+    updated.stroke_width = style.stroke_width;
+    updated.stroke_style = style.stroke_style;
+    updated.stroke_rendering_style = style.stroke_rendering_style;
+    updated.opacity = style.opacity;
+    updated.start_arrowhead = None;
+    updated.end_arrowhead = None;
+    updated.arrow_type = style.arrow_type;
+    updated
+}
+
+fn text_with_style(
+    id: snow_draw_engine_document::ElementId,
+    text: &TextData,
+    style: &TextStyle,
+    properties: u32,
+    layouts: &[TextLayoutOverride],
+) -> Result<TextData, ErrorCode> {
+    let mut updated =
+        text_with_style_attributes(text, &patched_text_style(text, style, properties));
+    // Hosts may reflow an automatic-width label against canvas bounds when its
+    // alignment changes, even though its typography is unchanged.
+    let alignment_layout_changed = updated.horizontal_align != text.horizontal_align
+        && layouts.iter().any(|layout| layout.id == id);
+    if updated.font_size == text.font_size
+        && updated.font_family == text.font_family
+        && updated.bold == text.bold
+        && updated.italic == text.italic
+        && !alignment_layout_changed
+    {
+        return Ok(updated);
+    }
+    if updated.auto_resize {
+        let layout = text_layout_override_size(layouts, id)?;
+        updated = text_with_auto_resize_layout(&updated, layout)?;
+        return Ok(updated);
+    }
+    // A style change re-renders the glyphs, so the stored rectangle and ink box
+    // must follow the re-measured layout even for fixed-width text; otherwise
+    // the painted content drifts off the stored geometry and decorations
+    // (serial connectors) and dirty regions anchor to stale edges.
+    if let Ok(layout) = text_layout_override_size(layouts, id) {
+        updated = text_with_wrapped_layout(&updated, layout)?;
+    }
+    Ok(updated)
+}
+
+fn patched_text_style(text: &TextData, style: &TextStyle, properties: u32) -> TextStyle {
+    let mut patched = TextStyle::from_text(text);
+    if properties & TEXT_STYLE_MIXED_COLOR != 0 {
+        patched.color = style.color;
+    }
+    if properties & TEXT_STYLE_MIXED_BOLD != 0 {
+        patched.bold = style.bold;
+    }
+    if properties & TEXT_STYLE_MIXED_ITALIC != 0 {
+        patched.italic = style.italic;
+    }
+    if properties & TEXT_STYLE_MIXED_FONT_SIZE != 0 {
+        patched.font_size = style.font_size;
+    }
+    if properties & TEXT_STYLE_MIXED_FONT_FAMILY != 0 {
+        patched.font_family = style.font_family.clone();
+    }
+    if properties & TEXT_STYLE_MIXED_FILL != 0 {
+        patched.fill = style.fill;
+    }
+    if properties & TEXT_STYLE_MIXED_FILL_STYLE != 0 {
+        patched.fill_style = style.fill_style;
+    }
+    if properties & TEXT_STYLE_MIXED_STROKE != 0 {
+        patched.stroke = style.stroke;
+    }
+    if properties & TEXT_STYLE_MIXED_STROKE_WIDTH != 0 {
+        patched.stroke_width = style.stroke_width;
+    }
+    if properties & TEXT_STYLE_MIXED_CORNER_RADII != 0 {
+        patched.corner_radii = style.corner_radii;
+    }
+    if properties & TEXT_STYLE_MIXED_HORIZONTAL_ALIGN != 0 {
+        patched.horizontal_align = style.horizontal_align;
+    }
+    if properties & TEXT_STYLE_MIXED_VERTICAL_ALIGN != 0 {
+        patched.vertical_align = style.vertical_align;
+    }
+    if properties & TEXT_STYLE_MIXED_OPACITY != 0 {
+        patched.opacity = style.opacity;
+    }
+    patched
+}
+
+#[cfg(test)]
+fn serial_number_with_style(
+    serial: &SerialNumberData,
+    style: &SerialNumberStyle,
+) -> SerialNumberData {
+    serial_number_with_style_properties(serial, style, SERIAL_NUMBER_STYLE_ALL_PROPERTIES)
+}
+
+fn serial_number_style_changed_properties(
+    current: &SerialNumberStyle,
+    next: &SerialNumberStyle,
+) -> u32 {
+    let mut properties = 0;
+    if current.number != next.number {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_NUMBER;
+    }
+    if current.numeric_type != next.numeric_type {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE;
+    }
+    if current.serial_number_type != next.serial_number_type {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_TYPE;
+    }
+    if current.color != next.color {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_COLOR;
+    }
+    if current.fill != next.fill {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_FILL;
+    }
+    if current.fill_style != next.fill_style {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE;
+    }
+    if current.font_size != next.font_size {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE;
+    }
+    if current.font_family != next.font_family {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY;
+    }
+    if current.stroke_width != next.stroke_width {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH;
+    }
+    if current.stroke_style != next.stroke_style {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE;
+    }
+    if current.stroke_rendering_style != next.stroke_rendering_style {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE;
+    }
+    if current.opacity != next.opacity {
+        properties |= SERIAL_NUMBER_STYLE_MIXED_OPACITY;
+    }
+    properties
+}
+
+fn serial_number_with_style_properties(
+    serial: &SerialNumberData,
+    style: &SerialNumberStyle,
+    properties: u32,
+) -> SerialNumberData {
+    let next_type = if properties & SERIAL_NUMBER_STYLE_MIXED_TYPE != 0 {
+        style.serial_number_type
+    } else {
+        serial.serial_number_type
+    };
+    let number =
+        if next_type.supports_number() && properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER != 0 {
+            style.number
+        } else {
+            serial.number
+        };
+    let font_size = if properties & SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE != 0 {
+        style.font_size
+    } else {
+        serial.font_size
+    };
+    let numeric_type = if properties & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE != 0 {
+        style.numeric_type
+    } else {
+        serial.numeric_type
+    };
+    let mut typed_serial = serial.clone();
+    typed_serial.serial_number_type = next_type;
+    typed_serial.numeric_type = numeric_type;
+    let mut updated = serial_number_with_label_style(&typed_serial, number, font_size);
+    if serial.serial_number_type.supports_number() != next_type.supports_number() {
+        updated.diameter =
+            resolve_serial_number_data_diameter(&updated, SerialNumberData::default().diameter);
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_COLOR != 0 {
+        updated.color = style.color;
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_FILL != 0 {
+        updated.fill = style.fill;
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE != 0 {
+        updated.fill_style = style.fill_style;
+    }
+    if next_type.supports_number() && properties & SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY != 0 {
+        updated.font_family = normalize_font_family(style.font_family.clone());
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH != 0 {
+        updated.stroke_width = style.stroke_width;
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE != 0 {
+        updated.stroke_style = style.stroke_style;
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE != 0 {
+        updated.stroke_rendering_style = style.stroke_rendering_style;
+    }
+    if properties & SERIAL_NUMBER_STYLE_MIXED_OPACITY != 0 {
+        updated.opacity = style.opacity;
+    }
+    updated
+}
+
+impl Editor {
+    pub fn watermark_config(&self, document: &DocumentModel) -> WatermarkConfig {
+        document.watermark_config().clone()
+    }
+
+    pub fn set_watermark_config(
+        &mut self,
+        document: &DocumentModel,
+        config: WatermarkConfig,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        let config = config.normalized();
+        snow_draw_engine_document::validate_watermark_config(&config)?;
+        if document.watermark_config() == &config {
+            return Ok(None);
+        }
+        let snapshot = self.capture_document_sync_snapshot(document);
+        let mut transaction = Transaction::new("Update watermark");
+        transaction.update_watermark(config);
+        Ok(Some(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::with_history_undo_snapshot(transaction, snapshot),
+        )))
+    }
+
+    pub fn spotlight_config(&self, document: &DocumentModel) -> SpotlightConfig {
+        document.spotlight_config()
+    }
+
+    pub fn set_spotlight_config(
+        &mut self,
+        document: &DocumentModel,
+        config: SpotlightConfig,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        let config = config.normalized();
+        snow_draw_engine_document::validate_spotlight_config(&config)?;
+        if document.spotlight_config() == config {
+            return Ok(None);
+        }
+        let snapshot = self.capture_document_sync_snapshot(document);
+        let mut transaction = Transaction::new("Update spotlight");
+        transaction.update_spotlight(config);
+        Ok(Some(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::with_history_undo_snapshot(transaction, snapshot),
+        )))
+    }
+
+    pub fn style_toolbar_source(&self, document: &DocumentModel) -> StyleToolbarSource {
+        if self.state.active_tool == ActiveTool::Watermark {
+            return StyleToolbarSource::Watermark;
+        }
+        if self.state.active_tool == ActiveTool::Spotlight && self.state.selection.ids.is_empty() {
+            return StyleToolbarSource::DefaultSpotlight;
+        }
+        if self.state.active_tool == ActiveTool::RectangleEraser {
+            return StyleToolbarSource::DefaultRectangleEraser;
+        }
+        if self.state.active_tool == ActiveTool::BrushEraser {
+            return StyleToolbarSource::DefaultBrushEraser;
+        }
+        if self.state.active_tool == ActiveTool::Eraser {
+            return StyleToolbarSource::Eraser;
+        }
+        let primary = self.state.selection.primary;
+        if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.speech_bubble(*id).is_ok())
+        {
+            return StyleToolbarSource::SelectedSpeechBubble;
+        }
+        if self.state.active_tool == ActiveTool::SpeechBubble {
+            return StyleToolbarSource::DefaultSpeechBubble;
+        }
+        if primary.is_some_and(|id| document.pen_filter(id).is_ok()) {
+            StyleToolbarSource::SelectedPenFilter
+        } else if primary.is_some_and(|id| document.filter(id).is_ok()) {
+            StyleToolbarSource::SelectedRectangleFilter
+        } else if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.pen_filter(*id).is_ok())
+        {
+            StyleToolbarSource::SelectedPenFilter
+        } else if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.filter(*id).is_ok())
+        {
+            StyleToolbarSource::SelectedRectangleFilter
+        } else if primary.is_some_and(|id| document.text(id).is_ok()) {
+            StyleToolbarSource::SelectedText
+        } else if primary.is_some_and(|id| document.serial_number(id).is_ok()) {
+            StyleToolbarSource::SelectedSerialNumber
+        } else if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.text(*id).is_ok())
+        {
+            StyleToolbarSource::SelectedText
+        } else if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.serial_number(*id).is_ok())
+        {
+            StyleToolbarSource::SelectedSerialNumber
+        } else if self.state.selection.ids.iter().any(|id| {
+            document
+                .rectangle(*id)
+                .is_ok_and(RectangleData::is_spotlight)
+        }) {
+            StyleToolbarSource::SelectedSpotlight
+        } else if self.selected_rectangle_style(document).is_some() {
+            StyleToolbarSource::SelectedRectangle
+        } else if self.selected_rectangle_highlight_style(document).is_some() {
+            StyleToolbarSource::SelectedRectangleHighlight
+        } else if self.selected_pen_highlight_style(document).is_some() {
+            StyleToolbarSource::SelectedPenHighlight
+        } else if self.selected_line_style(document).is_some() {
+            StyleToolbarSource::SelectedLine
+        } else if self.selected_free_draw_style(document).is_some() {
+            StyleToolbarSource::SelectedFreeDraw
+        } else if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.arrow(*id).is_ok_and(ArrowData::is_distance))
+        {
+            StyleToolbarSource::SelectedDistance
+        } else if self.has_homogeneous_bracket_selection(document) {
+            StyleToolbarSource::SelectedBracket
+        } else if self.has_homogeneous_angle_selection(document) {
+            StyleToolbarSource::SelectedAngle
+        } else if self.selected_arrow_style(document).is_some() {
+            StyleToolbarSource::SelectedArrow
+        } else if self.state.active_tool == ActiveTool::Line {
+            StyleToolbarSource::DefaultLine
+        } else if self.state.active_tool == ActiveTool::FreeDraw {
+            StyleToolbarSource::DefaultFreeDraw
+        } else if self.state.active_tool == ActiveTool::RectangleHighlight {
+            StyleToolbarSource::DefaultRectangleHighlight
+        } else if self.state.active_tool == ActiveTool::Spotlight {
+            StyleToolbarSource::DefaultSpotlight
+        } else if self.state.active_tool == ActiveTool::PenHighlight {
+            StyleToolbarSource::DefaultPenHighlight
+        } else if self.state.active_tool == ActiveTool::PenFilter {
+            StyleToolbarSource::DefaultPenFilter
+        } else if matches!(
+            self.state.active_tool,
+            ActiveTool::RectangleFilter | ActiveTool::AutoFilter
+        ) {
+            StyleToolbarSource::DefaultRectangleFilter
+        } else if self.has_homogeneous_magnifier_selection(document) {
+            StyleToolbarSource::SelectedMagnifier
+        } else if self.state.active_tool == ActiveTool::Magnifier {
+            StyleToolbarSource::DefaultMagnifier
+        } else if self.state.active_tool == ActiveTool::Bracket {
+            StyleToolbarSource::DefaultBracket
+        } else if self.state.active_tool == ActiveTool::Angle {
+            StyleToolbarSource::DefaultAngle
+        } else if self.state.active_tool == ActiveTool::Distance {
+            StyleToolbarSource::DefaultDistance
+        } else if self.state.active_tool == ActiveTool::Arrow {
+            StyleToolbarSource::DefaultArrow
+        } else if self.state.active_tool == ActiveTool::Text {
+            StyleToolbarSource::DefaultText
+        } else if self.state.active_tool == ActiveTool::SerialNumber {
+            StyleToolbarSource::DefaultSerialNumber
+        } else {
+            StyleToolbarSource::DefaultRectangle
+        }
+    }
+
+    pub fn brush_eraser_style(&self) -> crate::BrushEraserStyle {
+        self.state.default_brush_eraser
+    }
+
+    pub fn set_brush_eraser_creation_style(
+        &mut self,
+        style: crate::BrushEraserStyle,
+        properties: u32,
+    ) -> Result<(), ErrorCode> {
+        if properties & !crate::BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH != 0
+            || !style.stroke_width.is_finite()
+            || !(1.0..=72.0).contains(&style.stroke_width)
+        {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        if properties & crate::BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+            self.state.default_brush_eraser = style;
+        }
+        Ok(())
+    }
+
+    pub fn filter_style(&self, document: &DocumentModel) -> FilterStyle {
+        let pen_style = |id| {
+            document.pen_filter(id).ok().map(|filter| FilterStyle {
+                filter_type: filter.filter_type,
+                strength: filter.strength,
+                opacity: filter.opacity,
+                stroke_width: filter.stroke_width,
+            })
+        };
+        let rectangle_style = |id| {
+            document.filter(id).ok().map(|filter| FilterStyle {
+                filter_type: filter.filter_type,
+                strength: filter.strength,
+                opacity: filter.opacity,
+                stroke_width: 2.0,
+            })
+        };
+        // Match the family and primary element chosen by the toolbar source.
+        let selected = self
+            .state
+            .selection
+            .primary
+            .and_then(|id| pen_style(id).or_else(|| rectangle_style(id)))
+            .or_else(|| self.state.selection.ids.iter().copied().find_map(pen_style))
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .copied()
+                    .find_map(rectangle_style)
+            });
+        selected.unwrap_or_else(|| {
+            if self.state.active_tool == ActiveTool::PenFilter {
+                let filter = &self.state.default_pen_filter;
+                FilterStyle {
+                    filter_type: filter.filter_type,
+                    strength: filter.strength,
+                    opacity: filter.opacity,
+                    stroke_width: filter.stroke_width,
+                }
+            } else {
+                let filter = &self.state.default_filter;
+                FilterStyle {
+                    filter_type: if self.state.active_tool == ActiveTool::AutoFilter
+                        && filter.filter_type
+                            == snow_draw_engine_document::CanvasFilterType::SmartErase
+                    {
+                        snow_draw_engine_document::CanvasFilterType::Mosaic
+                    } else {
+                        filter.filter_type
+                    },
+                    strength: filter.strength,
+                    opacity: filter.opacity,
+                    stroke_width: self.state.default_filter_stroke_width,
+                }
+            }
+        })
+    }
+
+    pub fn filter_style_mixed(&self, document: &DocumentModel) -> u32 {
+        let selected = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .filter_map(|id| {
+                document
+                    .pen_filter(*id)
+                    .ok()
+                    .map(|filter| FilterStyle {
+                        filter_type: filter.filter_type,
+                        strength: filter.strength,
+                        opacity: filter.opacity,
+                        stroke_width: filter.stroke_width,
+                    })
+                    .or_else(|| {
+                        document.filter(*id).ok().map(|filter| FilterStyle {
+                            filter_type: filter.filter_type,
+                            strength: filter.strength,
+                            opacity: filter.opacity,
+                            stroke_width: 0.0,
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = selected.first() else {
+            return 0;
+        };
+        // Capability bits identify affected families as well as Smart Erase,
+        // independently of which filter is the primary selection.
+        let contains_both_filters = if self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.filter(*id).is_ok())
+            && self
+                .state
+                .selection
+                .ids
+                .iter()
+                .any(|id| document.pen_filter(*id).is_ok())
+        {
+            crate::FILTER_STYLE_MIXED_CONTAINS_BOTH_FILTERS
+        } else {
+            0
+        };
+        let contains_smart_erase = if selected
+            .iter()
+            .any(|f| f.filter_type == snow_draw_engine_document::CanvasFilterType::SmartErase)
+        {
+            1 << 31
+        } else {
+            0
+        };
+        selected.iter().skip(1).fold(
+            contains_both_filters | contains_smart_erase,
+            |mixed, filter| {
+                mixed
+                    | if filter.filter_type != first.filter_type {
+                        FILTER_STYLE_PROPERTY_TYPE
+                    } else {
+                        0
+                    }
+                    | if (filter.strength - first.strength).abs() > f64::EPSILON {
+                        FILTER_STYLE_PROPERTY_STRENGTH
+                    } else {
+                        0
+                    }
+                    | if (filter.opacity - first.opacity).abs() > f64::EPSILON {
+                        FILTER_STYLE_PROPERTY_OPACITY
+                    } else {
+                        0
+                    }
+                    | if (filter.stroke_width - first.stroke_width).abs() > f64::EPSILON {
+                        FILTER_STYLE_PROPERTY_STROKE_WIDTH
+                    } else {
+                        0
+                    }
+            },
+        )
+    }
+
+    fn validate_filter_style_patch(style: FilterStyle, properties: u32) -> Result<(), ErrorCode> {
+        if style.filter_type == snow_draw_engine_document::CanvasFilterType::RestoreBackground
+            || properties
+                & !(FILTER_STYLE_PROPERTY_TYPE
+                    | FILTER_STYLE_PROPERTY_STRENGTH
+                    | FILTER_STYLE_PROPERTY_OPACITY
+                    | FILTER_STYLE_PROPERTY_STROKE_WIDTH)
+                != 0
+            || !style.opacity.is_finite()
+            || !(0.0..=1.0).contains(&style.opacity)
+            || (properties & FILTER_STYLE_PROPERTY_STROKE_WIDTH != 0
+                && (!style.stroke_width.is_finite() || !(1.0..=72.0).contains(&style.stroke_width)))
+        {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    fn update_shared_filter_strength(&mut self, strength: f64) {
+        self.state.default_filter.strength = if self.state.default_filter.filter_type
+            == snow_draw_engine_document::CanvasFilterType::SmartErase
+        {
+            0.5
+        } else {
+            strength
+        };
+        self.state.default_pen_filter.strength = if self.state.default_pen_filter.filter_type
+            == snow_draw_engine_document::CanvasFilterType::SmartErase
+        {
+            0.5
+        } else {
+            strength
+        };
+    }
+
+    // Creation defaults share strength, while the other properties belong to
+    // the named filter family. Selection and the active tool remain untouched.
+    pub fn set_filter_creation_style(
+        &mut self,
+        style: FilterStyle,
+        properties: u32,
+        tool: ActiveTool,
+    ) -> Result<(), ErrorCode> {
+        if !matches!(tool, ActiveTool::RectangleFilter | ActiveTool::PenFilter) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        Self::validate_filter_style_patch(style, properties)?;
+        let strength = FilterData::normalized_strength(style.strength);
+        if properties & FILTER_STYLE_PROPERTY_STRENGTH != 0 {
+            self.update_shared_filter_strength(strength);
+        }
+        if tool == ActiveTool::PenFilter {
+            if properties & FILTER_STYLE_PROPERTY_TYPE != 0 {
+                self.state.default_pen_filter.filter_type = style.filter_type;
+            }
+            if properties & FILTER_STYLE_PROPERTY_STRENGTH != 0 {
+                self.state.default_pen_filter.strength = strength;
+            }
+            if properties & FILTER_STYLE_PROPERTY_OPACITY != 0 {
+                self.state.default_pen_filter.opacity = style.opacity;
+            }
+            if properties & FILTER_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+                self.state.default_pen_filter.stroke_width = style.stroke_width;
+            }
+        } else {
+            if properties & FILTER_STYLE_PROPERTY_TYPE != 0 {
+                self.state.default_filter.filter_type = style.filter_type;
+            }
+            if properties & FILTER_STYLE_PROPERTY_STRENGTH != 0 {
+                self.state.default_filter.strength = strength;
+            }
+            if properties & FILTER_STYLE_PROPERTY_OPACITY != 0 {
+                self.state.default_filter.opacity = style.opacity;
+            }
+            if properties & FILTER_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+                self.state.default_filter_stroke_width = style.stroke_width;
+            }
+        }
+        if self.state.default_filter.filter_type
+            == snow_draw_engine_document::CanvasFilterType::SmartErase
+        {
+            self.state.default_filter.strength = 0.5;
+        }
+        if self.state.default_pen_filter.filter_type
+            == snow_draw_engine_document::CanvasFilterType::SmartErase
+        {
+            self.state.default_pen_filter.strength = 0.5;
+        }
+        Ok(())
+    }
+
+    pub fn set_filter_style(
+        &mut self,
+        document: &DocumentModel,
+        style: FilterStyle,
+        properties: u32,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        Self::validate_filter_style_patch(style, properties)?;
+        let selected_ids = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| document.filter(*id).is_ok() || document.pen_filter(*id).is_ok())
+            .collect::<Vec<_>>();
+        if selected_ids.is_empty() {
+            let tool = if self.state.active_tool == ActiveTool::PenFilter {
+                ActiveTool::PenFilter
+            } else {
+                ActiveTool::RectangleFilter
+            };
+            self.set_filter_creation_style(style, properties, tool)?;
+            return Ok(None);
+        }
+        // The property mask updates each affected family's creation style as
+        // well as its selected elements, without adopting untouched properties.
+        if selected_ids
+            .iter()
+            .any(|id| document.pen_filter(*id).is_ok())
+        {
+            self.set_filter_creation_style(style, properties, ActiveTool::PenFilter)?;
+        }
+        if selected_ids.iter().any(|id| document.filter(*id).is_ok()) {
+            self.set_filter_creation_style(
+                style,
+                properties & !FILTER_STYLE_PROPERTY_STROKE_WIDTH,
+                ActiveTool::RectangleFilter,
+            )?;
+        }
+        let strength = FilterData::normalized_strength(style.strength);
+        let mut transaction = Transaction::new("update filter style");
+        for id in selected_ids {
+            if let Ok(current) = document.pen_filter(id) {
+                let mut updated = current.clone();
+                if properties & FILTER_STYLE_PROPERTY_TYPE != 0 {
+                    updated.filter_type = style.filter_type;
+                }
+                if properties & FILTER_STYLE_PROPERTY_STRENGTH != 0 {
+                    updated.strength = strength;
+                }
+                if properties & FILTER_STYLE_PROPERTY_OPACITY != 0 {
+                    updated.opacity = style.opacity;
+                }
+                if properties & FILTER_STYLE_PROPERTY_STROKE_WIDTH != 0 {
+                    updated.stroke_width = style.stroke_width;
+                }
+                if updated.filter_type == snow_draw_engine_document::CanvasFilterType::SmartErase {
+                    updated.strength = 0.5;
+                }
+                if updated != *current {
+                    transaction.update_pen_filter(id, updated);
+                }
+            } else if let Ok(current) = document.filter(id) {
+                let mut updated = *current;
+                if properties & FILTER_STYLE_PROPERTY_TYPE != 0 {
+                    updated.filter_type = style.filter_type;
+                }
+                if properties & FILTER_STYLE_PROPERTY_STRENGTH != 0 {
+                    updated.strength = strength;
+                }
+                if properties & FILTER_STYLE_PROPERTY_OPACITY != 0 {
+                    updated.opacity = style.opacity;
+                }
+                if updated.filter_type == snow_draw_engine_document::CanvasFilterType::SmartErase {
+                    updated.strength = 0.5;
+                }
+                if updated != *current {
+                    transaction.update_filter(id, updated);
+                }
+            }
+        }
+        if transaction.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::new(transaction),
+        )))
+    }
+
+    pub fn shape_style(&self, document: &DocumentModel) -> ShapeStyle {
+        if let Some(value) = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .find_map(|id| document.speech_bubble(*id).ok())
+        {
+            return ShapeStyle::from_rectangle_shape_style(RectangleShapeStyle::from_rectangle(
+                &value.body,
+            ))
+            .with_opacity(value.body.opacity);
+        }
+        if self.active_tool() == ActiveTool::SpeechBubble {
+            return ShapeStyle::from_rectangle_shape_style(self.state.default_speech_bubble_style);
+        }
+        if matches!(
+            self.style_toolbar_source(document),
+            StyleToolbarSource::SelectedDistance
+                | StyleToolbarSource::SelectedAngle
+                | StyleToolbarSource::SelectedBracket
+        ) {
+            let arrow = self
+                .state
+                .selection
+                .primary
+                .and_then(|id| document.arrow(id).ok())
+                .filter(|arrow| arrow.is_linear_annotation())
+                .or_else(|| {
+                    self.state.selection.ids.iter().find_map(|id| {
+                        document
+                            .arrow(*id)
+                            .ok()
+                            .filter(|arrow| arrow.is_linear_annotation())
+                    })
+                })
+                .expect("a selected annotation source has an annotation");
+            return ShapeStyle::from_rectangle_shape_style(
+                self.state.default_rectangle_shape_style,
+            )
+            .with_arrow_style(ArrowStyle::from_arrow(arrow))
+            .with_opacity(arrow.opacity);
+        }
+        self.selected_spotlight_style(document)
+            .or_else(|| self.selected_rectangle_style(document))
+            .or_else(|| self.selected_rectangle_highlight_style(document))
+            .or_else(|| self.selected_pen_highlight_style(document))
+            .or_else(|| self.selected_line_style(document))
+            .or_else(|| self.selected_free_draw_style(document))
+            .or_else(|| {
+                self.selected_arrow_style(document).map(|style| {
+                    ShapeStyle::from_rectangle_shape_style(self.state.default_rectangle_shape_style)
+                        .with_arrow_style(style)
+                        .with_opacity(self.selected_arrow_opacity(document).unwrap_or(1.0))
+                })
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::Spotlight).then(|| ShapeStyle {
+                    brush_mode: Default::default(),
+                    shape: self.state.default_spotlight_shape,
+                    corner_radii: self.state.default_spotlight_corner_radii,
+                    ..ShapeStyle::from_rectangle_shape_style(
+                        self.state.default_rectangle_shape_style,
+                    )
+                })
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::Line)
+                    .then_some(self.state.default_line_style)
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::FreeDraw)
+                    .then_some(self.state.default_free_draw_style)
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::RectangleHighlight)
+                    .then_some(self.state.default_rectangle_highlight_style)
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::PenHighlight)
+                    .then_some(self.state.default_pen_highlight_style)
+            })
+            .or_else(|| {
+                (self.state.active_tool == ActiveTool::Arrow).then(|| {
+                    ShapeStyle::from_rectangle_shape_style(self.state.default_rectangle_shape_style)
+                        .with_arrow_style(self.state.default_arrow_style)
+                })
+            })
+            .unwrap_or_else(|| {
+                ShapeStyle::from_rectangle_shape_style(self.state.default_rectangle_shape_style)
+            })
+    }
+
+    pub fn rectangle_shape_style(&self, document: &DocumentModel) -> RectangleShapeStyle {
+        if self.active_tool() == ActiveTool::SpeechBubble {
+            return self.state.default_speech_bubble_style;
+        }
+        self.selected_rectangle_style(document)
+            .map(|style| style.rectangle_shape_style())
+            .unwrap_or(self.state.default_rectangle_shape_style)
+    }
+
+    pub fn arrow_style(&self, document: &DocumentModel) -> ArrowStyle {
+        self.selected_arrow_style(document)
+            .unwrap_or(self.state.default_arrow_style)
+    }
+
+    pub fn shape_style_mixed(&self, document: &DocumentModel) -> u32 {
+        let source = self.style_toolbar_source(document);
+        if matches!(
+            source,
+            StyleToolbarSource::SelectedDistance
+                | StyleToolbarSource::SelectedAngle
+                | StyleToolbarSource::SelectedBracket
+        ) {
+            let mut opacity = self.state.selection.ids.iter().filter_map(|id| {
+                document
+                    .arrow(*id)
+                    .ok()
+                    .filter(|arrow| arrow.is_linear_annotation())
+                    .map(|arrow| arrow.opacity)
+            });
+            let Some(first) = opacity.next() else {
+                return 0;
+            };
+            return if opacity.any(|value| value != first) {
+                SHAPE_STYLE_MIXED_OPACITY
+            } else {
+                0
+            };
+        }
+        let mut selected = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .filter_map(|id| match source {
+                StyleToolbarSource::SelectedSpeechBubble => document
+                    .speech_bubble(*id)
+                    .ok()
+                    .map(|bubble| ShapeStyleSample::from_rectangle(&bubble.body)),
+                StyleToolbarSource::SelectedRectangle => document
+                    .rectangle(*id)
+                    .ok()
+                    .filter(|rect| !rect.is_highlight() && !rect.is_spotlight())
+                    .map(ShapeStyleSample::from_rectangle),
+                StyleToolbarSource::SelectedSpotlight => document
+                    .rectangle(*id)
+                    .ok()
+                    .filter(|rect| rect.is_spotlight())
+                    .map(ShapeStyleSample::from_rectangle),
+                StyleToolbarSource::SelectedRectangleHighlight => document
+                    .rectangle(*id)
+                    .ok()
+                    .filter(|rect| rect.is_highlight())
+                    .map(ShapeStyleSample::from_rectangle),
+                StyleToolbarSource::SelectedPenHighlight => document
+                    .arrow(*id)
+                    .ok()
+                    .filter(|arrow| arrow.is_pen_highlight())
+                    .map(ShapeStyleSample::from_arrow),
+                StyleToolbarSource::SelectedArrow => document
+                    .arrow(*id)
+                    .ok()
+                    .filter(|arrow| arrow.is_regular_arrow())
+                    .map(ShapeStyleSample::from_arrow),
+                StyleToolbarSource::SelectedLine => document
+                    .arrow(*id)
+                    .ok()
+                    .filter(|arrow| arrow.is_line())
+                    .map(ShapeStyleSample::from_arrow),
+                StyleToolbarSource::SelectedFreeDraw => document
+                    .free_draw(*id)
+                    .ok()
+                    .map(ShapeStyleSample::from_free_draw),
+                _ => None,
+            });
+        let Some(first) = selected.next() else {
+            return 0;
+        };
+
+        selected.fold(0, |mut mixed, style| {
+            if style.brush_mode != first.brush_mode {
+                mixed |= crate::SHAPE_STYLE_MIXED_BRUSH_MODE;
+            }
+            if style.fill != first.fill {
+                mixed |= SHAPE_STYLE_MIXED_FILL;
+            }
+            if style.fill_style != first.fill_style {
+                mixed |= SHAPE_STYLE_MIXED_FILL_STYLE;
+            }
+            if style.stroke != first.stroke {
+                mixed |= SHAPE_STYLE_MIXED_STROKE;
+            }
+            if style.stroke_width != first.stroke_width {
+                mixed |= SHAPE_STYLE_MIXED_STROKE_WIDTH;
+            }
+            if style.corner_radii != first.corner_radii {
+                mixed |= SHAPE_STYLE_MIXED_CORNER_RADII;
+            }
+            if style.stroke_style != first.stroke_style {
+                mixed |= SHAPE_STYLE_MIXED_STROKE_STYLE;
+            }
+            if style.stroke_rendering_style != first.stroke_rendering_style {
+                mixed |= crate::SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE;
+            }
+            if style.start_arrowhead != first.start_arrowhead {
+                mixed |= SHAPE_STYLE_MIXED_START_ARROWHEAD;
+            }
+            if style.end_arrowhead != first.end_arrowhead {
+                mixed |= SHAPE_STYLE_MIXED_END_ARROWHEAD;
+            }
+            if style.arrow_outline_color != first.arrow_outline_color {
+                mixed |= crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR;
+            }
+            if style.arrow_outline_width != first.arrow_outline_width {
+                mixed |= crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH;
+            }
+            if style.arrow_ratio != first.arrow_ratio {
+                mixed |= crate::SHAPE_STYLE_MIXED_ARROW_RATIO;
+            }
+            if style.arrow_shaft_type != first.arrow_shaft_type {
+                mixed |= crate::SHAPE_STYLE_MIXED_ARROW_SHAFT_TYPE;
+            }
+            if style.arrow_type != first.arrow_type {
+                mixed |= SHAPE_STYLE_MIXED_ARROW_TYPE;
+            }
+            if style.opacity != first.opacity {
+                mixed |= SHAPE_STYLE_MIXED_OPACITY;
+            }
+            if style.highlight_shape != first.highlight_shape {
+                mixed |= SHAPE_STYLE_MIXED_HIGHLIGHT_SHAPE;
+            }
+            if style.shape != first.shape {
+                mixed |= SHAPE_STYLE_MIXED_SHAPE;
+            }
+            mixed
+        })
+    }
+
+    fn selected_rectangle_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.selected_primary_rectangle_snapshot(document)
+            .map(|(_, rectangle)| rectangle)
+            .filter(|rectangle| !rectangle.is_highlight() && !rectangle.is_spotlight())
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .find_map(|id| {
+                        document
+                            .rectangle(*id)
+                            .ok()
+                            .filter(|rect| !rect.is_highlight() && !rect.is_spotlight())
+                    })
+                    .cloned()
+            })
+            .map(|rectangle| ShapeStyle::from_rectangle(&rectangle))
+    }
+
+    fn selected_spotlight_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.selected_primary_rectangle_snapshot(document)
+            .map(|(_, rectangle)| rectangle)
+            .filter(RectangleData::is_spotlight)
+            .or_else(|| {
+                self.state.selection.ids.iter().find_map(|id| {
+                    document
+                        .rectangle(*id)
+                        .ok()
+                        .filter(|rect| rect.is_spotlight())
+                        .copied()
+                })
+            })
+            .map(|rectangle| ShapeStyle::from_rectangle(&rectangle))
+    }
+
+    fn selected_rectangle_highlight_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.rectangle(id).ok())
+            .filter(|rect| rect.is_highlight())
+            .or_else(|| {
+                self.state.selection.ids.iter().find_map(|id| {
+                    document
+                        .rectangle(*id)
+                        .ok()
+                        .filter(|rect| rect.is_highlight())
+                })
+            })
+            .map(ShapeStyle::from_rectangle)
+    }
+
+    fn selected_pen_highlight_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.arrow(id).ok())
+            .filter(|pen| pen.is_pen_highlight())
+            .or_else(|| {
+                self.state.selection.ids.iter().find_map(|id| {
+                    document
+                        .arrow(*id)
+                        .ok()
+                        .filter(|pen| pen.is_pen_highlight())
+                })
+            })
+            .map(ShapeStyle::from_line)
+    }
+
+    fn selected_arrow_style(&self, document: &DocumentModel) -> Option<ArrowStyle> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.arrow(id).ok())
+            .filter(|arrow| arrow.is_regular_arrow())
+            .or_else(|| {
+                self.state.selection.ids.iter().find_map(|id| {
+                    document
+                        .arrow(*id)
+                        .ok()
+                        .filter(|arrow| arrow.is_regular_arrow())
+                })
+            })
+            .map(ArrowStyle::from_arrow)
+    }
+
+    fn selected_line_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.arrow(id).ok())
+            .filter(|line| line.is_line())
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .find_map(|id| document.arrow(*id).ok().filter(|line| line.is_line()))
+            })
+            .map(ShapeStyle::from_line)
+    }
+
+    fn selected_free_draw_style(&self, document: &DocumentModel) -> Option<ShapeStyle> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.free_draw(id).ok())
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .find_map(|id| document.free_draw(*id).ok())
+            })
+            .map(ShapeStyle::from_free_draw)
+    }
+
+    fn selected_arrow_opacity(&self, document: &DocumentModel) -> Option<f64> {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.arrow(id).ok())
+            .filter(|arrow| arrow.is_regular_arrow())
+            .or_else(|| {
+                self.state.selection.ids.iter().find_map(|id| {
+                    document
+                        .arrow(*id)
+                        .ok()
+                        .filter(|arrow| arrow.is_regular_arrow())
+                })
+            })
+            .map(|arrow| arrow.opacity)
+    }
+
+    pub fn text_style(&self, document: &DocumentModel) -> TextStyle {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.text(id).ok())
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .find_map(|id| document.text(*id).ok())
+            })
+            .map(TextStyle::from_text)
+            .unwrap_or_else(|| TextStyle::from_text(&self.state.default_text))
+    }
+
+    pub fn text_style_mixed(&self, document: &DocumentModel) -> u32 {
+        let mut selected_texts = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .filter_map(|id| document.text(*id).ok());
+        let Some(first) = selected_texts.next() else {
+            return 0;
+        };
+        let first = TextStyle::from_text(first);
+        selected_texts.fold(0, |mut mixed, text| {
+            let style = TextStyle::from_text(text);
+            if style.color != first.color {
+                mixed |= TEXT_STYLE_MIXED_COLOR;
+            }
+            if style.bold != first.bold {
+                mixed |= TEXT_STYLE_MIXED_BOLD;
+            }
+            if style.italic != first.italic {
+                mixed |= TEXT_STYLE_MIXED_ITALIC;
+            }
+            if style.font_size != first.font_size {
+                mixed |= TEXT_STYLE_MIXED_FONT_SIZE;
+            }
+            if style.font_family != first.font_family {
+                mixed |= TEXT_STYLE_MIXED_FONT_FAMILY;
+            }
+            if style.fill != first.fill {
+                mixed |= TEXT_STYLE_MIXED_FILL;
+            }
+            if style.fill_style != first.fill_style {
+                mixed |= TEXT_STYLE_MIXED_FILL_STYLE;
+            }
+            if style.stroke != first.stroke {
+                mixed |= TEXT_STYLE_MIXED_STROKE;
+            }
+            if style.stroke_width != first.stroke_width {
+                mixed |= TEXT_STYLE_MIXED_STROKE_WIDTH;
+            }
+            if style.corner_radii != first.corner_radii {
+                mixed |= TEXT_STYLE_MIXED_CORNER_RADII;
+            }
+            if style.horizontal_align != first.horizontal_align {
+                mixed |= TEXT_STYLE_MIXED_HORIZONTAL_ALIGN;
+            }
+            if style.vertical_align != first.vertical_align {
+                mixed |= TEXT_STYLE_MIXED_VERTICAL_ALIGN;
+            }
+            if style.opacity != first.opacity {
+                mixed |= TEXT_STYLE_MIXED_OPACITY;
+            }
+            mixed
+        })
+    }
+
+    pub fn serial_number_style(&self, document: &DocumentModel) -> SerialNumberStyle {
+        self.state
+            .selection
+            .primary
+            .and_then(|id| document.serial_number(id).ok())
+            .or_else(|| {
+                self.state
+                    .selection
+                    .ids
+                    .iter()
+                    .find_map(|id| document.serial_number(*id).ok())
+            })
+            .map(SerialNumberStyle::from_serial_number)
+            .unwrap_or_else(|| {
+                SerialNumberStyle::from_serial_number(&self.state.default_serial_number)
+            })
+    }
+
+    pub fn serial_number_style_mixed(&self, document: &DocumentModel) -> u32 {
+        let mut selected_serial_numbers = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .filter_map(|id| document.serial_number(*id).ok());
+        let Some(first) = selected_serial_numbers.next() else {
+            return 0;
+        };
+        let first = SerialNumberStyle::from_serial_number(first);
+        selected_serial_numbers.fold(0, |mut mixed, serial| {
+            let style = SerialNumberStyle::from_serial_number(serial);
+            if style.number != first.number {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_NUMBER;
+            }
+            if style.numeric_type != first.numeric_type {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE;
+            }
+            if style.serial_number_type != first.serial_number_type {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_TYPE;
+            }
+            if style.color != first.color {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_COLOR;
+            }
+            if style.fill != first.fill {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_FILL;
+            }
+            if style.fill_style != first.fill_style {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE;
+            }
+            if style.font_size != first.font_size {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE;
+            }
+            if style.font_family != first.font_family {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY;
+            }
+            if style.stroke_width != first.stroke_width {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH;
+            }
+            if style.stroke_style != first.stroke_style {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE;
+            }
+            if style.stroke_rendering_style != first.stroke_rendering_style {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE;
+            }
+            if style.opacity != first.opacity {
+                mixed |= SERIAL_NUMBER_STYLE_MIXED_OPACITY;
+            }
+            mixed
+        })
+    }
+
+    fn update_default_shape_styles(
+        &mut self,
+        document: &DocumentModel,
+        rectangle_style: RectangleShapeStyle,
+        mut arrow_style: ArrowStyle,
+    ) {
+        arrow_style.arrow_outline_width =
+            snow_draw_engine_core::arrow::normalize_arrow_outline_width(
+                arrow_style.arrow_outline_width,
+            );
+        arrow_style.arrow_ratio =
+            snow_draw_engine_core::arrow::normalize_arrow_ratio(arrow_style.arrow_ratio);
+        if self.state.default_rectangle_shape_style == rectangle_style
+            && self.state.default_arrow_style == arrow_style
+        {
+            return;
+        }
+
+        self.state.default_rectangle_shape_style = rectangle_style;
+        self.state.default_arrow_style = arrow_style;
+        let bindables = self.bindable_elements(document, &[]);
+        let arrow_context = self.arrow_engine_context(Modifiers::default());
+        let preview_changed = match self.state.creation_preview.as_mut() {
+            Some(ElementCreationPreview::Rectangle(preview)) if !preview.is_spotlight() => {
+                let next = rectangle_with_style(preview, rectangle_style);
+                if *preview != next {
+                    *preview = next;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(ElementCreationPreview::Arrow(preview)) => {
+                let next = arrow_with_style(
+                    document.peek_next_element_id(),
+                    preview,
+                    arrow_style,
+                    &bindables,
+                    arrow_context,
+                );
+                if *preview != next {
+                    *preview = next;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if preview_changed {
+            self.bump_scene_state_revision();
+        }
+    }
+
+    fn update_default_serial_number_style(&mut self, style: &SerialNumberStyle, properties: u32) {
+        let mut next_default = serial_number_with_style_properties(
+            &self.state.default_serial_number,
+            style,
+            properties,
+        );
+        let numeric_type_changed =
+            next_default.numeric_type != self.state.default_serial_number.numeric_type;
+        self.state.serial_number_values_by_numeric_type = self.state.serial_number_values();
+        if numeric_type_changed && properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER == 0 {
+            // Creation counters belong to numeric types even for numberless badges.
+            next_default.number =
+                self.state.serial_number_values_by_numeric_type[next_default.numeric_type as usize];
+        }
+        if properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER != 0
+            && next_default.serial_number_type.supports_number()
+        {
+            self.state.serial_number_sequence_overridden[next_default.numeric_type as usize] = true;
+        }
+        if self.state.default_serial_number == next_default {
+            return;
+        }
+
+        self.state.default_serial_number = next_default;
+        if let Some(ElementCreationPreview::SerialNumber(preview)) =
+            self.state.creation_preview.as_mut()
+        {
+            let preview_properties = if numeric_type_changed {
+                properties | SERIAL_NUMBER_STYLE_MIXED_NUMBER
+            } else {
+                properties
+            };
+            *preview = serial_number_with_style_properties(
+                preview,
+                &SerialNumberStyle::from_serial_number(&self.state.default_serial_number),
+                preview_properties,
+            );
+            self.bump_scene_state_revision();
+        }
+    }
+
+    pub fn set_shape_style_patch(
+        &mut self,
+        document: &DocumentModel,
+        patch: ShapeStylePatch,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        validate_shape_style_patch(patch)?;
+        if patch.is_empty() {
+            return Ok(None);
+        }
+
+        match patch.kind {
+            ShapeKind::SpeechBubble => {
+                self.state.default_speech_bubble_style =
+                    patch.apply_to_rectangle_shape(self.state.default_speech_bubble_style);
+                if let Some(ElementCreationPreview::SpeechBubble(bubble)) =
+                    self.state.creation_preview.as_mut()
+                {
+                    bubble.body = speech_bubble_body_with_style(
+                        &bubble.body,
+                        self.state.default_speech_bubble_style,
+                    );
+                    self.bump_scene_state_revision();
+                }
+            }
+            ShapeKind::Rectangle => self.update_default_shape_styles(
+                document,
+                patch.apply_to_rectangle_shape(self.state.default_rectangle_shape_style),
+                self.state.default_arrow_style,
+            ),
+            ShapeKind::Arrow => self.update_default_shape_styles(
+                document,
+                self.state.default_rectangle_shape_style,
+                patch.apply_to_arrow(self.state.default_arrow_style),
+            ),
+            ShapeKind::Line => {
+                self.state.default_line_style = patch.apply_to_line(self.state.default_line_style);
+                if let Some(ElementCreationPreview::Arrow(preview)) =
+                    self.state.creation_preview.as_mut()
+                    && preview.is_line()
+                {
+                    let updated = line_with_style(
+                        preview,
+                        patch.apply_to_line(ShapeStyle::from_line(preview)),
+                    );
+                    if *preview != updated {
+                        *preview = updated;
+                        self.bump_scene_state_revision();
+                    }
+                }
+            }
+            ShapeKind::FreeDraw => {
+                self.state.default_free_draw_style =
+                    patch.apply_to_line(self.state.default_free_draw_style);
+            }
+            ShapeKind::RectangleHighlight => {
+                self.state.default_rectangle_highlight_style =
+                    patch.apply_to_highlight(self.state.default_rectangle_highlight_style);
+            }
+            ShapeKind::PenHighlight => {
+                self.state.default_pen_highlight_style =
+                    patch.apply_to_line(self.state.default_pen_highlight_style);
+            }
+            ShapeKind::Spotlight => {
+                if patch.active_properties() & SHAPE_STYLE_PROPERTY_SHAPE != 0 {
+                    self.state.default_spotlight_shape = patch.style.shape;
+                }
+                if patch.active_properties() & SHAPE_STYLE_PROPERTY_CORNER_RADII != 0 {
+                    self.state.default_spotlight_corner_radii = patch.style.corner_radii;
+                }
+                if let Some(ElementCreationPreview::Rectangle(preview)) =
+                    self.state.creation_preview.as_mut()
+                    && preview.is_spotlight()
+                {
+                    let updated = rectangle_with_style(
+                        preview,
+                        patch
+                            .apply_to_rectangle_shape(RectangleShapeStyle::from_rectangle(preview)),
+                    );
+                    if *preview != updated {
+                        *preview = updated;
+                        self.bump_scene_state_revision();
+                    }
+                }
+            }
+        }
+
+        let bindables = self.bindable_elements(document, &[]);
+        let arrow_context = self.arrow_engine_context(Modifiers::default());
+        if !self.state.selection.is_empty() {
+            let history_undo_snapshot = self.capture_document_sync_snapshot(document);
+            let mut transaction = Transaction::new("update element style properties");
+            let mut next_selection_elements = Vec::new();
+            let mut next_selection_arrows = Vec::new();
+            for id in self.state.selection.ids.iter().copied() {
+                if let Ok(current) = document.speech_bubble(id) {
+                    let mut bubble = current.clone();
+                    if patch.kind == ShapeKind::SpeechBubble {
+                        bubble.body = speech_bubble_body_with_style(
+                            &bubble.body,
+                            patch.apply_to_rectangle_shape(RectangleShapeStyle::from_rectangle(
+                                &bubble.body,
+                            )),
+                        );
+                    }
+                    snow_draw_engine_document::speech_bubble_remove_swallowed_tails(&mut bubble);
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: snow_draw_engine_document::speech_bubble_body_proxy(&bubble),
+                    });
+                    if bubble != *current {
+                        transaction.update_speech_bubble(id, bubble);
+                    }
+                    continue;
+                }
+                if let Ok(current_rect) = document.rectangle(id) {
+                    let matches_kind = (patch.kind == ShapeKind::Rectangle
+                        && !current_rect.is_highlight()
+                        && !current_rect.is_spotlight())
+                        || (patch.kind == ShapeKind::RectangleHighlight
+                            && current_rect.is_highlight())
+                        || (patch.kind == ShapeKind::Spotlight && current_rect.is_spotlight());
+                    let updated_rect = if matches_kind {
+                        rectangle_with_style(
+                            current_rect,
+                            patch.apply_to_rectangle_shape(RectangleShapeStyle::from_rectangle(
+                                current_rect,
+                            )),
+                        )
+                    } else {
+                        *current_rect
+                    };
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: updated_rect,
+                    });
+                    if matches_kind && *current_rect != updated_rect {
+                        transaction.update_rectangle(id, updated_rect);
+                    }
+                    continue;
+                }
+                if let Ok(current_free_draw) = document.free_draw(id) {
+                    let mut updated = current_free_draw.clone();
+                    if patch.kind == ShapeKind::FreeDraw {
+                        let style =
+                            patch.apply_to_line(ShapeStyle::from_free_draw(current_free_draw));
+                        updated.fill = style.fill;
+                        updated.fill_style = style.fill_style;
+                        updated.stroke = style.stroke;
+                        updated.stroke_width = style.stroke_width;
+                        updated.stroke_style = style.stroke_style;
+                        updated.opacity = style.opacity;
+                        updated.brush_mode = style.brush_mode;
+                    }
+                    if updated != *current_free_draw {
+                        transaction.update_free_draw(id, updated.clone());
+                    }
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: RectangleData {
+                            stroke_rendering_seed: 0,
+                            text_element_id: None,
+                            stroke_rendering_style: Default::default(),
+                            rectangle_kind:
+                                snow_draw_engine_document::RectangleElementKind::Rectangle,
+                            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+                            center: Point::new(
+                                updated.x + updated.width / 2.0,
+                                updated.y + updated.height / 2.0,
+                            ),
+                            width: updated.width,
+                            height: updated.height,
+                            rotation: updated.rotation,
+                            fill: updated.fill,
+                            fill_style: updated.fill_style,
+                            stroke: updated.stroke,
+                            stroke_width: updated.stroke_width,
+                            stroke_style: updated.stroke_style,
+                            corner_radii: CornerRadii::default(),
+                            opacity: updated.opacity,
+                        },
+                    });
+                    continue;
+                }
+                let Ok(current_arrow) = document.arrow(id) else {
+                    if let Some(rect) = document.element_rect_proxy(id) {
+                        next_selection_elements.push(SelectionRectState { id, rect });
+                    }
+                    continue;
+                };
+                let updated_arrow = if patch.kind == ShapeKind::Arrow
+                    && current_arrow.is_regular_arrow()
+                {
+                    arrow_with_style(
+                        id,
+                        current_arrow,
+                        patch.apply_to_arrow(ArrowStyle::from_arrow(current_arrow)),
+                        &bindables,
+                        arrow_context,
+                    )
+                } else if patch.kind == ShapeKind::Line && current_arrow.is_line() {
+                    line_with_style(
+                        current_arrow,
+                        patch.apply_to_line(ShapeStyle::from_line(current_arrow)),
+                    )
+                } else if patch.kind == ShapeKind::PenHighlight && current_arrow.is_pen_highlight()
+                {
+                    let style = patch.apply_to_line(ShapeStyle::from_line(current_arrow));
+                    let mut updated = current_arrow.clone();
+                    updated.stroke = style.stroke;
+                    updated.stroke_width = style.stroke_width;
+                    updated.stroke_style = StrokeStyle::Solid;
+                    updated.arrow_type = ArrowType::Straight;
+                    updated
+                } else {
+                    current_arrow.clone()
+                };
+                next_selection_arrows.push(SelectionArrowState {
+                    id,
+                    arrow: updated_arrow.clone(),
+                });
+                if matches!(
+                    patch.kind,
+                    ShapeKind::Arrow
+                        | ShapeKind::Line
+                        | ShapeKind::FreeDraw
+                        | ShapeKind::PenHighlight
+                ) && *current_arrow != updated_arrow
+                {
+                    transaction.update_arrow(id, updated_arrow);
+                }
+            }
+            if transaction.is_empty() {
+                return Ok(None);
+            }
+            self.state.selection.elements = next_selection_elements;
+            self.state.selection.arrows = next_selection_arrows;
+            self.state.selection.bounds = selection_bounds_from_selection(
+                &self.state.selection.elements,
+                &self.state.selection.arrows,
+            );
+            return Ok(Some(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::with_history_undo_snapshot(
+                    transaction,
+                    history_undo_snapshot,
+                ),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    pub fn set_rectangle_shape_style(
+        &mut self,
+        document: &DocumentModel,
+        style: RectangleShapeStyle,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        validate_rectangle_shape_style(style)?;
+        self.update_default_shape_styles(document, style, self.state.default_arrow_style);
+
+        if !self.state.selection.is_empty() {
+            let history_undo_snapshot = self.capture_document_sync_snapshot(document);
+            let mut transaction = Transaction::new("update rectangle style");
+            let mut next_selection_elements = Vec::new();
+            let mut next_selection_arrows = Vec::new();
+
+            for id in self.state.selection.ids.iter().copied() {
+                if let Ok(current) = document.speech_bubble(id) {
+                    let mut bubble = current.clone();
+                    bubble.body = rectangle_with_style(&bubble.body, style);
+                    snow_draw_engine_document::speech_bubble_remove_swallowed_tails(&mut bubble);
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: snow_draw_engine_document::speech_bubble_body_proxy(&bubble),
+                    });
+                    if bubble != *current {
+                        transaction.update_speech_bubble(id, bubble);
+                    }
+                    continue;
+                }
+                if let Ok(current_rect) = document.rectangle(id) {
+                    let updated_rect = if current_rect.is_spotlight() {
+                        *current_rect
+                    } else {
+                        rectangle_with_style(current_rect, style)
+                    };
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: updated_rect,
+                    });
+                    if *current_rect != updated_rect {
+                        transaction.update_rectangle(id, updated_rect);
+                    }
+                    continue;
+                }
+
+                if let Ok(current_arrow) = document.arrow(id) {
+                    next_selection_arrows.push(SelectionArrowState {
+                        id,
+                        arrow: current_arrow.clone(),
+                    });
+                    continue;
+                }
+
+                if let Some(rect) = document.element_rect_proxy(id) {
+                    next_selection_elements.push(SelectionRectState { id, rect });
+                }
+            }
+
+            if transaction.is_empty() {
+                return Ok(None);
+            }
+
+            self.state.selection.elements = next_selection_elements;
+            self.state.selection.arrows = next_selection_arrows;
+            self.state.selection.bounds = selection_bounds_from_selection(
+                &self.state.selection.elements,
+                &self.state.selection.arrows,
+            );
+            return Ok(Some(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::with_history_undo_snapshot(
+                    transaction,
+                    history_undo_snapshot,
+                ),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    pub fn set_text_creation_style(
+        &mut self,
+        style: TextStyle,
+        properties: u32,
+    ) -> Result<(), ErrorCode> {
+        validate_text_style(&style)?;
+        if properties & !TEXT_STYLE_ALL_PROPERTIES != 0 {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        self.state.default_text = text_with_style_attributes(
+            &self.state.default_text,
+            &patched_text_style(&self.state.default_text, &style, properties),
+        );
+        Ok(())
+    }
+
+    pub fn set_text_style(
+        &mut self,
+        document: &DocumentModel,
+        style: TextStyle,
+        properties: u32,
+        layouts: &[TextLayoutOverride],
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        validate_text_style(&style)?;
+        if properties & !TEXT_STYLE_ALL_PROPERTIES != 0 {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        let next_default = text_with_style_attributes(
+            &self.state.default_text,
+            &patched_text_style(&self.state.default_text, &style, properties),
+        );
+
+        let selected_text_ids = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| document.text(*id).is_ok())
+            .collect::<Vec<_>>();
+        if !selected_text_ids.is_empty() {
+            let history_undo_snapshot = self.capture_document_sync_snapshot(document);
+            let mut transaction = Transaction::new("update text style");
+            let mut next_selection_elements = Vec::new();
+            let mut next_selection_arrows = Vec::new();
+
+            for id in self.state.selection.ids.iter().copied() {
+                if let Ok(current_text) = document.text(id) {
+                    let updated_text =
+                        text_with_style(id, current_text, &style, properties, layouts)?;
+                    validate_text(&updated_text)?;
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: RectangleData {
+                            stroke_rendering_style: Default::default(),
+                            text_element_id: None,
+                            stroke_rendering_seed: 0,
+                            rectangle_kind:
+                                snow_draw_engine_document::RectangleElementKind::Rectangle,
+                            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+                            center: updated_text.center,
+                            width: updated_text.width(),
+                            height: updated_text.height(),
+                            rotation: updated_text.rotation,
+                            fill: updated_text.fill,
+                            fill_style: updated_text.fill_style,
+                            stroke: updated_text.stroke,
+                            stroke_width: updated_text.stroke_width,
+                            stroke_style: StrokeStyle::Solid,
+                            corner_radii: updated_text.corner_radii,
+                            opacity: updated_text.opacity,
+                        },
+                    });
+                    if *current_text != updated_text {
+                        transaction.update_text(id, updated_text);
+                    }
+                    continue;
+                }
+
+                if let Ok(current_arrow) = document.arrow(id) {
+                    next_selection_arrows.push(SelectionArrowState {
+                        id,
+                        arrow: current_arrow.clone(),
+                    });
+                    continue;
+                }
+
+                if let Some(rect) = document.element_rect_proxy(id) {
+                    next_selection_elements.push(SelectionRectState { id, rect });
+                }
+            }
+
+            self.state.default_text = next_default;
+            if transaction.is_empty() {
+                return Ok(None);
+            }
+            self.state.selection.elements = next_selection_elements;
+            self.state.selection.arrows = next_selection_arrows;
+            self.state.selection.bounds = selection_bounds_from_selection(
+                &self.state.selection.elements,
+                &self.state.selection.arrows,
+            );
+            return Ok(Some(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::with_history_undo_snapshot(
+                    transaction,
+                    history_undo_snapshot,
+                ),
+            )));
+        }
+
+        self.state.default_text = next_default;
+        Ok(None)
+    }
+
+    pub fn set_serial_number_style(
+        &mut self,
+        document: &DocumentModel,
+        style: SerialNumberStyle,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        validate_serial_number_style(&style)?;
+
+        let current_style = self.serial_number_style(document);
+        let mixed = self.serial_number_style_mixed(document);
+        let changed_properties = serial_number_style_changed_properties(&current_style, &style);
+        let type_only_change = changed_properties == SERIAL_NUMBER_STYLE_MIXED_TYPE
+            || (changed_properties == 0 && mixed & SERIAL_NUMBER_STYLE_MIXED_TYPE != 0);
+        let properties = if changed_properties == SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE
+            || (changed_properties == 0
+                && mixed & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE != 0
+                && mixed & SERIAL_NUMBER_STYLE_MIXED_TYPE == 0)
+        {
+            SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE
+        } else if type_only_change {
+            SERIAL_NUMBER_STYLE_MIXED_TYPE
+        } else if (mixed & SERIAL_NUMBER_STYLE_MIXED_TYPE != 0
+            && changed_properties & SERIAL_NUMBER_STYLE_MIXED_TYPE == 0)
+            || (mixed & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE != 0
+                && changed_properties & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE == 0)
+        {
+            changed_properties
+        } else {
+            SERIAL_NUMBER_STYLE_ALL_PROPERTIES
+        };
+
+        self.set_serial_number_style_properties(
+            document,
+            style,
+            properties,
+            changed_properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER != 0,
+            changed_properties | (properties & mixed),
+        )
+    }
+
+    pub fn set_serial_number_style_patch(
+        &mut self,
+        document: &DocumentModel,
+        style: SerialNumberStyle,
+        properties: u32,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        self.set_serial_number_style_properties(
+            document,
+            style,
+            properties,
+            properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER != 0,
+            properties,
+        )
+    }
+
+    fn set_serial_number_style_properties(
+        &mut self,
+        document: &DocumentModel,
+        style: SerialNumberStyle,
+        properties: u32,
+        explicit_number: bool,
+        creation_properties: u32,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        validate_serial_number_style(&style)?;
+        if properties == 0 || properties & !SERIAL_NUMBER_STYLE_ALL_PROPERTIES != 0 {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        // Full element styles carry a number during appearance edits. Only an
+        // explicit number edit may replace a creation counter or restart it.
+        let creation_properties = if explicit_number {
+            creation_properties
+        } else {
+            creation_properties & !SERIAL_NUMBER_STYLE_MIXED_NUMBER
+        };
+        let has_selected_serial_number = self
+            .state
+            .selection
+            .ids
+            .iter()
+            .any(|id| document.serial_number(*id).is_ok());
+        if has_selected_serial_number {
+            let history_undo_snapshot = self.capture_document_sync_snapshot(document);
+            let mut transaction = Transaction::new("update serial number style");
+            let mut next_selection_elements = Vec::new();
+            let mut next_selection_arrows = Vec::new();
+
+            for id in self.state.selection.ids.iter().copied() {
+                if let Ok(current_serial) = document.serial_number(id) {
+                    let updated_serial =
+                        serial_number_with_style_properties(current_serial, &style, properties);
+                    validate_serial_number(&updated_serial)?;
+                    next_selection_elements.push(SelectionRectState {
+                        id,
+                        rect: serial_number_rect_proxy(&updated_serial),
+                    });
+                    if *current_serial != updated_serial {
+                        transaction.update_serial_number(id, updated_serial);
+                    }
+                    continue;
+                }
+
+                if let Ok(current_arrow) = document.arrow(id) {
+                    next_selection_arrows.push(SelectionArrowState {
+                        id,
+                        arrow: current_arrow.clone(),
+                    });
+                    continue;
+                }
+
+                if let Some(rect) = document.element_rect_proxy(id) {
+                    next_selection_elements.push(SelectionRectState { id, rect });
+                }
+            }
+
+            self.update_default_serial_number_style(
+                &style,
+                creation_properties & !SERIAL_NUMBER_STYLE_MIXED_NUMBER,
+            );
+            if transaction.is_empty() {
+                return Ok(None);
+            }
+            // Value edits continue their numeric sequence instead of treating
+            // the selected number as a fresh creation start.
+            if explicit_number {
+                self.continue_serial_number_sequences_after_value_edits(document, &transaction);
+            }
+            self.state.selection.elements = next_selection_elements;
+            self.state.selection.arrows = next_selection_arrows;
+            self.state.selection.bounds = selection_bounds_from_selection(
+                &self.state.selection.elements,
+                &self.state.selection.arrows,
+            );
+            return Ok(Some(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::with_history_undo_snapshot(
+                    transaction,
+                    history_undo_snapshot,
+                ),
+            )));
+        }
+
+        self.update_default_serial_number_style(&style, creation_properties);
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defaults::editor_style_defaults;
+    use snow_draw_engine_core::Point;
+    use snow_draw_engine_document::{
+        ElementId, ElementMeta, TextLayoutSize, resolve_serial_number_style_diameter,
+    };
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= f64::EPSILON,
+            "expected {actual} to equal {expected}"
+        );
+    }
+
+    #[test]
+    fn spotlight_shape_patch_updates_only_selected_cutouts_and_its_default() {
+        use snow_draw_engine_document::{HighlightShape, RectangleElementKind};
+        let mut document = DocumentModel::new();
+        let base = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: RectangleElementKind::Rectangle,
+            highlight_shape: HighlightShape::Rectangle,
+            center: Point::default(),
+            width: 80.0,
+            height: 40.0,
+            rotation: 0.0,
+            fill: ColorRgba8::default(),
+            stroke: ColorRgba8::default(),
+            stroke_width: 0.0,
+            fill_style: FillStyle::Solid,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+        let ids: Vec<_> = (0..4).map(|_| document.allocate_element_id()).collect();
+        let mut insert = Transaction::new("spotlight shape fixture");
+        insert.insert_rectangle(ids[0], ElementMeta::default(), base.into_spotlight());
+        insert.insert_rectangle(
+            ids[1],
+            ElementMeta::default(),
+            RectangleData {
+                highlight_shape: HighlightShape::Ellipse,
+                ..base
+            }
+            .into_spotlight(),
+        );
+        insert.insert_rectangle(ids[2], ElementMeta::default(), base);
+        insert.insert_rectangle(ids[3], ElementMeta::default(), base.into_spotlight());
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(Some(&document), ids[..3].to_vec(), Some(ids[0]));
+        assert_eq!(editor.shape_style_mixed(&document), SHAPE_STYLE_MIXED_SHAPE);
+        let mut style = editor.shape_style(&document);
+        style.shape = HighlightShape::Diamond;
+        let patch = ShapeStylePatch {
+            kind: ShapeKind::Spotlight,
+            style,
+            properties: SHAPE_STYLE_PROPERTY_SHAPE,
+        };
+        let Some(EditorCommand::ApplyTransaction(command)) =
+            editor.set_shape_style_patch(&document, patch).unwrap()
+        else {
+            panic!("a spotlight shape edit must create one transaction");
+        };
+        let result = document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            document.rectangle(ids[0]).unwrap().highlight_shape,
+            HighlightShape::Diamond
+        );
+        assert_eq!(
+            document.rectangle(ids[1]).unwrap().highlight_shape,
+            HighlightShape::Diamond
+        );
+        assert_eq!(*document.rectangle(ids[2]).unwrap(), base);
+        assert_eq!(
+            document.rectangle(ids[3]).unwrap().highlight_shape,
+            HighlightShape::Rectangle
+        );
+        assert_eq!(editor.shape_style_mixed(&document), 0);
+        assert_eq!(
+            editor.state.default_spotlight_shape,
+            HighlightShape::Diamond
+        );
+        assert_eq!(
+            editor.state.default_rectangle_shape_style.shape,
+            HighlightShape::Rectangle
+        );
+        document.apply_transaction(result.inverse).unwrap();
+        assert_eq!(
+            document.rectangle(ids[1]).unwrap().highlight_shape,
+            HighlightShape::Ellipse
+        );
+        assert_eq!(
+            ShapeKind::Spotlight.supported_properties(),
+            SHAPE_STYLE_PROPERTY_SHAPE | SHAPE_STYLE_PROPERTY_CORNER_RADII
+        );
+        for bit in 0..14 {
+            let properties = 1 << bit;
+            if properties != SHAPE_STYLE_PROPERTY_SHAPE
+                && properties != SHAPE_STYLE_PROPERTY_CORNER_RADII
+            {
+                assert_eq!(
+                    editor.set_shape_style_patch(
+                        &document,
+                        ShapeStylePatch {
+                            properties,
+                            ..patch
+                        }
+                    ),
+                    Err(ErrorCode::InvalidArgument)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filter_creation_style_preserves_selection_tool_and_document() {
+        let mut document = DocumentModel::new();
+        let id = document.allocate_element_id();
+        let filter = FilterData::default();
+        let mut insert = Transaction::new("filter fixture");
+        insert.insert_filter(id, ElementMeta::default(), filter);
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(snow_draw_engine_core::EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Select).unwrap();
+        editor.set_selection_state(vec![id], Some(id));
+        let selected = editor.state.selection.clone();
+        let rectangle = FilterStyle {
+            filter_type: snow_draw_engine_document::CanvasFilterType::GaussianBlur,
+            strength: 0.3,
+            opacity: 0.6,
+            stroke_width: 7.0,
+        };
+        let pen = FilterStyle {
+            filter_type: snow_draw_engine_document::CanvasFilterType::Brightness,
+            strength: 0.8,
+            opacity: 0.9,
+            stroke_width: 20.0,
+        };
+        for _ in 0..128 {
+            editor
+                .set_filter_creation_style(
+                    rectangle,
+                    crate::FILTER_STYLE_PROPERTY_ALL,
+                    ActiveTool::RectangleFilter,
+                )
+                .unwrap();
+            editor
+                .set_filter_creation_style(
+                    pen,
+                    crate::FILTER_STYLE_PROPERTY_ALL,
+                    ActiveTool::PenFilter,
+                )
+                .unwrap();
+            assert_eq!(editor.active_tool(), ActiveTool::Select);
+            assert_eq!(editor.state.selection, selected);
+            assert_eq!(document.filter(id).unwrap(), &filter);
+            assert_eq!(editor.filter_style(&document).strength, filter.strength);
+            assert_eq!(
+                editor.state.default_filter.filter_type,
+                rectangle.filter_type
+            );
+            assert_eq!(editor.state.default_filter.opacity, rectangle.opacity);
+            assert_eq!(
+                editor.state.default_filter_stroke_width,
+                rectangle.stroke_width
+            );
+            assert_eq!(editor.state.default_filter.strength, pen.strength);
+            assert_eq!(editor.state.default_pen_filter.filter_type, pen.filter_type);
+            assert_eq!(editor.state.default_pen_filter.opacity, pen.opacity);
+            assert_eq!(
+                editor.state.default_pen_filter.stroke_width,
+                pen.stroke_width
+            );
+            assert_eq!(editor.state.default_pen_filter.strength, pen.strength);
+        }
+    }
+
+    #[test]
+    fn filter_creation_style_rejects_invalid_patches_and_normalizes_smart_erase() {
+        let mut editor = Editor::new(snow_draw_engine_core::EngineConfig::default()).unwrap();
+        let style = FilterStyle {
+            filter_type: snow_draw_engine_document::CanvasFilterType::SmartErase,
+            strength: 0.8,
+            opacity: 0.9,
+            stroke_width: 20.0,
+        };
+        let before = editor.state.clone();
+        for (patch, properties, tool) in [
+            (style, crate::FILTER_STYLE_PROPERTY_ALL, ActiveTool::Shape),
+            (style, u32::MAX, ActiveTool::PenFilter),
+            (
+                FilterStyle {
+                    opacity: f64::NAN,
+                    ..style
+                },
+                crate::FILTER_STYLE_PROPERTY_ALL,
+                ActiveTool::PenFilter,
+            ),
+            (
+                FilterStyle {
+                    stroke_width: 73.0,
+                    ..style
+                },
+                crate::FILTER_STYLE_PROPERTY_ALL,
+                ActiveTool::PenFilter,
+            ),
+        ] {
+            assert_eq!(
+                editor.set_filter_creation_style(patch, properties, tool),
+                Err(ErrorCode::InvalidArgument)
+            );
+            assert_eq!(editor.state, before);
+        }
+        editor
+            .set_filter_creation_style(
+                style,
+                crate::FILTER_STYLE_PROPERTY_ALL,
+                ActiveTool::PenFilter,
+            )
+            .unwrap();
+        assert_eq!(editor.state.default_filter.strength, 0.8);
+        assert_eq!(editor.state.default_pen_filter.strength, 0.5);
+        let pen = editor.state.default_pen_filter.clone();
+        let rectangle = FilterStyle {
+            filter_type: snow_draw_engine_document::CanvasFilterType::Inversion,
+            opacity: 0.4,
+            ..style
+        };
+        editor
+            .set_filter_creation_style(
+                rectangle,
+                FILTER_STYLE_PROPERTY_TYPE | FILTER_STYLE_PROPERTY_OPACITY,
+                ActiveTool::RectangleFilter,
+            )
+            .unwrap();
+        assert_eq!(
+            editor.state.default_filter.filter_type,
+            rectangle.filter_type
+        );
+        assert_eq!(editor.state.default_filter.opacity, rectangle.opacity);
+        assert_eq!(editor.state.default_pen_filter, pen);
+    }
+
+    #[test]
+    fn rectangle_style_preserves_and_updates_fill_style() {
+        let rect = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Default::default(),
+            width: 120.0,
+            height: 80.0,
+            rotation: 0.0,
+            fill: ColorRgba8::default(),
+            fill_style: FillStyle::Line,
+            stroke: ColorRgba8::default(),
+            stroke_width: 2.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+
+        let mut style = RectangleShapeStyle::from_rectangle(&rect);
+        assert_eq!(style.fill_style, FillStyle::Line);
+        assert_eq!(style.stroke_style, StrokeStyle::Solid);
+
+        style.fill_style = FillStyle::CrossLine;
+        style.stroke_style = StrokeStyle::Dashed;
+        let updated = rectangle_with_style(&rect, style);
+        assert_eq!(updated.fill_style, FillStyle::CrossLine);
+        assert_eq!(updated.stroke_style, StrokeStyle::Dashed);
+        assert_eq!(updated.center, rect.center);
+        assert_eq!(updated.width, rect.width);
+        assert_eq!(updated.height, rect.height);
+    }
+
+    #[test]
+    fn rectangle_style_patch_preserves_unrequested_properties() {
+        let rectangle_style = RectangleShapeStyle {
+            stroke_rendering_style: Default::default(),
+            shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            fill: ColorRgba8 {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 40,
+            },
+            fill_style: FillStyle::CrossLine,
+            stroke: ColorRgba8 {
+                r: 50,
+                g: 60,
+                b: 70,
+                a: 80,
+            },
+            stroke_width: 2.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::splat(6.0),
+        };
+        let arrow_style = ArrowStyle {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(),
+            arrow_outline_width: 0.0,
+            stroke_rendering_style: Default::default(),
+            stroke: ColorRgba8 {
+                r: 90,
+                g: 100,
+                b: 110,
+                a: 120,
+            },
+            stroke_width: 3.0,
+            start_arrowhead: None,
+            end_arrowhead: Some(Arrowhead::Arrow),
+            stroke_style: StrokeStyle::Dotted,
+            arrow_type: ArrowType::Curve,
+            arrow_shaft_type: Default::default(),
+            arrow_ratio: 1.0,
+        };
+        let mut updated_style =
+            ShapeStyle::from_rectangle_shape_style(rectangle_style).with_arrow_style(arrow_style);
+        updated_style.stroke_width = 9.0;
+        updated_style.stroke = ColorRgba8 {
+            r: 200,
+            g: 201,
+            b: 202,
+            a: 203,
+        };
+
+        let patch = ShapeStylePatch {
+            kind: ShapeKind::Rectangle,
+            style: updated_style,
+            properties: SHAPE_STYLE_PROPERTY_STROKE_WIDTH,
+        };
+
+        let updated_rectangle = patch.apply_to_rectangle_shape(rectangle_style);
+        assert_eq!(updated_rectangle.stroke_width, 9.0);
+        assert_eq!(updated_rectangle.fill, rectangle_style.fill);
+        assert_eq!(updated_rectangle.fill_style, rectangle_style.fill_style);
+        assert_eq!(updated_rectangle.stroke, rectangle_style.stroke);
+        assert_eq!(updated_rectangle.stroke_style, rectangle_style.stroke_style);
+        assert_eq!(updated_rectangle.corner_radii, rectangle_style.corner_radii);
+
+        let mut stroke_style_only = ShapeStyle::from_rectangle_shape_style(rectangle_style);
+        stroke_style_only.stroke_style = StrokeStyle::Dotted;
+        let stroke_style_patch = ShapeStylePatch {
+            kind: ShapeKind::Rectangle,
+            style: stroke_style_only,
+            properties: SHAPE_STYLE_PROPERTY_STROKE_STYLE,
+        };
+        let stroke_style_updated = stroke_style_patch.apply_to_rectangle_shape(rectangle_style);
+        assert_eq!(stroke_style_updated.stroke_style, StrokeStyle::Dotted);
+
+        let updated_arrow = patch.apply_to_arrow(arrow_style);
+        assert_eq!(updated_arrow.stroke_width, 9.0);
+        assert_eq!(updated_arrow.stroke, arrow_style.stroke);
+        assert_eq!(updated_arrow.start_arrowhead, arrow_style.start_arrowhead);
+        assert_eq!(updated_arrow.end_arrowhead, arrow_style.end_arrowhead);
+        assert_eq!(updated_arrow.stroke_style, arrow_style.stroke_style);
+        assert_eq!(updated_arrow.arrow_type, arrow_style.arrow_type);
+    }
+
+    #[test]
+    fn highlight_tools_support_only_their_public_properties() {
+        assert_eq!(
+            ShapeKind::RectangleHighlight.supported_properties(),
+            SHAPE_STYLE_PROPERTY_FILL
+                | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+                | SHAPE_STYLE_PROPERTY_STROKE
+        );
+        assert_eq!(
+            ShapeKind::PenHighlight.supported_properties(),
+            SHAPE_STYLE_PROPERTY_STROKE | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+        );
+
+        let mut style = editor_style_defaults().rectangle_highlight;
+        style.fill_style = FillStyle::CrossLine;
+        let error = validate_shape_style_patch(ShapeStylePatch {
+            kind: ShapeKind::RectangleHighlight,
+            style,
+            properties: SHAPE_STYLE_PROPERTY_FILL_STYLE,
+        });
+        assert_eq!(error, Err(ErrorCode::InvalidArgument));
+    }
+
+    #[test]
+    fn line_and_free_draw_expose_distinct_arrow_type_contracts() {
+        assert_ne!(
+            ShapeKind::Line.supported_properties() & SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+            0
+        );
+        assert_eq!(
+            ShapeKind::FreeDraw.supported_properties() & SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+            0
+        );
+
+        let mut style = editor_style_defaults().free_draw;
+        style.arrow_type = ArrowType::Straight;
+        assert_eq!(
+            validate_shape_style_patch(ShapeStylePatch {
+                kind: ShapeKind::FreeDraw,
+                style,
+                properties: SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+            }),
+            Err(ErrorCode::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn rectangle_highlight_patch_updates_its_public_properties() {
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let base = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Point::default(),
+            width: 80.0,
+            height: 40.0,
+            rotation: 0.0,
+            fill: ColorRgba8 {
+                r: 245,
+                g: 34,
+                b: 45,
+                a: 255,
+            },
+            fill_style: FillStyle::Solid,
+            stroke: ColorRgba8::default(),
+            stroke_width: 0.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+        let first = base.into_highlight(snow_draw_engine_document::HighlightShape::Rectangle);
+        let mut second = base.into_highlight(snow_draw_engine_document::HighlightShape::Rectangle);
+        second.center.x = 120.0;
+        let mut insert = Transaction::new("insert highlights");
+        insert.insert_rectangle(first_id, ElementMeta::default(), first);
+        insert.insert_rectangle(second_id, ElementMeta::default(), second);
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(
+            Some(&document),
+            vec![first_id, second_id],
+            Some(first_id),
+        );
+        assert_eq!(editor.shape_style_mixed(&document), 0);
+
+        let mut style = editor.shape_style(&document);
+        style.fill = ColorRgba8 {
+            r: 255,
+            g: 220,
+            b: 0,
+            a: 255,
+        };
+        style.stroke = ColorRgba8 {
+            r: 12,
+            g: 34,
+            b: 56,
+            a: 255,
+        };
+        style.stroke_width = 6.0;
+        let command = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::RectangleHighlight,
+                    style,
+                    properties: ShapeKind::RectangleHighlight.supported_properties(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("expected a highlight style transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+
+        for id in [first_id, second_id] {
+            let highlight = document.rectangle(id).unwrap();
+            assert_eq!(highlight.fill, style.fill);
+            assert_eq!(
+                highlight.highlight_shape,
+                snow_draw_engine_document::HighlightShape::Rectangle
+            );
+            assert_eq!(highlight.stroke, style.stroke);
+            assert_eq!(highlight.stroke_width, style.stroke_width);
+            assert_eq!(highlight.opacity, 1.0);
+            assert_eq!(highlight.fill_style, FillStyle::Solid);
+            assert_eq!(highlight.stroke_style, StrokeStyle::Solid);
+            assert_eq!(highlight.corner_radii, CornerRadii::default());
+        }
+    }
+
+    #[test]
+    fn selected_element_style_patch_updates_creation_defaults() {
+        let mut document = DocumentModel::new();
+        let rectangle_id = document.peek_next_element_id();
+        let rectangle = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Default::default(),
+            width: 120.0,
+            height: 80.0,
+            rotation: 0.0,
+            fill: ColorRgba8 {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            fill_style: FillStyle::Solid,
+            stroke: ColorRgba8 {
+                r: 40,
+                g: 50,
+                b: 60,
+                a: 255,
+            },
+            stroke_width: 2.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+        let mut insert = Transaction::new("insert selected rectangle");
+        insert.insert_rectangle(rectangle_id, ElementMeta::default(), rectangle);
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.select_element(&document, rectangle_id).unwrap();
+        let original_default_fill = editor.state.default_rectangle_shape_style.fill;
+        let original_default_arrow_stroke_width = editor.state.default_arrow_style.stroke_width;
+
+        let mut style = editor.shape_style(&document);
+        style.stroke_width = 9.0;
+        style.fill = ColorRgba8 {
+            r: 200,
+            g: 201,
+            b: 202,
+            a: 255,
+        };
+        let command = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Rectangle,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_STROKE_WIDTH,
+                },
+            )
+            .unwrap();
+
+        assert!(command.is_some());
+        assert_eq!(editor.state.default_rectangle_shape_style.stroke_width, 9.0);
+        assert_eq!(
+            editor.state.default_arrow_style.stroke_width, original_default_arrow_stroke_width,
+            "rectangle patches must not mutate arrow creation defaults"
+        );
+        assert_eq!(
+            editor.state.default_rectangle_shape_style.fill, original_default_fill,
+            "properties not edited in the toolbar must keep their creation defaults"
+        );
+
+        editor.clear_selection();
+        assert_eq!(editor.rectangle_shape_style(&document).stroke_width, 9.0);
+        assert_eq!(
+            editor.arrow_style(&document).stroke_width,
+            original_default_arrow_stroke_width
+        );
+    }
+
+    #[test]
+    fn selected_arrow_style_patch_preserves_unrequested_properties() {
+        let mut document = DocumentModel::new();
+        let arrow = ArrowData::from_global_points(
+            &[
+                snow_draw_engine_core::Point::new(10.0, 10.0),
+                snow_draw_engine_core::Point::new(90.0, 50.0),
+            ],
+            ColorRgba8 {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            6.0,
+            StrokeStyle::Dotted,
+            ArrowType::Curve,
+            Some(Arrowhead::Bar),
+            Some(Arrowhead::Arrow),
+        )
+        .expect("two points create an arrow");
+        let arrow_id = document.peek_next_element_id();
+        let mut insert = Transaction::new("insert selected arrow");
+        insert.insert_arrow(arrow_id, ElementMeta::default(), arrow.clone());
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.select_element(&document, arrow_id).unwrap();
+        let original_rectangle_default = editor.state.default_rectangle_shape_style;
+
+        let mut style = editor.shape_style(&document);
+        style.end_arrowhead = Some(Arrowhead::Diamond);
+        let command = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_END_ARROWHEAD,
+                },
+            )
+            .unwrap();
+
+        assert!(command.is_some());
+        let updated = &editor.state.selection.arrows[0].arrow;
+        assert_eq!(updated.end_arrowhead, Some(Arrowhead::Diamond));
+        assert_eq!(updated.stroke, arrow.stroke);
+        assert_eq!(updated.stroke_width, arrow.stroke_width);
+        assert_eq!(updated.start_arrowhead, arrow.start_arrowhead);
+        assert_eq!(updated.stroke_style, arrow.stroke_style);
+        assert_eq!(updated.arrow_type, arrow.arrow_type);
+        assert_eq!(
+            editor.state.default_rectangle_shape_style, original_rectangle_default,
+            "arrow patches must not mutate rectangle creation defaults"
+        );
+    }
+
+    #[test]
+    fn line_style_patch_is_canonical_and_does_not_mutate_arrow() {
+        let mut document = DocumentModel::new();
+        let arrow = ArrowData::from_global_points(
+            &[
+                snow_draw_engine_core::Point::new(0.0, 0.0),
+                snow_draw_engine_core::Point::new(40.0, 0.0),
+            ],
+            ColorRgba8 {
+                r: 200,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            3.0,
+            StrokeStyle::Solid,
+            ArrowType::Straight,
+            None,
+            Some(Arrowhead::Arrow),
+        )
+        .unwrap();
+        let line = ArrowData::from_global_points(
+            &[
+                snow_draw_engine_core::Point::new(0.0, 20.0),
+                snow_draw_engine_core::Point::new(40.0, 20.0),
+            ],
+            ColorRgba8 {
+                r: 30,
+                g: 30,
+                b: 30,
+                a: 255,
+            },
+            2.0,
+            StrokeStyle::Solid,
+            ArrowType::Curve,
+            None,
+            None,
+        )
+        .unwrap()
+        .into_line(ColorRgba8::default(), FillStyle::Solid);
+        let arrow_id = document.allocate_element_id();
+        let line_id = document.allocate_element_id();
+        let mut insert = Transaction::new("insert arrow and line");
+        insert.insert_arrow(arrow_id, ElementMeta::default(), arrow.clone());
+        insert.insert_arrow(line_id, ElementMeta::default(), line);
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(
+            Some(&document),
+            vec![arrow_id, line_id],
+            Some(line_id),
+        );
+        let original_arrow_default = editor.state.default_arrow_style;
+        let mut style = editor.state.default_line_style;
+        style.stroke_width = 9.0;
+        style.fill = ColorRgba8 {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 128,
+        };
+        style.opacity = 0.4;
+        style.arrow_type = ArrowType::Straight;
+        style.start_arrowhead = Some(Arrowhead::Diamond);
+        style.end_arrowhead = Some(Arrowhead::Arrow);
+        let command = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Line,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+                        | SHAPE_STYLE_PROPERTY_FILL
+                        | SHAPE_STYLE_PROPERTY_OPACITY
+                        | SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap();
+
+        assert!(command.is_some());
+        let selected_arrow = editor
+            .state
+            .selection
+            .arrows
+            .iter()
+            .find(|item| item.id == arrow_id)
+            .unwrap();
+        let selected_line = editor
+            .state
+            .selection
+            .arrows
+            .iter()
+            .find(|item| item.id == line_id)
+            .unwrap();
+        assert_eq!(selected_arrow.arrow, arrow);
+        assert_eq!(selected_line.arrow.stroke_width, 9.0);
+        assert_eq!(selected_line.arrow.fill, style.fill);
+        assert_eq!(selected_line.arrow.opacity, 0.4);
+        assert_eq!(selected_line.arrow.arrow_type, ArrowType::Straight);
+        assert_eq!(selected_line.arrow.start_arrowhead, None);
+        assert_eq!(selected_line.arrow.end_arrowhead, None);
+        assert_eq!(editor.state.default_arrow_style, original_arrow_default);
+
+        editor.clear_selection();
+        style.arrow_type = ArrowType::Elbow;
+        editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Line,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap();
+        assert_eq!(editor.state.default_line_style.arrow_type, ArrowType::Curve);
+    }
+
+    #[test]
+    fn tapered_arrow_mixed_selection_and_style_changes() {
+        use snow_draw_engine_core::arrow::ArrowShaftType;
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert mixed shafts");
+        let mut ids = Vec::new();
+        for (i, shaft) in [ArrowShaftType::Plain, ArrowShaftType::Tapered]
+            .into_iter()
+            .enumerate()
+        {
+            let id = document.allocate_element_id();
+            let mut arrow = ArrowData::from_global_points(
+                &[
+                    Point::new(0.0, i as f64 * 30.0),
+                    Point::new(100.0, i as f64 * 30.0),
+                ],
+                ColorRgba8::default(),
+                2.0,
+                StrokeStyle::Solid,
+                ArrowType::Straight,
+                None,
+                Some(Arrowhead::Triangle),
+            )
+            .unwrap();
+            arrow.arrow_shaft_type = shaft;
+            insert.insert_arrow(id, ElementMeta::default(), arrow);
+            ids.push(id);
+        }
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(Some(&document), ids.clone(), Some(ids[0]));
+        assert_ne!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_SHAFT_TYPE,
+            0
+        );
+        let mut style = editor.shape_style(&document);
+        style.arrow_shaft_type = ArrowShaftType::Tapered;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: crate::SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("shaft change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_SHAFT_TYPE,
+            0
+        );
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_shaft_type, ArrowShaftType::Tapered);
+        }
+        style.end_arrowhead = Some(Arrowhead::Circle);
+        style.arrow_type = ArrowType::Elbow;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_END_ARROWHEAD
+                        | SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("head change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_shaft_type, ArrowShaftType::Tapered);
+            assert!(snow_draw_engine_document::tapered_arrow_geometry(&selected.arrow).is_none());
+        }
+    }
+
+    #[test]
+    fn arrow_ratio_mixed_selection_and_style_changes() {
+        use snow_draw_engine_core::arrow::ArrowShaftType;
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert mixed shafts");
+        let mut ids = Vec::new();
+        for (i, shaft) in [ArrowShaftType::Plain, ArrowShaftType::Tapered]
+            .into_iter()
+            .enumerate()
+        {
+            let id = document.allocate_element_id();
+            let mut arrow = ArrowData::from_global_points(
+                &[
+                    Point::new(0.0, i as f64 * 30.0),
+                    Point::new(100.0, i as f64 * 30.0),
+                ],
+                ColorRgba8::default(),
+                2.0,
+                StrokeStyle::Solid,
+                ArrowType::Straight,
+                None,
+                Some(Arrowhead::Triangle),
+            )
+            .unwrap();
+            arrow.arrow_shaft_type = shaft;
+            arrow.arrow_ratio = 1.0 + i as f64;
+            insert.insert_arrow(id, ElementMeta::default(), arrow);
+            ids.push(id);
+        }
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(Some(&document), ids.clone(), Some(ids[0]));
+        assert_ne!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_RATIO,
+            0
+        );
+        let mut style = editor.shape_style(&document);
+        style.arrow_ratio = 2.5;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: crate::SHAPE_STYLE_PROPERTY_ARROW_RATIO,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("shaft change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_RATIO,
+            0
+        );
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_ratio, 2.5);
+            assert_eq!(selected.arrow.stroke_width, 2.0);
+        }
+        style.end_arrowhead = Some(Arrowhead::Circle);
+        style.arrow_type = ArrowType::Elbow;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_END_ARROWHEAD
+                        | SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("head change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_ratio, 2.5);
+            assert_eq!(selected.arrow.stroke_width, 2.0);
+            assert!(snow_draw_engine_document::tapered_arrow_geometry(&selected.arrow).is_none());
+        }
+    }
+
+    #[test]
+    fn arrow_outline_width_mixed_selection_and_style_changes() {
+        use snow_draw_engine_core::arrow::ArrowShaftType;
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert mixed shafts");
+        let mut ids = Vec::new();
+        for (i, shaft) in [ArrowShaftType::Plain, ArrowShaftType::Tapered]
+            .into_iter()
+            .enumerate()
+        {
+            let id = document.allocate_element_id();
+            let mut arrow = ArrowData::from_global_points(
+                &[
+                    Point::new(0.0, i as f64 * 30.0),
+                    Point::new(100.0, i as f64 * 30.0),
+                ],
+                ColorRgba8::default(),
+                2.0,
+                StrokeStyle::Solid,
+                ArrowType::Straight,
+                None,
+                Some(Arrowhead::Triangle),
+            )
+            .unwrap();
+            arrow.arrow_shaft_type = shaft;
+            arrow.arrow_outline_width = 1.0 + i as f64;
+            arrow.arrow_outline_color.r = i as u8;
+            insert.insert_arrow(id, ElementMeta::default(), arrow);
+            ids.push(id);
+        }
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(Some(&document), ids.clone(), Some(ids[0]));
+        assert_ne!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH,
+            0
+        );
+        assert_ne!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR,
+            0
+        );
+        let mut style = editor.shape_style(&document);
+        style.arrow_outline_width = 2.5;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: crate::SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("shaft change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH,
+            0
+        );
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_outline_width, 2.5);
+            assert_eq!(selected.arrow.stroke_width, 2.0);
+        }
+        assert_ne!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR,
+            0
+        );
+        style.arrow_outline_color = ColorRgba8 {
+            r: 20,
+            g: 100,
+            b: 200,
+            a: 128,
+        };
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: crate::SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("outline color change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR,
+            0
+        );
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(
+                selected.arrow.arrow_outline_color,
+                style.arrow_outline_color
+            );
+            assert_eq!(selected.arrow.arrow_outline_width, 2.5);
+        }
+        style.end_arrowhead = Some(Arrowhead::Circle);
+        style.arrow_type = ArrowType::Elbow;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Arrow,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_END_ARROWHEAD
+                        | SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("head change needs transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for selected in &editor.state.selection.arrows {
+            assert_eq!(selected.arrow.arrow_outline_width, 2.5);
+            assert_eq!(selected.arrow.stroke_width, 2.0);
+            assert!(snow_draw_engine_document::tapered_arrow_geometry(&selected.arrow).is_none());
+        }
+    }
+
+    #[test]
+    fn selected_lines_report_and_resolve_mixed_arrow_types() {
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert mixed line types");
+        let mut ids = Vec::new();
+        for (index, arrow_type) in [ArrowType::Straight, ArrowType::Curve]
+            .into_iter()
+            .enumerate()
+        {
+            let id = document.allocate_element_id();
+            let line = ArrowData::from_global_points(
+                &[
+                    Point::new(0.0, index as f64 * 20.0),
+                    Point::new(40.0, index as f64 * 20.0),
+                ],
+                ColorRgba8::default(),
+                2.0,
+                StrokeStyle::Solid,
+                arrow_type,
+                None,
+                None,
+            )
+            .unwrap()
+            .into_line(ColorRgba8::default(), FillStyle::Solid);
+            insert.insert_arrow(id, ElementMeta::default(), line);
+            ids.push(id);
+        }
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state_with_document(Some(&document), ids.clone(), Some(ids[0]));
+
+        assert_eq!(
+            editor.style_toolbar_source(&document),
+            StyleToolbarSource::SelectedLine
+        );
+        assert_ne!(
+            editor.shape_style_mixed(&document) & SHAPE_STYLE_MIXED_ARROW_TYPE,
+            0
+        );
+        assert_eq!(
+            editor.shape_style(&document).arrow_type,
+            ArrowType::Straight
+        );
+
+        let mut style = editor.shape_style(&document);
+        style.arrow_type = ArrowType::Curve;
+        let command = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Line,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = command else {
+            panic!("resolving mixed Line types should queue one transaction");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            editor.shape_style_mixed(&document) & SHAPE_STYLE_MIXED_ARROW_TYPE,
+            0
+        );
+        for id in ids {
+            let selected = editor
+                .state
+                .selection
+                .arrows
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap();
+            assert!(selected.arrow.is_line());
+            assert_eq!(selected.arrow.arrow_type, ArrowType::Curve);
+            assert_eq!(selected.arrow.start_arrowhead, None);
+            assert_eq!(selected.arrow.end_arrowhead, None);
+        }
+    }
+
+    #[test]
+    fn serial_number_style_font_size_decrease_shrinks_diameter() {
+        let mut serial = SerialNumberData::default();
+        serial.font_size = 42.0;
+        serial.diameter = resolve_serial_number_style_diameter(serial.number, serial.font_size);
+
+        let mut style = SerialNumberStyle::from_serial_number(&serial);
+        style.font_size = 16.0;
+
+        let updated = serial_number_with_style(&serial, &style);
+
+        assert!(updated.diameter < serial.diameter);
+        assert_close(
+            updated.diameter,
+            resolve_serial_number_style_diameter(updated.number, updated.font_size),
+        );
+    }
+
+    #[test]
+    fn serial_number_non_size_style_preserves_diameter() {
+        let serial = SerialNumberData {
+            font_size: 42.0,
+            diameter: 123.0,
+            ..SerialNumberData::default()
+        };
+
+        let mut style = SerialNumberStyle::from_serial_number(&serial);
+        style.color = ColorRgba8 {
+            r: 0,
+            g: 128,
+            b: 255,
+            a: 255,
+        };
+
+        let updated = serial_number_with_style(&serial, &style);
+
+        assert_eq!(updated.diameter, serial.diameter);
+    }
+
+    #[test]
+    fn serial_number_content_and_numbered_shape_changes_preserve_geometry() {
+        let serial = SerialNumberData {
+            center: Point::new(123.0, 456.0),
+            diameter: 97.0,
+            rotation: 0.3,
+            number: 9,
+            ..SerialNumberData::default()
+        };
+        for properties in [
+            SERIAL_NUMBER_STYLE_MIXED_NUMBER,
+            SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE,
+            SERIAL_NUMBER_STYLE_MIXED_TYPE,
+            SERIAL_NUMBER_STYLE_MIXED_NUMBER | SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE,
+        ] {
+            let mut style = SerialNumberStyle::from_serial_number(&serial);
+            style.number = 888;
+            style.numeric_type = snow_draw_engine_document::SerialNumberNumericType::Roman;
+            style.serial_number_type = snow_draw_engine_document::SerialNumberType::SolidSquare;
+            let mut expected = serial.clone();
+            if properties & SERIAL_NUMBER_STYLE_MIXED_NUMBER != 0 {
+                expected.number = style.number;
+            }
+            if properties & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE != 0 {
+                expected.numeric_type = style.numeric_type;
+            }
+            if properties & SERIAL_NUMBER_STYLE_MIXED_TYPE != 0 {
+                expected.serial_number_type = style.serial_number_type;
+            }
+            assert_eq!(
+                serial_number_with_style_properties(&serial, &style, properties),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn circle_type_changes_recompute_size_and_preserve_unsupported_properties() {
+        let original = SerialNumberData {
+            number: 42,
+            font_family: Some("Saved font".to_owned()),
+            diameter: 123.0,
+            ..SerialNumberData::default()
+        };
+        let mut style = SerialNumberStyle::from_serial_number(&original);
+        style.serial_number_type = snow_draw_engine_document::SerialNumberType::Circle;
+        style.number = 99;
+        style.font_family = Some("Ignored font".to_owned());
+        let circle = serial_number_with_style(&original, &style);
+        assert_eq!(circle.diameter, 12.0);
+        assert_eq!(circle.number, original.number);
+        assert_eq!(circle.font_family, original.font_family);
+        assert_eq!(circle.stroke_width, original.stroke_width);
+        style = SerialNumberStyle::from_serial_number(&circle);
+        style.font_size = 48.0;
+        let larger = serial_number_with_style(&circle, &style);
+        assert_eq!(larger.diameter, 24.0);
+        style.serial_number_type = original.serial_number_type;
+        let numbered = serial_number_with_style(&larger, &style);
+        assert_eq!(
+            numbered.diameter,
+            resolve_serial_number_style_diameter(42, 48.0)
+        );
+        assert_eq!(numbered.number, original.number);
+        assert_eq!(numbered.font_family, original.font_family);
+        assert_eq!(numbered.stroke_width, original.stroke_width);
+    }
+
+    #[test]
+    fn explicit_serial_font_patch_preserves_unrelated_mixed_properties() {
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let first = SerialNumberData::default();
+        let second = SerialNumberData {
+            number: 27,
+            font_size: 52.0,
+            font_family: Some("Other font".to_owned()),
+            color: ColorRgba8 {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            ..SerialNumberData::default()
+        };
+        let mut insert = Transaction::new("insert mixed serials");
+        insert.insert_serial_number(first_id, ElementMeta::default(), first.clone());
+        insert.insert_serial_number(second_id, ElementMeta::default(), second.clone());
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state(vec![first_id, second_id], Some(first_id));
+        let mut style = editor.serial_number_style(&document);
+        style.font_size = 43.0;
+        let command = editor
+            .set_serial_number_style_patch(&document, style, SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE)
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("expected transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for (id, original) in [(first_id, first), (second_id, second)] {
+            let changed = document.serial_number(id).unwrap();
+            assert_eq!(changed.font_size, 43.0);
+            assert_eq!(changed.number, original.number);
+            assert_eq!(changed.color, original.color);
+            assert_eq!(changed.font_family, original.font_family);
+        }
+    }
+
+    #[test]
+    fn selected_serial_size_edits_remember_only_size_and_preserve_creation_counter() {
+        for use_patch in [false, true] {
+            let mut document = DocumentModel::new();
+            let id = document.allocate_element_id();
+            let selected = SerialNumberData {
+                number: 99,
+                font_size: 52.0,
+                color: ColorRgba8 {
+                    r: 7,
+                    g: 8,
+                    b: 9,
+                    a: 255,
+                },
+                font_family: Some("Selected font".to_owned()),
+                ..Default::default()
+            };
+            let mut insert = Transaction::new("import differently styled serial");
+            insert.insert_serial_number(id, ElementMeta::default(), selected);
+            document.apply_transaction(insert).unwrap();
+            let mut editor = Editor::new(Default::default()).unwrap();
+            editor.state.default_serial_number.number = 7;
+            let mut expected = editor.state.default_serial_number.clone();
+            expected.font_size = 32.0;
+            expected.diameter = resolve_serial_number_style_diameter(expected.number, 32.0);
+            editor.set_selection_state(vec![id], Some(id));
+            let mut style = editor.serial_number_style(&document);
+            style.font_size = 32.0;
+            let command = if use_patch {
+                editor.set_serial_number_style_patch(
+                    &document,
+                    style,
+                    SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE,
+                )
+            } else {
+                editor.set_serial_number_style(&document, style)
+            }
+            .unwrap();
+            let Some(EditorCommand::ApplyTransaction(command)) = command else {
+                panic!("a selected size change must edit the document")
+            };
+            document.apply_transaction(command.transaction).unwrap();
+            assert_eq!(editor.state.default_serial_number, expected);
+            assert_eq!(document.serial_number(id).unwrap().number, 99);
+            // A named property still becomes the preference if the selected
+            // element already has that value and needs no history operation.
+            editor.state.default_serial_number.font_size = 24.0;
+            let style = editor.serial_number_style(&document);
+            assert!(
+                editor
+                    .set_serial_number_style_patch(
+                        &document,
+                        style,
+                        SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(editor.state.default_serial_number, expected);
+        }
+    }
+
+    #[test]
+    fn selected_filter_patches_remember_only_properties_of_affected_families() {
+        use snow_draw_engine_document::{CanvasFilterType, PenFilterData};
+        for (rectangle, pen) in [(true, false), (false, true), (true, true)] {
+            let mut document = DocumentModel::new();
+            let mut insert = Transaction::new("import filters");
+            let mut ids = Vec::new();
+            if rectangle {
+                let id = document.allocate_element_id();
+                insert.insert_filter(
+                    id,
+                    ElementMeta::default(),
+                    FilterData {
+                        filter_type: CanvasFilterType::GaussianBlur,
+                        opacity: 0.2,
+                        ..Default::default()
+                    },
+                );
+                ids.push(id);
+            }
+            if pen {
+                let id = document.allocate_element_id();
+                insert.insert_pen_filter(
+                    id,
+                    ElementMeta::default(),
+                    PenFilterData {
+                        filter_type: CanvasFilterType::Brightness,
+                        opacity: 0.3,
+                        stroke_width: 12.0,
+                        width: 10.0,
+                        height: 10.0,
+                        ..Default::default()
+                    },
+                );
+                ids.push(id);
+            }
+            document.apply_transaction(insert).unwrap();
+            let mut editor = Editor::new(Default::default()).unwrap();
+            let original_rectangle = editor.state.default_filter;
+            let original_pen = editor.state.default_pen_filter.clone();
+            let original_rectangle_stroke = editor.state.default_filter_stroke_width;
+            editor.set_active_tool(ActiveTool::Select).unwrap();
+            editor.set_selection_state(ids.clone(), ids.first().copied());
+            assert_eq!(
+                editor.filter_style_mixed(&document)
+                    & crate::FILTER_STYLE_MIXED_CONTAINS_BOTH_FILTERS,
+                if rectangle && pen {
+                    crate::FILTER_STYLE_MIXED_CONTAINS_BOTH_FILTERS
+                } else {
+                    0
+                }
+            );
+            if rectangle && pen {
+                editor.set_selection_state(ids.clone(), ids.last().copied());
+                assert_eq!(
+                    editor.style_toolbar_source(&document),
+                    StyleToolbarSource::SelectedPenFilter
+                );
+                assert_eq!(editor.filter_style(&document).stroke_width, 12.0);
+                assert_eq!(
+                    editor.filter_style(&document).filter_type,
+                    CanvasFilterType::Brightness
+                );
+                editor.set_selection_state(ids.clone(), ids.first().copied());
+                assert_eq!(
+                    editor.style_toolbar_source(&document),
+                    StyleToolbarSource::SelectedRectangleFilter
+                );
+                assert_eq!(
+                    editor.filter_style(&document).filter_type,
+                    CanvasFilterType::GaussianBlur
+                );
+            }
+            let mut style = editor.filter_style(&document);
+            style.opacity = 0.7;
+            style.stroke_width = 19.0;
+            let Some(EditorCommand::ApplyTransaction(command)) = editor
+                .set_filter_style(
+                    &document,
+                    style,
+                    FILTER_STYLE_PROPERTY_OPACITY | FILTER_STYLE_PROPERTY_STROKE_WIDTH,
+                )
+                .unwrap()
+            else {
+                panic!("selected filters must change")
+            };
+            document.apply_transaction(command.transaction).unwrap();
+            assert_eq!(
+                editor.state.default_filter.opacity,
+                if rectangle {
+                    0.7
+                } else {
+                    original_rectangle.opacity
+                }
+            );
+            assert_eq!(
+                editor.state.default_pen_filter.opacity,
+                if pen { 0.7 } else { original_pen.opacity }
+            );
+            assert_eq!(
+                editor.state.default_pen_filter.stroke_width,
+                if pen { 19.0 } else { original_pen.stroke_width }
+            );
+            assert_eq!(
+                editor.state.default_filter_stroke_width,
+                original_rectangle_stroke
+            );
+            assert_eq!(
+                editor.state.default_filter.filter_type,
+                original_rectangle.filter_type
+            );
+            assert_eq!(
+                editor.state.default_pen_filter.filter_type,
+                original_pen.filter_type
+            );
+            style.filter_type = CanvasFilterType::Inversion;
+            let Some(EditorCommand::ApplyTransaction(command)) = editor
+                .set_filter_style(&document, style, FILTER_STYLE_PROPERTY_TYPE)
+                .unwrap()
+            else {
+                panic!("selected filter types must change")
+            };
+            document.apply_transaction(command.transaction).unwrap();
+            assert_eq!(
+                editor.state.default_filter.filter_type,
+                if rectangle {
+                    CanvasFilterType::Inversion
+                } else {
+                    original_rectangle.filter_type
+                }
+            );
+            assert_eq!(
+                editor.state.default_pen_filter.filter_type,
+                if pen {
+                    CanvasFilterType::Inversion
+                } else {
+                    original_pen.filter_type
+                }
+            );
+            assert_eq!(editor.active_tool(), ActiveTool::Select);
+            assert_eq!(editor.selected_ids(), ids);
+            editor.set_selection_state(Vec::new(), None);
+            assert_eq!(editor.filter_style_mixed(&document), 0);
+        }
+    }
+
+    #[test]
+    fn mixed_circle_selection_edits_only_supported_label_properties() {
+        let mut document = DocumentModel::new();
+        let numbered_id = document.allocate_element_id();
+        let circle_id = document.allocate_element_id();
+        let circle = SerialNumberData {
+            serial_number_type: snow_draw_engine_document::SerialNumberType::Circle,
+            diameter: 12.0,
+            number: 87,
+            font_family: Some("Circle saved font".to_owned()),
+            ..SerialNumberData::default()
+        };
+        let mut insert = Transaction::new("insert mixed serial types");
+        insert.insert_serial_number(
+            numbered_id,
+            ElementMeta::default(),
+            SerialNumberData::default(),
+        );
+        insert.insert_serial_number(circle_id, ElementMeta::default(), circle.clone());
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state(vec![numbered_id, circle_id], Some(numbered_id));
+        let mut style = editor.serial_number_style(&document);
+        style.number = 15;
+        style.font_family = Some("Numbered font".to_owned());
+        let command = editor
+            .set_serial_number_style(&document, style)
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("expected transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(document.serial_number(circle_id).unwrap(), &circle);
+        let numbered = document.serial_number(numbered_id).unwrap();
+        assert_eq!(numbered.number, 15);
+        assert_eq!(numbered.font_family.as_deref(), Some("Numbered font"));
+    }
+
+    #[test]
+    fn serial_number_type_change_preserves_size_and_fill_settings() {
+        let serial = SerialNumberData {
+            diameter: 123.0,
+            fill: ColorRgba8 {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 4,
+            },
+            fill_style: FillStyle::CrossLine,
+            ..SerialNumberData::default()
+        };
+        let mut style = SerialNumberStyle::from_serial_number(&serial);
+        style.serial_number_type = snow_draw_engine_document::SerialNumberType::SolidSquare;
+
+        let updated = serial_number_with_style(&serial, &style);
+
+        assert_eq!(updated.serial_number_type, style.serial_number_type);
+        assert_eq!(updated.diameter, serial.diameter);
+        assert_eq!(updated.fill, serial.fill);
+        assert_eq!(updated.fill_style, serial.fill_style);
+    }
+
+    #[test]
+    fn serial_number_type_participates_in_mixed_selection_and_updates_every_item() {
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let mut insert = Transaction::new("insert serial numbers");
+        insert.insert_serial_number(
+            first_id,
+            ElementMeta::default(),
+            SerialNumberData::default(),
+        );
+        insert.insert_serial_number(
+            second_id,
+            ElementMeta::default(),
+            SerialNumberData {
+                diameter: 77.0,
+                number: 42,
+                serial_number_type: snow_draw_engine_document::SerialNumberType::SolidCircle,
+                color: ColorRgba8 {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                    a: 40,
+                },
+                fill: ColorRgba8 {
+                    r: 50,
+                    g: 60,
+                    b: 70,
+                    a: 80,
+                },
+                fill_style: FillStyle::Line,
+                font_size: 31.0,
+                font_family: Some("Second font".to_owned()),
+                stroke_width: 9.0,
+                stroke_style: StrokeStyle::Dotted,
+                opacity: 0.4,
+                ..SerialNumberData::default()
+            },
+        );
+        document.apply_transaction(insert).unwrap();
+        let second_before = document.serial_number(second_id).unwrap().clone();
+
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state(vec![first_id, second_id], Some(first_id));
+        assert_ne!(
+            editor.serial_number_style_mixed(&document) & SERIAL_NUMBER_STYLE_MIXED_TYPE,
+            0
+        );
+
+        let mut style = editor.serial_number_style(&document);
+        style.serial_number_type = snow_draw_engine_document::SerialNumberType::SolidSquare;
+        let command = editor
+            .set_serial_number_style(&document, style)
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("expected serial-number style transaction");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            document.serial_number(first_id).unwrap().serial_number_type,
+            snow_draw_engine_document::SerialNumberType::SolidSquare
+        );
+        assert_eq!(
+            document
+                .serial_number(second_id)
+                .unwrap()
+                .serial_number_type,
+            snow_draw_engine_document::SerialNumberType::SolidSquare
+        );
+        let mut expected_second = second_before;
+        expected_second.serial_number_type =
+            snow_draw_engine_document::SerialNumberType::SolidSquare;
+        assert_eq!(
+            document.serial_number(second_id).unwrap(),
+            &expected_second,
+            "changing type must preserve every unrelated per-item property"
+        );
+    }
+
+    #[test]
+    fn serial_number_style_rejects_font_size_below_minimum() {
+        let mut style = SerialNumberStyle::from_serial_number(&SerialNumberData::default());
+        style.font_size = MIN_SERIAL_NUMBER_FONT_SIZE - 0.1;
+
+        assert_eq!(
+            validate_serial_number_style(&style),
+            Err(ErrorCode::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn text_emphasis_patches_preserve_other_properties_and_remeasure_each_sizing_mode() {
+        let id = ElementId {
+            index: 1,
+            generation: 1,
+        };
+        for automatic in [false, true] {
+            let text = TextData {
+                auto_resize: automatic,
+                layout: TextLayoutSize::with_content(120.0, 40.0, 100.0, 40.0),
+                ..TextData::default()
+            };
+            let mut style = TextStyle::from_text(&text);
+            style.bold = true;
+            style.italic = true;
+            style.font_size = 80.0;
+            let layouts = [TextLayoutOverride {
+                id,
+                size: TextLayoutSize::with_content(
+                    if automatic { 180.0 } else { 120.0 },
+                    80.0,
+                    110.0,
+                    80.0,
+                ),
+            }];
+            let updated =
+                text_with_style(id, &text, &style, TEXT_STYLE_MIXED_BOLD, &layouts).unwrap();
+            assert!(updated.bold);
+            assert!(!updated.italic);
+            assert_eq!(updated.font_size, text.font_size);
+            assert_eq!(updated.height(), 80.0);
+            assert_eq!(updated.width(), layouts[0].size.width());
+            let updated =
+                text_with_style(id, &updated, &style, TEXT_STYLE_MIXED_ITALIC, &layouts).unwrap();
+            assert!(updated.bold && updated.italic);
+            let mut disabled = style;
+            disabled.bold = false;
+            let updated =
+                text_with_style(id, &updated, &disabled, TEXT_STYLE_MIXED_BOLD, &layouts).unwrap();
+            assert!(!updated.bold && updated.italic);
+        }
+    }
+
+    #[test]
+    fn text_emphasis_selection_reports_independent_mixed_flags() {
+        let mut document = DocumentModel::new();
+        let mut tx = Transaction::new("create mixed emphasis text");
+        let ids = vec![
+            document.allocate_element_id(),
+            document.allocate_element_id(),
+        ];
+        tx.insert_text(
+            ids[0],
+            ElementMeta::default(),
+            TextData {
+                bold: true,
+                ..TextData::default()
+            },
+        );
+        tx.insert_text(
+            ids[1],
+            ElementMeta::default(),
+            TextData {
+                italic: true,
+                ..TextData::default()
+            },
+        );
+        document.apply_transaction(tx).unwrap();
+        let mut editor = Editor::new(snow_draw_engine_core::EngineConfig::default()).unwrap();
+        editor.set_selection_state(ids.clone(), Some(ids[0]));
+        assert_eq!(
+            editor.text_style_mixed(&document),
+            TEXT_STYLE_MIXED_BOLD | TEXT_STYLE_MIXED_ITALIC
+        );
+        let mut style = editor.text_style(&document);
+        style.bold = true;
+        let layouts = ids
+            .iter()
+            .map(|id| TextLayoutOverride {
+                id: *id,
+                size: TextLayoutSize::with_content(120.0, 40.0, 110.0, 40.0),
+            })
+            .collect::<Vec<_>>();
+        let command = editor
+            .set_text_style(&document, style, TEXT_STYLE_MIXED_BOLD, &layouts)
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("emphasis edits must produce a document transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert!(ids.iter().all(|id| document.text(*id).unwrap().bold));
+        assert!(!document.text(ids[0]).unwrap().italic);
+        assert!(document.text(ids[1]).unwrap().italic);
+        assert_eq!(editor.text_style_mixed(&document), TEXT_STYLE_MIXED_ITALIC);
+    }
+
+    #[test]
+    fn text_style_alignment_applies_host_reflow_without_changing_typography() {
+        let id = ElementId {
+            index: 1,
+            generation: 1,
+        };
+        let text = TextData {
+            center: Point::new(100.0, 30.0),
+            layout: TextLayoutSize::with_content(120.0, 60.0, 110.0, 60.0),
+            auto_resize: true,
+            ..TextData::default()
+        };
+        let mut style = TextStyle::from_text(&text);
+        style.horizontal_align = snow_draw_engine_document::TextHorizontalAlign::Right;
+        let layouts = [TextLayoutOverride {
+            id,
+            size: TextLayoutSize::with_content(200.0, 40.0, 190.0, 40.0),
+        }];
+        let updated = text_with_style(
+            id,
+            &text,
+            &style,
+            TEXT_STYLE_MIXED_HORIZONTAL_ALIGN,
+            &layouts,
+        )
+        .unwrap();
+        assert_eq!(updated.width(), 200.0);
+        assert_eq!(updated.height(), 40.0);
+        assert_eq!(updated.font_size, text.font_size);
+        assert_eq!(updated.font_family, text.font_family);
+        assert!(updated.auto_resize);
+        assert_eq!(
+            updated.center.x + updated.width() / 2.0,
+            text.center.x + text.width() / 2.0
+        );
+        assert_eq!(
+            updated.center.y - updated.height() / 2.0,
+            text.center.y - text.height() / 2.0
+        );
+        let unchanged =
+            text_with_style(id, &text, &style, TEXT_STYLE_MIXED_HORIZONTAL_ALIGN, &[]).unwrap();
+        assert_eq!(unchanged.layout, text.layout);
+        assert_eq!(unchanged.center, text.center);
+    }
+
+    #[test]
+    fn text_style_refits_fixed_width_text_from_measured_layout() {
+        // The stale-height regression: a style change re-renders the glyphs, so
+        // a fixed-width (width-resized) text must adopt the re-measured wrapped
+        // height and ink box. Otherwise top/bottom-aligned text paints its pill
+        // off the stored rectangle and decorations detach.
+        let id = ElementId {
+            index: 1,
+            generation: 1,
+        };
+        let mut text = TextData {
+            auto_resize: false,
+            layout: TextLayoutSize::with_content(120.0, 40.0, 100.0, 40.0),
+            ..TextData::default()
+        };
+        let mut style = TextStyle::from_text(&text);
+        style.font_size = 60.0;
+        let layouts = vec![TextLayoutOverride {
+            id,
+            size: TextLayoutSize::with_content(120.0, 80.0, 88.0, 80.0),
+        }];
+
+        let updated =
+            text_with_style(id, &text, &style, TEXT_STYLE_ALL_PROPERTIES, &layouts).unwrap();
+
+        assert_eq!(updated.font_size, 60.0);
+        assert!(!updated.auto_resize);
+        assert_eq!(updated.width(), 120.0, "the wrap rectangle must stay fixed");
+        assert_eq!(
+            updated.height(),
+            80.0,
+            "height must follow the re-measured layout"
+        );
+        assert_eq!(
+            updated.layout.ink(),
+            snow_draw_engine_document::InkBox::new(88.0, 80.0)
+        );
+        // The stored rectangle grows symmetrically around the text center.
+        assert!((updated.center.y - text.center.y - 20.0).abs() < 1e-9);
+
+        // Without a host measurement the stored geometry stays untouched.
+        text.vertical_align = snow_draw_engine_document::TextVerticalAlign::Top;
+        let unchanged = text_with_style(id, &text, &style, TEXT_STYLE_ALL_PROPERTIES, &[]).unwrap();
+        assert_eq!(unchanged.height(), 40.0);
+        assert_eq!(
+            unchanged.layout.ink(),
+            snow_draw_engine_document::InkBox::new(100.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn stroke_width_patch_preserves_mixed_text_fonts_and_resized_layouts() {
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let first = TextData {
+            font_size: 24.0,
+            layout: TextLayoutSize::with_content(110.0, 42.0, 105.0, 42.0),
+            auto_resize: true,
+            ..TextData::default()
+        };
+        let second = TextData {
+            font_size: 48.0,
+            layout: TextLayoutSize::with_content(220.0, 84.0, 210.0, 84.0),
+            auto_resize: true,
+            ..TextData::default()
+        };
+        let mut insert = Transaction::new("insert text");
+        insert.insert_text(first_id, ElementMeta::default(), first.clone());
+        insert.insert_text(second_id, ElementMeta::default(), second.clone());
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(snow_draw_engine_core::EngineConfig::default()).unwrap();
+        editor.set_selection_state(vec![first_id, second_id], Some(first_id));
+        let mut style = TextStyle::from_text(&first);
+        style.stroke_width = 8.0;
+        let command = editor
+            .set_text_style(&document, style, TEXT_STYLE_MIXED_STROKE_WIDTH, &[])
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!()
+        };
+        document.apply_transaction(command.transaction).unwrap();
+
+        for (id, original) in [(first_id, first), (second_id, second)] {
+            let updated = document.text(id).unwrap();
+            assert_eq!(updated.stroke_width, 8.0);
+            assert_eq!(updated.font_size, original.font_size);
+            assert_eq!(updated.layout, original.layout);
+            assert_eq!(updated.center, original.center);
+        }
+    }
+
+    #[test]
+    fn filter_style_updates_only_filters_in_a_heterogeneous_selection() {
+        let mut document = DocumentModel::new();
+        let filter_id = document.allocate_element_id();
+        let rectangle_id = document.allocate_element_id();
+        let filter = FilterData::default();
+        let second_filter_id = document.allocate_element_id();
+        let second_filter = FilterData {
+            opacity: 0.25,
+            ..filter
+        };
+        let rectangle = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Point::default(),
+            width: 10.0,
+            height: 10.0,
+            rotation: 0.0,
+            fill: ColorRgba8::default(),
+            fill_style: FillStyle::Solid,
+            stroke: ColorRgba8::default(),
+            stroke_width: 0.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+        let mut insert = Transaction::new("insert");
+        insert.insert_filter(filter_id, ElementMeta::default(), filter);
+        insert.insert_rectangle(rectangle_id, ElementMeta::default(), rectangle);
+        insert.insert_filter(second_filter_id, ElementMeta::default(), second_filter);
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(snow_draw_engine_core::EngineConfig::default()).unwrap();
+        editor.set_selection_state(
+            vec![rectangle_id, filter_id, second_filter_id],
+            Some(rectangle_id),
+        );
+
+        assert_eq!(
+            editor.style_toolbar_source(&document),
+            StyleToolbarSource::SelectedFilter
+        );
+        assert_eq!(
+            editor.filter_style_mixed(&document),
+            FILTER_STYLE_PROPERTY_OPACITY
+        );
+        let command = editor
+            .set_filter_style(
+                &document,
+                FilterStyle {
+                    filter_type: snow_draw_engine_document::CanvasFilterType::Inversion,
+                    strength: 2.0,
+                    opacity: 0.75,
+                    stroke_width: 2.0,
+                },
+                FILTER_STYLE_PROPERTY_TYPE
+                    | FILTER_STYLE_PROPERTY_STRENGTH
+                    | FILTER_STYLE_PROPERTY_OPACITY,
+            )
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!()
+        };
+        assert_eq!(command.transaction.operations().len(), 2);
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(
+            document.filter(filter_id).unwrap().filter_type,
+            snow_draw_engine_document::CanvasFilterType::Inversion
+        );
+        assert_eq!(document.filter(filter_id).unwrap().strength, 1.0);
+        assert_eq!(document.filter(filter_id).unwrap().opacity, 0.75);
+        assert_eq!(document.filter(second_filter_id).unwrap().opacity, 0.75);
+        assert_eq!(*document.rectangle(rectangle_id).unwrap(), rectangle);
+    }
+    #[test]
+    fn serial_number_selected_value_edits_continue_only_edited_numeric_sequences() {
+        use snow_draw_engine_document::SerialNumberNumericType;
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert mixed numeric types");
+        let mut ids = Vec::new();
+        for numeric_type in [
+            SerialNumberNumericType::Roman,
+            SerialNumberNumericType::Chinese,
+        ] {
+            let id = document.allocate_element_id();
+            insert.insert_serial_number(
+                id,
+                ElementMeta::default(),
+                SerialNumberData {
+                    number: 3,
+                    numeric_type,
+                    ..Default::default()
+                },
+            );
+            ids.push(id);
+        }
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.state.default_serial_number.number = 7;
+        let mut values = editor.state.serial_number_values();
+        let mut overrides = editor.state.serial_number_sequence_overridden;
+        editor.set_selection_state(ids.clone(), Some(ids[0]));
+        let mut style = editor.serial_number_style(&document);
+        assert!(
+            editor
+                .set_serial_number_style_patch(
+                    &document,
+                    style.clone(),
+                    SERIAL_NUMBER_STYLE_MIXED_NUMBER
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(editor.state.serial_number_values(), values);
+        assert_eq!(editor.state.serial_number_sequence_overridden, overrides);
+        style.number = 55;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_serial_number_style_patch(&document, style, SERIAL_NUMBER_STYLE_MIXED_NUMBER)
+            .unwrap()
+        else {
+            panic!("expected selected value edit");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for id in ids {
+            assert_eq!(document.serial_number(id).unwrap().number, 55);
+        }
+        for numeric_type in [
+            SerialNumberNumericType::Roman,
+            SerialNumberNumericType::Chinese,
+        ] {
+            values[numeric_type as usize] = 56;
+            overrides[numeric_type as usize] = true;
+        }
+        assert_eq!(editor.state.serial_number_values(), values);
+        assert_eq!(editor.state.serial_number_sequence_overridden, overrides);
+        editor.set_selection_state(Vec::new(), None);
+        assert_eq!(editor.serial_number_style(&document).number, 7);
+        for numeric_type in [
+            SerialNumberNumericType::Roman,
+            SerialNumberNumericType::Chinese,
+        ] {
+            let mut style = editor.serial_number_style(&document);
+            style.numeric_type = numeric_type;
+            editor
+                .set_serial_number_style_patch(
+                    &document,
+                    style,
+                    SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE,
+                )
+                .unwrap();
+            assert_eq!(editor.serial_number_style(&document).number, 56);
+        }
+    }
+
+    #[test]
+    fn serial_number_numeric_type_patches_preserve_mixed_values_and_other_styles() {
+        use snow_draw_engine_document::SerialNumberNumericType;
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let first = SerialNumberData {
+            number: 888,
+            ..SerialNumberData::default()
+        };
+        let second = SerialNumberData {
+            number: 27,
+            numeric_type: SerialNumberNumericType::UppercaseLetters,
+            font_size: 42.0,
+            serial_number_type: snow_draw_engine_document::SerialNumberType::SolidSquare,
+            ..SerialNumberData::default()
+        };
+        let mut insert = Transaction::new("mixed numeric formats");
+        insert.insert_serial_number(first_id, ElementMeta::default(), first.clone());
+        insert.insert_serial_number(second_id, ElementMeta::default(), second.clone());
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state(vec![first_id, second_id], Some(first_id));
+        assert_ne!(
+            editor.serial_number_style_mixed(&document) & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE,
+            0
+        );
+        let mut style = editor.serial_number_style(&document);
+        style.numeric_type = SerialNumberNumericType::Roman;
+        let command = editor
+            .set_serial_number_style(&document, style)
+            .unwrap()
+            .unwrap();
+        let EditorCommand::ApplyTransaction(command) = command else {
+            panic!("expected transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for (id, original) in [(first_id, first), (second_id, second)] {
+            let changed = document.serial_number(id).unwrap();
+            let mut expected = original;
+            expected.numeric_type = SerialNumberNumericType::Roman;
+            assert_eq!(changed, &expected);
+        }
+        assert_eq!(
+            editor.serial_number_style_mixed(&document) & SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE,
+            0
+        );
+        assert_ne!(
+            editor.serial_number_style_mixed(&document) & SERIAL_NUMBER_STYLE_MIXED_NUMBER,
+            0
+        );
+    }
+
+    #[test]
+    fn serial_number_stroke_rendering_patch_resolves_only_the_mixed_stroke_type() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        let mut document = DocumentModel::new();
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let first = SerialNumberData {
+            number: 4,
+            stroke_rendering_seed: 123,
+            ..Default::default()
+        };
+        let second = SerialNumberData {
+            number: 8,
+            font_size: 35.0,
+            stroke_style: StrokeStyle::Dashed,
+            stroke_rendering_seed: 456,
+            stroke_rendering_style: StrokeRenderingStyle::Artist,
+            ..Default::default()
+        };
+        let mut insert = Transaction::new("mixed stroke types");
+        insert.insert_serial_number(first_id, ElementMeta::default(), first.clone());
+        insert.insert_serial_number(second_id, ElementMeta::default(), second.clone());
+        document.apply_transaction(insert).unwrap();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_selection_state(vec![first_id, second_id], Some(first_id));
+        assert_ne!(
+            editor.serial_number_style_mixed(&document)
+                & SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE,
+            0
+        );
+        let mut style = editor.serial_number_style(&document);
+        // Resolve the mixed property to the first item's value.
+        style.stroke_rendering_style = StrokeRenderingStyle::Architect;
+        let EditorCommand::ApplyTransaction(command) = editor
+            .set_serial_number_style_patch(
+                &document,
+                style,
+                SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE,
+            )
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected transaction")
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        for (id, mut original) in [(first_id, first), (second_id, second)] {
+            original.stroke_rendering_style = StrokeRenderingStyle::Architect;
+            assert_eq!(document.serial_number(id).unwrap(), &original);
+        }
+        assert_eq!(
+            editor.serial_number_style_mixed(&document)
+                & SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE,
+            0
+        );
+    }
+    #[test]
+    fn stroke_rendering_style_patch_preserves_pattern_seed_and_template_appearance() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        let mut document = DocumentModel::new();
+        let mut editor = Editor::new(Default::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Shape).unwrap();
+        let mut first = editor
+            .preview_rectangle_with_snapping(
+                &document,
+                Point::new(10.0, 10.0),
+                Point::new(110.0, 90.0),
+                Modifiers::default(),
+            )
+            .0
+            .unwrap();
+        first.stroke_style = StrokeStyle::Dashed;
+        first.stroke_rendering_seed = 901;
+        let first_id = document.allocate_element_id();
+        let second_id = document.allocate_element_id();
+        let mut second = first;
+        second.center.x += 140.0;
+        second.stroke_rendering_style = StrokeRenderingStyle::Artist;
+        second.stroke_rendering_seed = 0;
+        let mut insert = Transaction::new("stroke rendering fixture");
+        insert.insert_rectangle(first_id, ElementMeta::default(), first);
+        insert.insert_rectangle(second_id, ElementMeta::default(), second);
+        document.apply_transaction(insert).unwrap();
+        editor.set_selection_state_with_document(
+            Some(&document),
+            vec![first_id, second_id],
+            Some(first_id),
+        );
+        let bounds = editor.selection_bounds_snapshot(&document);
+        assert_eq!(
+            editor.shape_style_mixed(&document) & crate::SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE,
+            crate::SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE
+        );
+        let mut style = editor.shape_style(&document);
+        style.stroke_rendering_style = StrokeRenderingStyle::Cartoonist;
+        let Some(EditorCommand::ApplyTransaction(command)) = editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Rectangle,
+                    style,
+                    properties: crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("style transaction missing");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(editor.selection_bounds_snapshot(&document), bounds);
+        for (id, seed) in [(first_id, 901), (second_id, 0)] {
+            let rect = document.rectangle(id).unwrap();
+            assert_eq!(
+                rect.stroke_rendering_style,
+                StrokeRenderingStyle::Cartoonist
+            );
+            assert_eq!(rect.stroke_rendering_seed, seed);
+            assert_eq!(rect.stroke_style, StrokeStyle::Dashed);
+        }
+        let template = editor.selected_draw_template(&document).unwrap();
+        let EditorCommand::ApplyTransaction(command) = editor
+            .insert_draw_template(&document, &template, Point::new(500.0, 400.0))
+            .unwrap()
+        else {
+            panic!("template transaction missing")
+        };
+        let new_id = document.peek_next_element_id();
+        document.apply_transaction(command.transaction).unwrap();
+        let pasted = document.rectangle(new_id).unwrap();
+        assert_ne!(new_id, first_id);
+        assert_eq!(pasted.stroke_rendering_seed, 901);
+        assert_eq!(
+            pasted.stroke_rendering_style,
+            StrokeRenderingStyle::Cartoonist
+        );
+        assert!(
+            editor
+                .set_shape_style_patch(
+                    &document,
+                    ShapeStylePatch {
+                        kind: ShapeKind::FreeDraw,
+                        style,
+                        properties: crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE
+                    }
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn stroke_rendering_arrow_and_line_selection_patches_preserve_existing_geometry() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        for kind in [ShapeKind::Arrow, ShapeKind::Line] {
+            let mut document = DocumentModel::new();
+            let id = document.allocate_element_id();
+            let mut arrow = ArrowData::from_global_points(
+                &[Point::new(20.0, 30.0), Point::new(140.0, 70.0)],
+                ColorRgba8 {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                    a: 255,
+                },
+                3.0,
+                StrokeStyle::Dotted,
+                ArrowType::Straight,
+                None,
+                Some(Arrowhead::Arrow),
+            )
+            .unwrap();
+            if kind == ShapeKind::Line {
+                arrow = arrow.into_line(ColorRgba8::default(), FillStyle::Solid);
+            }
+            arrow.stroke_rendering_seed = 29;
+            let original = arrow.clone();
+            let mut insert = Transaction::new("styled linear fixture");
+            insert.insert_arrow(id, ElementMeta::default(), arrow);
+            document.apply_transaction(insert).unwrap();
+            let mut editor = Editor::new(Default::default()).unwrap();
+            editor.set_selection_state_with_document(Some(&document), vec![id], Some(id));
+            let mut style = editor.shape_style(&document);
+            style.stroke_rendering_style = StrokeRenderingStyle::Artist;
+            let Some(EditorCommand::ApplyTransaction(command)) = editor
+                .set_shape_style_patch(
+                    &document,
+                    ShapeStylePatch {
+                        kind,
+                        style,
+                        properties: crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("linear style transaction missing");
+            };
+            document.apply_transaction(command.transaction).unwrap();
+            let mut expected = original;
+            expected.stroke_rendering_style = StrokeRenderingStyle::Artist;
+            assert_eq!(*document.arrow(id).unwrap(), expected);
+        }
+    }
+}

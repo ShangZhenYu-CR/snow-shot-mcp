@@ -1,0 +1,161 @@
+use std::sync::Arc;
+
+use crate::CapturePixelFormat;
+use crate::CaptureTarget;
+use crate::backend::{
+    self, AutoBackendPolicy, CaptureBackend, CaptureBackendKind, CaptureWorkload,
+};
+use crate::capture_session::{CaptureSession, CaptureTargetInfo, inspect_target_from_backend};
+use crate::error::CaptureResult;
+use crate::monitor::MonitorId;
+use crate::region::MonitorLayout;
+
+#[derive(Clone, Debug)]
+pub struct CaptureOptions {
+    pub backend_tuning: crate::tuning::BackendTuning,
+    pub capture_retry_count: usize,
+    pub workload: CaptureWorkload,
+    /// Packed 8-bit pixel layout returned by capture sessions.
+    pub output_pixel_format: CapturePixelFormat,
+    /// Opt in to persistent, independent window capture at the given producer
+    /// frame rate. This profile retains offscreen/minimized macOS windows; the
+    /// caller owns native source-state observation and recovery. Other capture
+    /// workflows keep their existing snapshot/recording policy when unset.
+    pub live_window_fps: Option<u32>,
+    /// Session-scoped macOS ScreenCaptureKit exclusions. Other backends ignore
+    /// these filters; display and region targets accept them while independent
+    /// window targets reject them.
+    pub excluded_windows: Arc<[u32]>,
+    pub excluded_processes: Arc<[i32]>,
+    /// Record a per-stage timing breakdown inside participating backends and
+    /// attach it to each frame's metadata (`FrameMetadata::stage_timings`).
+    ///
+    /// Compile-time gated by the `stage-timing` cargo feature: this field,
+    /// the metadata it feeds, and all backend instrumentation only exist in
+    /// builds that enable that feature (benchmarks and diagnostics). When
+    /// the feature is disabled the capture hot path contains no
+    /// instrumentation code at all.
+    #[cfg(feature = "stage-timing")]
+    pub record_stage_timings: bool,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            backend_tuning: crate::tuning::BackendTuning::Default,
+            capture_retry_count: 1,
+            workload: CaptureWorkload::Snapshot,
+            output_pixel_format: CapturePixelFormat::Rgba8,
+            live_window_fps: None,
+            excluded_windows: Arc::from(Vec::<u32>::new()),
+            excluded_processes: Arc::from(Vec::<i32>::new()),
+            #[cfg(feature = "stage-timing")]
+            record_stage_timings: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CaptureSystem {
+    backend: Arc<dyn CaptureBackend>,
+    backend_kind: CaptureBackendKind,
+    auto_backend_policy: AutoBackendPolicy,
+    auto_backend_policy_is_explicit: bool,
+}
+
+impl CaptureSystem {
+    pub fn capabilities(&self) -> crate::capabilities::CaptureCapabilities {
+        crate::capabilities::CaptureCapabilities::current()
+    }
+    pub fn builder() -> CaptureSystemBuilder {
+        CaptureSystemBuilder::new()
+    }
+
+    pub fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+        self.backend.enumerate_monitors()
+    }
+
+    pub fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+        self.backend.primary_monitor()
+    }
+
+    pub fn monitor_layout(&self) -> CaptureResult<MonitorLayout> {
+        self.backend.monitor_layout()
+    }
+
+    pub fn refresh_display_configuration(&self) -> CaptureResult<()> {
+        self.backend.refresh_display_configuration()
+    }
+
+    pub fn backend_kind(&self) -> CaptureBackendKind {
+        self.backend_kind
+    }
+
+    pub fn inspect_target(&self, target: &CaptureTarget) -> CaptureResult<CaptureTargetInfo> {
+        inspect_target_from_backend(&self.backend, target)
+    }
+
+    pub fn open_session(
+        &self,
+        target: CaptureTarget,
+        options: CaptureOptions,
+    ) -> CaptureResult<CaptureSession> {
+        let session_backend = if options.workload == CaptureWorkload::Snapshot {
+            backend::backend_for_kind_with_auto_policy(
+                self.backend_kind,
+                self.auto_backend_policy.clone(),
+                self.auto_backend_policy_is_explicit,
+            )?
+        } else {
+            Arc::clone(&self.backend)
+        };
+        CaptureSession::open_with_backend(target, session_backend, options)
+    }
+}
+
+pub struct CaptureSystemBuilder {
+    backend_kind: CaptureBackendKind,
+    auto_backend_policy: AutoBackendPolicy,
+    auto_backend_policy_is_explicit: bool,
+}
+
+impl CaptureSystemBuilder {
+    pub fn new() -> Self {
+        Self {
+            backend_kind: CaptureBackendKind::Auto,
+            auto_backend_policy: AutoBackendPolicy::default(),
+            auto_backend_policy_is_explicit: false,
+        }
+    }
+
+    pub fn with_backend_kind(mut self, kind: CaptureBackendKind) -> Self {
+        self.backend_kind = kind;
+        self
+    }
+
+    pub fn with_auto_backend_policy(mut self, auto_backend_policy: AutoBackendPolicy) -> Self {
+        self.auto_backend_policy = auto_backend_policy;
+        self.auto_backend_policy_is_explicit = true;
+        self
+    }
+
+    pub fn build(self) -> CaptureResult<CaptureSystem> {
+        let backend = backend::backend_for_kind_with_auto_policy(
+            self.backend_kind,
+            self.auto_backend_policy.clone(),
+            self.auto_backend_policy_is_explicit,
+        )?;
+        Ok(CaptureSystem {
+            backend,
+            backend_kind: self.backend_kind,
+            auto_backend_policy: self.auto_backend_policy,
+            auto_backend_policy_is_explicit: self.auto_backend_policy_is_explicit,
+        })
+    }
+}
+
+impl Default for CaptureSystemBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}

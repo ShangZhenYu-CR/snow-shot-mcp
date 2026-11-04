@@ -1,0 +1,765 @@
+#include "snow_shot/presentation/screenshotcanvastoolstyles.h"
+
+#include "snow_shot/presentation/screenshotdefaultstyles.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/settingsadapters.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+
+#include <QJsonObject>
+#include <QMap>
+#include <QString>
+#include <QThread>
+
+#include <algorithm>
+#include <cmath>
+
+namespace snow_shot::presentation {
+namespace {
+constexpr quint32 kRectangleShapeProperties =
+    SnowCanvasShapeStylePropertyFillColor | SnowCanvasShapeStylePropertyFillStyle |
+    SnowCanvasShapeStylePropertyStrokeColor | SnowCanvasShapeStylePropertyStrokeWidth |
+    SnowCanvasShapeStylePropertyCornerRadius | SnowCanvasShapeStylePropertyStrokeStyle |
+    SnowCanvasShapeStylePropertyStrokeRenderingStyle | SnowCanvasShapeStylePropertyShape;
+constexpr quint32 kArrowShapeProperties =
+    SnowCanvasShapeStylePropertyStrokeColor | SnowCanvasShapeStylePropertyStrokeWidth |
+    SnowCanvasShapeStylePropertyStartArrowhead | SnowCanvasShapeStylePropertyEndArrowhead |
+    SnowCanvasShapeStylePropertyStrokeStyle | SnowCanvasShapeStylePropertyArrowType |
+    SnowCanvasShapeStylePropertyStrokeRenderingStyle | SnowCanvasShapeStylePropertyArrowShaftType |
+    SnowCanvasShapeStylePropertyArrowRatio | SnowCanvasShapeStylePropertyArrowOutlineColor |
+    SnowCanvasShapeStylePropertyArrowOutlineWidth;
+constexpr quint32 kLineShapeProperties =
+    SnowCanvasShapeStylePropertyFillColor | SnowCanvasShapeStylePropertyFillStyle |
+    SnowCanvasShapeStylePropertyStrokeColor | SnowCanvasShapeStylePropertyStrokeWidth |
+    SnowCanvasShapeStylePropertyStrokeStyle | SnowCanvasShapeStylePropertyArrowType |
+    SnowCanvasShapeStylePropertyStrokeRenderingStyle | SnowCanvasShapeStylePropertyOpacity;
+constexpr quint32 kFreeDrawShapeProperties =
+    SnowCanvasShapeStylePropertyFillColor | SnowCanvasShapeStylePropertyFillStyle |
+    SnowCanvasShapeStylePropertyStrokeColor | SnowCanvasShapeStylePropertyStrokeWidth |
+    SnowCanvasShapeStylePropertyStrokeStyle | SnowCanvasShapeStylePropertyOpacity |
+    SnowCanvasShapeStylePropertyBrushMode;
+constexpr quint32 kRectangleHighlightProperties = SnowCanvasShapeStylePropertyFillColor |
+                                                  SnowCanvasShapeStylePropertyStrokeColor |
+                                                  SnowCanvasShapeStylePropertyStrokeWidth;
+constexpr quint32 kPenHighlightProperties =
+    SnowCanvasShapeStylePropertyStrokeColor | SnowCanvasShapeStylePropertyStrokeWidth;
+constexpr quint32 kAllFilterProperties =
+    SnowCanvasFilterStylePropertyType | SnowCanvasFilterStylePropertyStrength |
+    SnowCanvasFilterStylePropertyOpacity | SnowCanvasFilterStylePropertyStrokeWidth;
+constexpr quint32 kSerialNumberAppearanceProperties =
+    SnowCanvasSerialNumberStyleMixedColor | SnowCanvasSerialNumberStyleMixedFill |
+    SnowCanvasSerialNumberStyleMixedFillStyle | SnowCanvasSerialNumberStyleMixedFontSize |
+    SnowCanvasSerialNumberStyleMixedFontFamily | SnowCanvasSerialNumberStyleMixedStrokeWidth |
+    SnowCanvasSerialNumberStyleMixedStrokeStyle | SnowCanvasSerialNumberStyleMixedOpacity |
+    SnowCanvasSerialNumberStyleMixedType | SnowCanvasSerialNumberStyleMixedNumericType |
+    SnowCanvasSerialNumberStyleMixedStrokeRenderingStyle;
+
+const QString kShapeKey = QStringLiteral("drawing/shape_style");
+const QString kSpeechBubbleKey = QStringLiteral("drawing/speech_bubble_style");
+const QString kArrowKey = QStringLiteral("drawing/arrow_style");
+const QString kLineKey = QStringLiteral("drawing/line_style");
+const QString kDistanceKey = QStringLiteral("drawing/distance_style");
+const QString kAngleKey = QStringLiteral("drawing/angle_style");
+const QString kBracketKey = QStringLiteral("drawing/bracket_style");
+const QString kMagnifierKey = QStringLiteral("drawing/magnifier_style");
+const QString kFreeDrawKey = QStringLiteral("drawing/free_draw_style");
+const QString kRectangleHighlightKey = QStringLiteral("drawing/rectangle_highlight_style");
+const QString kPenHighlightKey = QStringLiteral("drawing/pen_highlight_style");
+const QString kRectangleFilterKey = QStringLiteral("drawing/rectangle_filter_style");
+const QString kPenFilterKey = QStringLiteral("drawing/pen_filter_style");
+const QString kBrushEraserKey = QStringLiteral("drawing/brush_eraser_style");
+const QString kTextKey = QStringLiteral("drawing/text_style");
+const QString kSerialNumberKey = QStringLiteral("drawing/serial_number_style");
+const QString kWatermarkKey = QStringLiteral("drawing/watermark_style");
+const QString kSpotlightKey = QStringLiteral("drawing/spotlight_style");
+
+QJsonValue colorValue(const QColor& color) {
+    if (!color.isValid()) {
+        return {};
+    }
+    return QStringLiteral("#%1%2%3%4")
+        .arg(color.red(), 2, 16, QLatin1Char('0'))
+        .arg(color.green(), 2, 16, QLatin1Char('0'))
+        .arg(color.blue(), 2, 16, QLatin1Char('0'))
+        .arg(color.alpha(), 2, 16, QLatin1Char('0'));
+}
+
+bool colorValue(const QJsonValue& value, QColor* color) {
+    if (color == nullptr || !value.isString()) {
+        return false;
+    }
+    const QString text = value.toString();
+    if (text.size() != 9 || !text.startsWith(u'#')) {
+        return false;
+    }
+    bool ok = false;
+    const int red = text.mid(1, 2).toInt(&ok, 16);
+    if (!ok)
+        return false;
+    const int green = text.mid(3, 2).toInt(&ok, 16);
+    if (!ok)
+        return false;
+    const int blue = text.mid(5, 2).toInt(&ok, 16);
+    if (!ok)
+        return false;
+    const int alpha = text.mid(7, 2).toInt(&ok, 16);
+    if (!ok)
+        return false;
+    *color = QColor(red, green, blue, alpha);
+    return color->isValid();
+}
+
+void putDouble(QJsonObject* object, const QString& key, double value) {
+    if (object != nullptr && std::isfinite(value)) {
+        object->insert(key, value);
+    }
+}
+
+bool readDouble(const QJsonObject& object, const QString& key, double* value) {
+    if (value == nullptr || !object.value(key).isDouble() ||
+        !std::isfinite(object.value(key).toDouble())) {
+        return false;
+    }
+    *value = object.value(key).toDouble();
+    return true;
+}
+
+double bounded(double value, double minimum, double maximum) {
+    return std::isfinite(value) ? std::clamp(value, minimum, maximum) : minimum;
+}
+
+template <typename Enum> void putEnum(QJsonObject* object, const QString& key, Enum value) {
+    if (object != nullptr) {
+        object->insert(key, static_cast<int>(value));
+    }
+}
+
+template <typename Enum>
+bool readEnum(const QJsonObject& object, const QString& key, int maximum, Enum* value) {
+    if (value == nullptr || !object.value(key).isDouble()) {
+        return false;
+    }
+    const double raw = object.value(key).toDouble();
+    if (!std::isfinite(raw) || std::floor(raw) != raw || raw < 0 || raw > maximum) {
+        return false;
+    }
+    *value = static_cast<Enum>(static_cast<int>(raw));
+    return true;
+}
+
+QJsonObject cornerRadiiValue(const SnowCanvasCornerRadii& radii) {
+    QJsonObject value;
+    putDouble(&value, QStringLiteral("top_left"), radii.topLeft);
+    putDouble(&value, QStringLiteral("top_right"), radii.topRight);
+    putDouble(&value, QStringLiteral("bottom_right"), radii.bottomRight);
+    putDouble(&value, QStringLiteral("bottom_left"), radii.bottomLeft);
+    return value;
+}
+
+void readCornerRadii(const QJsonObject& object, SnowCanvasCornerRadii* radii) {
+    if (radii == nullptr)
+        return;
+    const QJsonObject value = object.value(QStringLiteral("corner_radii")).toObject();
+    readDouble(value, QStringLiteral("top_left"), &radii->topLeft);
+    readDouble(value, QStringLiteral("top_right"), &radii->topRight);
+    readDouble(value, QStringLiteral("bottom_right"), &radii->bottomRight);
+    readDouble(value, QStringLiteral("bottom_left"), &radii->bottomLeft);
+}
+
+QJsonObject shapeValue(const SnowCanvasShapeStyle& style) {
+    QJsonObject value;
+    value.insert(QStringLiteral("arrow_outline_color"), colorValue(style.arrowOutlineColor));
+    putDouble(&value, QStringLiteral("arrow_outline_width"), style.arrowOutlineWidth);
+    value.insert(QStringLiteral("fill"), colorValue(style.fill));
+    putEnum(&value, QStringLiteral("fill_style"), style.fillStyle);
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    value.insert(QStringLiteral("corner_radii"), cornerRadiiValue(style.cornerRadii));
+    putEnum(&value, QStringLiteral("start_arrowhead"), style.startArrowhead);
+    putEnum(&value, QStringLiteral("end_arrowhead"), style.endArrowhead);
+    putEnum(&value, QStringLiteral("stroke_style"), style.strokeStyle);
+    putEnum(&value, QStringLiteral("stroke_rendering_style"), style.strokeRenderingStyle);
+    putEnum(&value, QStringLiteral("arrow_type"), style.arrowType);
+    putEnum(&value, QStringLiteral("arrow_shaft_type"), style.arrowShaftType);
+    putDouble(&value, QStringLiteral("arrow_ratio"),
+              snowCanvasNormalizeArrowRatio(style.arrowRatio));
+    putDouble(&value, QStringLiteral("opacity"), style.opacity);
+    putEnum(&value, QStringLiteral("highlight_shape"), style.highlightShape);
+    putEnum(&value, QStringLiteral("shape"), style.shape);
+    return value;
+}
+
+QJsonObject magnifierValue(const SnowCanvasMagnifierStyle& style) {
+    QJsonObject value;
+    putEnum(&value, QStringLiteral("shape"), style.shape);
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    putDouble(&value, QStringLiteral("factor"), style.factor);
+    putEnum(&value, QStringLiteral("connection_type"), style.connectionType);
+    value.insert(QStringLiteral("source_outline"), style.sourceOutline);
+    putEnum(&value, QStringLiteral("leader_arrowhead"), style.leaderArrowhead);
+    putDouble(&value, QStringLiteral("arrow_ratio"),
+              snowCanvasNormalizeArrowRatio(style.arrowRatio));
+    value.insert(QStringLiteral("corner_radii"), cornerRadiiValue(style.cornerRadii));
+    return value;
+}
+
+void readMagnifierValue(const QJsonObject& object, SnowCanvasMagnifierStyle* style) {
+    if (style == nullptr || object.contains(QStringLiteral("show_leader")) ||
+        !object.value(QStringLiteral("source_outline")).isBool())
+        return;
+    auto connectionType = style->connectionType;
+    if (!readEnum(object, QStringLiteral("connection_type"),
+                  static_cast<int>(SnowCanvasMagnifierConnectionType::Gradient), &connectionType))
+        return;
+    // The unreleased Magnifier format requires both new fields. Reject its
+    // complete preference object before applying any appearance properties.
+    style->connectionType = connectionType;
+    style->sourceOutline = object.value(QStringLiteral("source_outline")).toBool();
+    readEnum(object, QStringLiteral("shape"), static_cast<int>(SnowCanvasRectangleShape::Diamond),
+             &style->shape);
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readDouble(object, QStringLiteral("factor"), &style->factor);
+    readEnum(object, QStringLiteral("leader_arrowhead"),
+             static_cast<int>(SnowCanvasArrowhead::IndentedTriangle), &style->leaderArrowhead);
+    style->strokeWidth = bounded(style->strokeWidth, 0.0, 72.0);
+    style->factor = bounded(style->factor, 1.0, 10.0);
+    readDouble(object, QStringLiteral("arrow_ratio"), &style->arrowRatio);
+    style->arrowRatio = std::clamp(snowCanvasNormalizeArrowRatio(style->arrowRatio), 0.5, 3.0);
+    readCornerRadii(object, &style->cornerRadii);
+    style->cornerRadii.topLeft = bounded(style->cornerRadii.topLeft, 0.0, 83.0);
+    style->cornerRadii.topRight = bounded(style->cornerRadii.topRight, 0.0, 83.0);
+    style->cornerRadii.bottomRight = bounded(style->cornerRadii.bottomRight, 0.0, 83.0);
+    style->cornerRadii.bottomLeft = bounded(style->cornerRadii.bottomLeft, 0.0, 83.0);
+}
+
+QJsonObject distanceValue(const SnowCanvasDistanceStyle& style) {
+    QJsonObject value;
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    putDouble(&value, QStringLiteral("factor"), style.factor);
+    putEnum(&value, QStringLiteral("unit"), style.unit);
+    value.insert(QStringLiteral("decimal_places"), style.decimalPlaces);
+    putDouble(&value, QStringLiteral("endpoint_scale"), style.endpointScale);
+    putEnum(&value, QStringLiteral("endpoint_style"), style.endpointStyle);
+    return value;
+}
+
+void readDistanceValue(const QJsonObject& object, SnowCanvasDistanceStyle* style) {
+    if (style == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readDouble(object, QStringLiteral("factor"), &style->factor);
+    readDouble(object, QStringLiteral("endpoint_scale"), &style->endpointScale);
+    readEnum(object, QStringLiteral("unit"), static_cast<int>(SnowCanvasDistanceUnit::Um),
+             &style->unit);
+    readEnum(object, QStringLiteral("endpoint_style"),
+             static_cast<int>(SnowCanvasArrowhead::IndentedTriangle), &style->endpointStyle);
+    double decimalPlaces = style->decimalPlaces;
+    if (readDouble(object, QStringLiteral("decimal_places"), &decimalPlaces) &&
+        std::floor(decimalPlaces) == decimalPlaces && decimalPlaces >= 0 && decimalPlaces <= 3)
+        style->decimalPlaces = static_cast<int>(decimalPlaces);
+    style->strokeWidth = bounded(style->strokeWidth, 1.0, 72.0);
+    style->factor = bounded(style->factor, 0.01, 1000.0);
+    style->endpointScale = bounded(style->endpointScale, 0.5, 3.0);
+}
+
+QJsonObject bracketValue(const SnowCanvasBracketStyle& style) {
+    QJsonObject value;
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    return value;
+}
+void readBracketValue(const QJsonObject& object, SnowCanvasBracketStyle* style) {
+    if (style == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    style->strokeWidth = bounded(style->strokeWidth, 1.0, 72.0);
+}
+QJsonObject angleValue(const SnowCanvasAngleStyle& style) {
+    QJsonObject value;
+    putEnum(&value, QStringLiteral("angle_type"), style.angleType);
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    putEnum(&value, QStringLiteral("unit"), style.unit);
+    value.insert(QStringLiteral("decimal_places"), static_cast<int>(style.decimalPlaces));
+    return value;
+}
+
+void readAngleValue(const QJsonObject& object, SnowCanvasAngleStyle* style) {
+    if (style == nullptr)
+        return;
+    readEnum(object, QStringLiteral("angle_type"), static_cast<int>(SnowCanvasAngleType::Interior),
+             &style->angleType);
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readEnum(object, QStringLiteral("unit"), static_cast<int>(SnowCanvasAngleUnit::Radians),
+             &style->unit);
+    double decimalPlaces = style->decimalPlaces;
+    if (readDouble(object, QStringLiteral("decimal_places"), &decimalPlaces) &&
+        std::floor(decimalPlaces) == decimalPlaces && decimalPlaces >= 0 && decimalPlaces <= 3)
+        style->decimalPlaces = static_cast<quint32>(decimalPlaces);
+    style->strokeWidth = bounded(style->strokeWidth, 1.0, 72.0);
+}
+
+QJsonObject lineValue(const SnowCanvasShapeStyle& style) {
+    QJsonObject value = shapeValue(style);
+    value.remove(QStringLiteral("arrow_type"));
+    putEnum(&value, QStringLiteral("line_type"), style.arrowType);
+    return value;
+}
+
+QJsonObject freeDrawValue(const SnowCanvasShapeStyle& style) {
+    QJsonObject value = shapeValue(style);
+    value.insert(QStringLiteral("brush_mode"),
+                 style.brushMode == SnowCanvasBrushMode::PressureSensitive
+                     ? QStringLiteral("pressure-sensitive")
+                     : QStringLiteral("regular"));
+    return value;
+}
+
+void readShapeValue(const QJsonObject& object, SnowCanvasShapeStyle* style,
+                    bool speechBubble = false) {
+    if (style == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("fill")), &color))
+        style->fill = color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readCornerRadii(object, &style->cornerRadii);
+    style->arrowRatio = 1.0;
+    readDouble(object, QStringLiteral("arrow_ratio"), &style->arrowRatio);
+    style->arrowRatio = snowCanvasNormalizeArrowRatio(style->arrowRatio);
+    style->arrowOutlineColor = QColor(0xff, 0xcc, 0xc7);
+    colorValue(object.value(QStringLiteral("arrow_outline_color")), &style->arrowOutlineColor);
+    style->arrowOutlineWidth = 0.0;
+    readDouble(object, QStringLiteral("arrow_outline_width"), &style->arrowOutlineWidth);
+    style->arrowOutlineWidth = bounded(style->arrowOutlineWidth, 0.0, 72.0);
+    readEnum(object, QStringLiteral("fill_style"), static_cast<int>(SnowCanvasFillStyle::Border),
+             &style->fillStyle);
+    readEnum(object, QStringLiteral("start_arrowhead"),
+             static_cast<int>(SnowCanvasArrowhead::IndentedTriangle), &style->startArrowhead);
+    readEnum(object, QStringLiteral("end_arrowhead"),
+             static_cast<int>(SnowCanvasArrowhead::IndentedTriangle), &style->endArrowhead);
+    readEnum(object, QStringLiteral("stroke_style"),
+             static_cast<int>(SnowCanvasStrokeStyle::Dotted), &style->strokeStyle);
+    style->strokeRenderingStyle = SnowCanvasStrokeRenderingStyle::Architect;
+    readEnum(object, QStringLiteral("stroke_rendering_style"),
+             static_cast<int>(SnowCanvasStrokeRenderingStyle::Cartoonist),
+             &style->strokeRenderingStyle);
+    readEnum(object, QStringLiteral("arrow_type"), static_cast<int>(SnowCanvasArrowType::Elbow),
+             &style->arrowType);
+    readEnum(object, QStringLiteral("arrow_shaft_type"),
+             static_cast<int>(SnowCanvasArrowShaftType::Tapered), &style->arrowShaftType);
+    readDouble(object, QStringLiteral("opacity"), &style->opacity);
+    readEnum(object, QStringLiteral("highlight_shape"),
+             static_cast<int>(SnowCanvasHighlightShape::Ellipse), &style->highlightShape);
+    readEnum(object, QStringLiteral("shape"),
+             static_cast<int>(speechBubble ? SnowCanvasRectangleShape::ThoughtBubble
+                                           : SnowCanvasRectangleShape::Diamond),
+             &style->shape);
+}
+
+void readLineValue(QJsonObject object, SnowCanvasShapeStyle* style) {
+    if (style == nullptr)
+        return;
+    object.remove(QStringLiteral("arrow_type"));
+    readShapeValue(object, style);
+    SnowCanvasArrowType lineType = SnowCanvasArrowType::Curve;
+    if (readEnum(object, QStringLiteral("line_type"), static_cast<int>(SnowCanvasArrowType::Curve),
+                 &lineType)) {
+        style->arrowType = lineType;
+    } else {
+        style->arrowType = SnowCanvasArrowType::Curve;
+    }
+}
+
+QJsonObject filterValue(const SnowCanvasFilterStyle& style) {
+    QJsonObject value;
+    putEnum(&value, QStringLiteral("type"), style.type);
+    putDouble(&value, QStringLiteral("strength"), style.strength);
+    putDouble(&value, QStringLiteral("opacity"), style.opacity);
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    return value;
+}
+
+void readFilterValue(const QJsonObject& object, SnowCanvasFilterStyle* style) {
+    if (style == nullptr)
+        return;
+    readEnum(object, QStringLiteral("type"), static_cast<int>(SnowCanvasFilterType::Brightness),
+             &style->type);
+    readDouble(object, QStringLiteral("strength"), &style->strength);
+    readDouble(object, QStringLiteral("opacity"), &style->opacity);
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+}
+
+QJsonObject textValue(const SnowCanvasTextStyle& style) {
+    QJsonObject value;
+    value.insert(QStringLiteral("color"), colorValue(style.color));
+    putDouble(&value, QStringLiteral("font_size"), style.fontSize);
+    value.insert(QStringLiteral("font_family"), style.fontFamily);
+    value.insert(QStringLiteral("bold"), style.bold);
+    value.insert(QStringLiteral("italic"), style.italic);
+    value.insert(QStringLiteral("fill"), colorValue(style.fill));
+    putEnum(&value, QStringLiteral("fill_style"), style.fillStyle);
+    value.insert(QStringLiteral("stroke"), colorValue(style.stroke));
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    value.insert(QStringLiteral("corner_radii"), cornerRadiiValue(style.cornerRadii));
+    putEnum(&value, QStringLiteral("horizontal_align"), style.horizontalAlign);
+    putEnum(&value, QStringLiteral("vertical_align"), style.verticalAlign);
+    putDouble(&value, QStringLiteral("opacity"), style.opacity);
+    return value;
+}
+
+void readTextValue(const QJsonObject& object, SnowCanvasTextStyle* style) {
+    if (style == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("color")), &color))
+        style->color = color;
+    if (colorValue(object.value(QStringLiteral("fill")), &color))
+        style->fill = color;
+    if (colorValue(object.value(QStringLiteral("stroke")), &color))
+        style->stroke = color;
+    if (object.value(QStringLiteral("bold")).isBool())
+        style->bold = object.value(QStringLiteral("bold")).toBool();
+    if (object.value(QStringLiteral("italic")).isBool())
+        style->italic = object.value(QStringLiteral("italic")).toBool();
+    readDouble(object, QStringLiteral("font_size"), &style->fontSize);
+    if (object.value(QStringLiteral("font_family")).isString())
+        style->fontFamily = object.value(QStringLiteral("font_family")).toString();
+    readEnum(object, QStringLiteral("fill_style"), static_cast<int>(SnowCanvasFillStyle::Border),
+             &style->fillStyle);
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readCornerRadii(object, &style->cornerRadii);
+    readEnum(object, QStringLiteral("horizontal_align"),
+             static_cast<int>(SnowCanvasTextHorizontalAlign::Right), &style->horizontalAlign);
+    readEnum(object, QStringLiteral("vertical_align"),
+             static_cast<int>(SnowCanvasTextVerticalAlign::Bottom), &style->verticalAlign);
+    readDouble(object, QStringLiteral("opacity"), &style->opacity);
+}
+
+QJsonObject serialNumberValue(const SnowCanvasSerialNumberStyle& style) {
+    QJsonObject value;
+    // The current number belongs to the editing session, not the saved appearance.
+    putEnum(&value, QStringLiteral("type"), style.type);
+    putEnum(&value, QStringLiteral("numeric_type"), style.numericType);
+    value.insert(QStringLiteral("color"), colorValue(style.color));
+    value.insert(QStringLiteral("fill"), colorValue(style.fill));
+    putEnum(&value, QStringLiteral("fill_style"), style.fillStyle);
+    putDouble(&value, QStringLiteral("font_size"), style.fontSize);
+    value.insert(QStringLiteral("font_family"), style.fontFamily);
+    putDouble(&value, QStringLiteral("stroke_width"), style.strokeWidth);
+    putEnum(&value, QStringLiteral("stroke_style"), style.strokeStyle);
+    putEnum(&value, QStringLiteral("stroke_rendering_style"), style.strokeRenderingStyle);
+    putDouble(&value, QStringLiteral("opacity"), style.opacity);
+    return value;
+}
+
+void readSerialNumberValue(const QJsonObject& object, SnowCanvasSerialNumberStyle* style) {
+    if (style == nullptr)
+        return;
+    readEnum(object, QStringLiteral("numeric_type"),
+             static_cast<int>(SnowCanvasSerialNumberNumericType::Chinese), &style->numericType);
+    readEnum(object, QStringLiteral("type"), static_cast<int>(SnowCanvasSerialNumberType::Circle),
+             &style->type);
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("color")), &color))
+        style->color = color;
+    if (colorValue(object.value(QStringLiteral("fill")), &color))
+        style->fill = color;
+    readEnum(object, QStringLiteral("fill_style"), static_cast<int>(SnowCanvasFillStyle::Border),
+             &style->fillStyle);
+    readDouble(object, QStringLiteral("font_size"), &style->fontSize);
+    if (object.value(QStringLiteral("font_family")).isString())
+        style->fontFamily = object.value(QStringLiteral("font_family")).toString();
+    readDouble(object, QStringLiteral("stroke_width"), &style->strokeWidth);
+    readEnum(object, QStringLiteral("stroke_style"),
+             static_cast<int>(SnowCanvasStrokeStyle::Dotted), &style->strokeStyle);
+    readEnum(object, QStringLiteral("stroke_rendering_style"),
+             static_cast<int>(SnowCanvasStrokeRenderingStyle::Cartoonist),
+             &style->strokeRenderingStyle);
+    readDouble(object, QStringLiteral("opacity"), &style->opacity);
+}
+
+QJsonObject watermarkValue(const SnowCanvasWatermarkConfig& config) {
+    QJsonObject value;
+    // Creation defaults contain appearance only. Remembered content is restored separately on
+    // explicit tool activation, with template timestamps owned by the document session.
+    value.insert(QStringLiteral("color"), colorValue(config.color));
+    putDouble(&value, QStringLiteral("font_size"), config.fontSize);
+    value.insert(QStringLiteral("font_family"), config.fontFamily);
+    putDouble(&value, QStringLiteral("angle"), config.angle);
+    putDouble(&value, QStringLiteral("gap"), config.gap);
+    putDouble(&value, QStringLiteral("opacity"), config.opacity);
+    return value;
+}
+
+void readWatermarkValue(const QJsonObject& object, SnowCanvasWatermarkConfig* config) {
+    if (config == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("color")), &color))
+        config->color = color;
+    readDouble(object, QStringLiteral("font_size"), &config->fontSize);
+    if (object.value(QStringLiteral("font_family")).isString())
+        config->fontFamily = object.value(QStringLiteral("font_family")).toString();
+    readDouble(object, QStringLiteral("angle"), &config->angle);
+    readDouble(object, QStringLiteral("gap"), &config->gap);
+    readDouble(object, QStringLiteral("opacity"), &config->opacity);
+}
+
+QJsonObject spotlightValue(const SnowCanvasSpotlightConfig& config, SnowCanvasRectangleShape shape,
+                           const SnowCanvasCornerRadii& radii) {
+    QJsonObject value;
+    value.insert(QStringLiteral("color"), colorValue(config.color));
+    putDouble(&value, QStringLiteral("opacity"), config.opacity);
+    putEnum(&value, QStringLiteral("shape"), shape);
+    value.insert(QStringLiteral("corner_radii"), cornerRadiiValue(radii));
+    return value;
+}
+
+void readSpotlightValue(const QJsonObject& object, SnowCanvasSpotlightConfig* config) {
+    if (config == nullptr)
+        return;
+    QColor color;
+    if (colorValue(object.value(QStringLiteral("color")), &color))
+        config->color = color;
+    readDouble(object, QStringLiteral("opacity"), &config->opacity);
+}
+
+} // namespace
+
+SnowCanvasStyleDefaults screenshotCanvasToolStyleDefaults() {
+    SnowCanvasStyleDefaults defaults = screenshotCanvasStyleDefaults();
+    auto& storage = storage::ApplicationStorage::instance();
+    if (!storage.isInitialized())
+        return defaults;
+    const auto& configuration = storage.configuration();
+    readShapeValue(configuration.value(kShapeKey).toObject(), &defaults.rectangle);
+    readShapeValue(configuration.value(kSpeechBubbleKey).toObject(), &defaults.speechBubble, true);
+    readShapeValue(configuration.value(kArrowKey).toObject(), &defaults.arrow);
+    readDistanceValue(configuration.value(kDistanceKey).toObject(), &defaults.distance);
+    readAngleValue(configuration.value(kAngleKey).toObject(), &defaults.angle);
+    readBracketValue(configuration.value(kBracketKey).toObject(), &defaults.bracket);
+    readMagnifierValue(configuration.value(kMagnifierKey).toObject(), &defaults.magnifier);
+    readLineValue(configuration.value(kLineKey).toObject(), &defaults.line);
+    readShapeValue(configuration.value(kFreeDrawKey).toObject(), &defaults.freeDraw);
+    defaults.freeDraw.brushMode =
+        configuration.value(kFreeDrawKey).toObject().value(QStringLiteral("brush_mode")) ==
+                QStringLiteral("pressure-sensitive")
+            ? SnowCanvasBrushMode::PressureSensitive
+            : SnowCanvasBrushMode::Regular;
+    readShapeValue(configuration.value(kRectangleHighlightKey).toObject(),
+                   &defaults.rectangleHighlight);
+    readShapeValue(configuration.value(kPenHighlightKey).toObject(), &defaults.penHighlight);
+    readFilterValue(configuration.value(kRectangleFilterKey).toObject(), &defaults.rectangleFilter);
+    readFilterValue(configuration.value(kPenFilterKey).toObject(), &defaults.penFilter);
+    readDouble(configuration.value(kBrushEraserKey).toObject(), QStringLiteral("stroke_width"),
+               &defaults.brushEraser.strokeWidth);
+    readTextValue(configuration.value(kTextKey).toObject(), &defaults.text);
+    readSerialNumberValue(configuration.value(kSerialNumberKey).toObject(), &defaults.serialNumber);
+    readWatermarkValue(configuration.value(kWatermarkKey).toObject(), &defaults.watermark);
+    readSpotlightValue(configuration.value(kSpotlightKey).toObject(), &defaults.spotlight);
+    readEnum(configuration.value(kSpotlightKey).toObject(), QStringLiteral("shape"),
+             static_cast<int>(SnowCanvasRectangleShape::Diamond), &defaults.spotlightShape);
+    readCornerRadii(configuration.value(kSpotlightKey).toObject(), &defaults.spotlightCornerRadii);
+    double sharedStrength = screenshotCanvasStyleDefaults().rectangleFilter.strength;
+    const auto readStrength = [&](const QString& key) {
+        double value = 0.0;
+        if (!readDouble(configuration.value(key).toObject(), QStringLiteral("strength"), &value) ||
+            value < 0.0 || value > 1.0) {
+            return false;
+        }
+        sharedStrength = value;
+        return true;
+    };
+    if (!readStrength(kRectangleFilterKey)) {
+        readStrength(kPenFilterKey);
+    }
+    defaults.rectangleFilter.strength = defaults.penFilter.strength = sharedStrength;
+    const auto normalizeShape = [](SnowCanvasShapeStyle& style, bool rectangle) {
+        style.strokeWidth = bounded(style.strokeWidth, 0.0, 72.0);
+        style.cornerRadii.topLeft = bounded(style.cornerRadii.topLeft, 0.0, 83.0);
+        style.cornerRadii.topRight = bounded(style.cornerRadii.topRight, 0.0, 83.0);
+        style.cornerRadii.bottomRight = bounded(style.cornerRadii.bottomRight, 0.0, 83.0);
+        style.cornerRadii.bottomLeft = bounded(style.cornerRadii.bottomLeft, 0.0, 83.0);
+        style.opacity = bounded(style.opacity, 0.0, 1.0);
+        if (rectangle) {
+            style.startArrowhead = SnowCanvasArrowhead::None;
+            style.endArrowhead = SnowCanvasArrowhead::None;
+            style.arrowType = SnowCanvasArrowType::Straight;
+        }
+    };
+    normalizeShape(defaults.rectangle, true);
+    normalizeShape(defaults.speechBubble, true);
+    normalizeShape(defaults.arrow, false);
+    normalizeShape(defaults.line, false);
+    normalizeShape(defaults.freeDraw, false);
+    normalizeShape(defaults.rectangleHighlight, false);
+    normalizeShape(defaults.penHighlight, false);
+    defaults.rectangleFilter.strength = bounded(defaults.rectangleFilter.strength, 0.0, 1.0);
+    defaults.rectangleFilter.opacity = bounded(defaults.rectangleFilter.opacity, 0.0, 1.0);
+    defaults.rectangleFilter.strokeWidth = bounded(defaults.rectangleFilter.strokeWidth, 1.0, 72.0);
+    defaults.penFilter.strength = bounded(defaults.penFilter.strength, 0.0, 1.0);
+    defaults.penFilter.opacity = bounded(defaults.penFilter.opacity, 0.0, 1.0);
+    defaults.penFilter.strokeWidth = bounded(defaults.penFilter.strokeWidth, 1.0, 72.0);
+    defaults.brushEraser.strokeWidth = bounded(defaults.brushEraser.strokeWidth, 1.0, 72.0);
+    defaults.text.fontSize =
+        bounded(defaults.text.fontSize, snow_canvas_style_limits::minimumFontSize,
+                snow_canvas_style_limits::maximumTextFontSize);
+    defaults.text.strokeWidth = bounded(defaults.text.strokeWidth, 0.0, 72.0);
+    defaults.text.cornerRadii.topLeft = bounded(defaults.text.cornerRadii.topLeft, 0.0, 83.0);
+    defaults.text.cornerRadii.topRight = bounded(defaults.text.cornerRadii.topRight, 0.0, 83.0);
+    defaults.text.cornerRadii.bottomRight =
+        bounded(defaults.text.cornerRadii.bottomRight, 0.0, 83.0);
+    defaults.text.cornerRadii.bottomLeft = bounded(defaults.text.cornerRadii.bottomLeft, 0.0, 83.0);
+    defaults.text.opacity = bounded(defaults.text.opacity, 0.0, 1.0);
+    defaults.serialNumber.fontSize =
+        bounded(defaults.serialNumber.fontSize, snow_canvas_style_limits::minimumFontSize,
+                snow_canvas_style_limits::maximumBadgeFontSize);
+    defaults.serialNumber.strokeWidth = bounded(defaults.serialNumber.strokeWidth, 0.0, 72.0);
+    defaults.serialNumber.opacity = bounded(defaults.serialNumber.opacity, 0.0, 1.0);
+    defaults.watermark.fontSize =
+        bounded(defaults.watermark.fontSize, snow_canvas_style_limits::minimumFontSize,
+                snow_canvas_style_limits::maximumWatermarkFontSize);
+    defaults.watermark.angle = bounded(defaults.watermark.angle, -90.0, 90.0);
+    defaults.watermark.gap = bounded(defaults.watermark.gap, 10.0, 200.0);
+    defaults.watermark.opacity = bounded(defaults.watermark.opacity, 0.0, 1.0);
+    defaults.spotlight.opacity = bounded(defaults.spotlight.opacity, 0.0, 1.0);
+    defaults.spotlightCornerRadii.topLeft =
+        bounded(defaults.spotlightCornerRadii.topLeft, 0.0, 83.0);
+    defaults.spotlightCornerRadii.topRight =
+        bounded(defaults.spotlightCornerRadii.topRight, 0.0, 83.0);
+    defaults.spotlightCornerRadii.bottomRight =
+        bounded(defaults.spotlightCornerRadii.bottomRight, 0.0, 83.0);
+    defaults.spotlightCornerRadii.bottomLeft =
+        bounded(defaults.spotlightCornerRadii.bottomLeft, 0.0, 83.0);
+    return defaults;
+}
+
+namespace {
+bool persistToolStyles(const SnowCanvasStyleDefaults& defaults,
+                       const QMap<QString, QJsonValue>& additionalValues = {}) {
+    auto& storage = storage::ApplicationStorage::instance();
+    if (!storage.isInitialized())
+        return false;
+    SnowCanvasFilterStyle penFilter = defaults.penFilter;
+    penFilter.strength = defaults.rectangleFilter.strength;
+    QMap<QString, QJsonValue> values{
+        {kShapeKey, shapeValue(defaults.rectangle)},
+        {kSpeechBubbleKey, shapeValue(defaults.speechBubble)},
+        {kArrowKey, shapeValue(defaults.arrow)},
+        {kDistanceKey, distanceValue(defaults.distance)},
+        {kAngleKey, angleValue(defaults.angle)},
+        {kBracketKey, bracketValue(defaults.bracket)},
+        {kMagnifierKey, magnifierValue(defaults.magnifier)},
+        {kLineKey, lineValue(defaults.line)},
+        {kFreeDrawKey, freeDrawValue(defaults.freeDraw)},
+        {kRectangleHighlightKey, shapeValue(defaults.rectangleHighlight)},
+        {kPenHighlightKey, shapeValue(defaults.penHighlight)},
+        {kRectangleFilterKey, filterValue(defaults.rectangleFilter)},
+        {kPenFilterKey, filterValue(penFilter)},
+        {kBrushEraserKey,
+         QJsonObject{{QStringLiteral("stroke_width"), defaults.brushEraser.strokeWidth}}},
+        {kTextKey, textValue(defaults.text)},
+        {kSerialNumberKey, serialNumberValue(defaults.serialNumber)},
+        {kWatermarkKey, watermarkValue(defaults.watermark)},
+        {kSpotlightKey, spotlightValue(defaults.spotlight, defaults.spotlightShape,
+                                       defaults.spotlightCornerRadii)},
+    };
+    storage::ConfigurationStore& configuration = storage.configuration();
+    if (QThread::currentThread() != configuration.thread()) {
+        return false;
+    }
+    values.insert(additionalValues);
+    return configuration.setValues(values);
+}
+} // namespace
+
+bool persistScreenshotCanvasToolStyles(const SnowCanvasStyleDefaults& defaults) {
+    return persistToolStyles(defaults);
+}
+
+bool persistScreenshotCanvasStyleEdit(const SnowCanvasStyleEdit& edit) {
+    if (snowCanvasCreationStyleProperties(edit) == 0)
+        return true;
+    if (!storage::ApplicationStorage::instance().isInitialized())
+        return false;
+    // Always merge against storage, never an editor's potentially stale snapshot.
+    auto defaults = screenshotCanvasToolStyleDefaults();
+    snowCanvasMergeStyleEdit(defaults, edit);
+    QMap<QString, QJsonValue> additionalValues;
+    if (const auto* watermark = std::get_if<SnowCanvasWatermarkEdit>(&edit);
+        watermark != nullptr &&
+        (watermark->properties & (SnowCanvasWatermarkText | SnowCanvasWatermarkTemplate)) != 0) {
+        auto content = storage::WatermarkContentSettings().content();
+        if ((watermark->properties & SnowCanvasWatermarkText) != 0)
+            content.text = watermark->style.text;
+        if ((watermark->properties & SnowCanvasWatermarkTemplate) != 0)
+            content.templateValue = watermark->style.templateValue;
+        additionalValues.insert(
+            QStringLiteral("drawing/watermark_content"),
+            QJsonObject{{QStringLiteral("text"), content.text},
+                        {QStringLiteral("template_value"), content.templateValue}});
+    }
+    return persistToolStyles(defaults, additionalValues);
+}
+
+void applyScreenshotCanvasToolStyles(SnowCanvasWidget& canvas,
+                                     const SnowCanvasStyleDefaults& defaults) {
+    const SnowCanvasTool previousTool = canvas.canvasTool();
+    // Style setters also update selected elements when a selection is active.
+    // Refreshing creation defaults must never rewrite document content.
+    if (!canvas.resetEditingState()) {
+        return;
+    }
+    const auto applyShape = [&canvas](const SnowCanvasShapeStyle& style, quint32 properties,
+                                      SnowCanvasShapeKind kind) {
+        static_cast<void>(canvas.setCanvasShapeStylePatch(style, properties, kind));
+    };
+    applyShape(defaults.rectangle, kRectangleShapeProperties, SnowCanvasShapeKind::Rectangle);
+    applyShape(defaults.speechBubble, kRectangleShapeProperties, SnowCanvasShapeKind::SpeechBubble);
+    applyShape(defaults.arrow, kArrowShapeProperties, SnowCanvasShapeKind::Arrow);
+    static_cast<void>(canvas.setCanvasDistanceStyle(defaults.distance));
+    static_cast<void>(canvas.setCanvasAngleStyle(defaults.angle));
+    static_cast<void>(canvas.setCanvasBracketStyle(defaults.bracket));
+    static_cast<void>(canvas.applyStyleEdit(
+        SnowCanvasMagnifierEdit{defaults.magnifier, SnowCanvasMagnifierStyleAllProperties,
+                                SnowCanvasStyleEditTarget::Creation}));
+    applyShape(defaults.line, kLineShapeProperties, SnowCanvasShapeKind::Line);
+    applyShape(defaults.freeDraw, kFreeDrawShapeProperties, SnowCanvasShapeKind::FreeDraw);
+    applyShape(defaults.rectangleHighlight, kRectangleHighlightProperties,
+               SnowCanvasShapeKind::RectangleHighlight);
+    applyShape(defaults.penHighlight, kPenHighlightProperties, SnowCanvasShapeKind::PenHighlight);
+    SnowCanvasShapeStyle spotlightStyle;
+    spotlightStyle.shape = defaults.spotlightShape;
+    spotlightStyle.cornerRadii = defaults.spotlightCornerRadii;
+    applyShape(spotlightStyle,
+               SnowCanvasShapeStylePropertyShape | SnowCanvasShapeStylePropertyCornerRadius,
+               SnowCanvasShapeKind::Spotlight);
+    static_cast<void>(canvas.setCanvasTextStyle(defaults.text));
+    // Saved appearance must preserve every numeric type's session sequence.
+    static_cast<void>(canvas.applyStyleEdit(
+        SnowCanvasSerialNumberEdit{defaults.serialNumber, kSerialNumberAppearanceProperties}));
+    static_cast<void>(canvas.setCanvasFilterCreationStyle(
+        defaults.rectangleFilter, kAllFilterProperties, SnowCanvasTool::RectangleFilter));
+    static_cast<void>(canvas.setCanvasFilterCreationStyle(defaults.penFilter, kAllFilterProperties,
+                                                          SnowCanvasTool::PenFilter));
+    static_cast<void>(canvas.setCanvasBrushEraserCreationStyle(defaults.brushEraser));
+    static_cast<void>(canvas.setCanvasTool(previousTool));
+}
+
+} // namespace snow_shot::presentation

@@ -1,0 +1,110 @@
+#include "snow_shot/presentation/directcapturebudget.h"
+#include "captureframeimage.h"
+
+#include <QColorSpace>
+#include <array>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+
+struct SnowCaptureFrameLeaseImpl {
+    std::array<uint8_t, 16> pixels{};
+};
+
+namespace {
+int releases = 0;
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+} // namespace
+
+extern "C" void snow_capture_frame_lease_release(SnowCaptureFrameLease* lease) {
+    ++releases;
+    delete lease;
+}
+
+int main() {
+    using namespace snow_shot::presentation::capture;
+    using snow_shot::presentation::directCapturePeakRasterBytes;
+    require(directCapturePeakRasterBytes(QSize(3840, 2160), 1.0) == qint64{3840} * 2160 * 8,
+            "unscaled direct capture budgets the prepared target without an output duplicate");
+    require(directCapturePeakRasterBytes(QSize(4000, 1000), 0.5) ==
+                qint64{4000} * 1000 * 8 + qint64{2000} * 500 * 8,
+            "scaled direct capture reserves both native and output rasters");
+    require(directCapturePeakRasterBytes(QSize(3, 5), 0.5) == (qint64{15} + 6) * 8,
+            "scaled target budgets round each output extent upward");
+    require(directCapturePeakRasterBytes(QSize(8000, 8000), 1.0) == 64000000LL * 8 &&
+                directCapturePeakRasterBytes(QSize(4000, 4000), 2.0) == 80000000LL * 8,
+            "native and scaled output admit the 64 MP boundary independently");
+    require(
+        directCapturePeakRasterBytes(QSize(), 1.0) < 0 &&
+            directCapturePeakRasterBytes(QSize(-1, -1), 1.0) < 0 &&
+            directCapturePeakRasterBytes(
+                QSize(std::numeric_limits<int>::max(), std::numeric_limits<int>::max()), 1.0) < 0 &&
+            directCapturePeakRasterBytes(QSize(8001, 8000), 1.0) < 0 &&
+            directCapturePeakRasterBytes(QSize(4001, 4000), 2.0) < 0 &&
+            directCapturePeakRasterBytes(QSize(10, 10), 4.1) < 0 &&
+            directCapturePeakRasterBytes(QSize(10, 10), std::numeric_limits<double>::infinity()) <
+                0 &&
+            directCapturePeakRasterBytes(QSize(10, 10), std::numeric_limits<double>::quiet_NaN()) <
+                0,
+        "targeted capture preserves invalid-geometry, scale and 64 MP limits");
+
+    auto* lease = new SnowCaptureFrameLease;
+    lease->pixels = {123, 123, 123, 255, 123, 123, 123, 255,
+                     123, 123, 123, 255, 123, 123, 123, 255};
+    auto image = imageFromFrameLease(lease, lease->pixels.data(), 16, 2, 2, 8,
+                                     SNOW_CAPTURE_PIXEL_FORMAT_BGRA8, FrameAlphaMode::Opaque);
+    require(!image.isNull() && image.format() == QImage::Format_RGB32 &&
+                image.pixelColor(1, 1).red() == 123,
+            "native image pixels were not wrapped correctly");
+    require(image.colorSpace() == QColorSpace(QColorSpace::SRgb),
+            "native sRGB frame lost its color-space tag");
+    auto retained = image;
+    image = {};
+    require(releases == 0 && retained.pixelColor(0, 0).green() == 123,
+            "image copy lost its native lease");
+    retained = {};
+    require(releases == 1, "final image release did not release the native lease exactly once");
+    for (const auto pixelFormat :
+         {SNOW_CAPTURE_PIXEL_FORMAT_BGRA8, SNOW_CAPTURE_PIXEL_FORMAT_RGBA8}) {
+        auto* transparent = new SnowCaptureFrameLease;
+        transparent->pixels = {10, 20, 30, 0, 40, 50, 60, 64, 70, 80, 90, 128, 100, 110, 120, 255};
+        const auto* pixels = transparent->pixels.data();
+        const QImage wrapped = imageFromFrameLease(transparent, pixels, 16, 2, 2, 8, pixelFormat,
+                                                   FrameAlphaMode::Preserve);
+        require(wrapped.constBits() == pixels && wrapped.hasAlphaChannel(),
+                "preserving native alpha copied pixels or lost the alpha format tag");
+        require(wrapped.colorSpace() == QColorSpace(QColorSpace::SRgb),
+                "transparent native sRGB frame lost its color-space tag");
+        const QImage converted = wrapped.convertToFormat(QImage::Format_RGBA8888);
+        const std::array<int, 4> alpha{0, 64, 128, 255};
+        for (int pixel = 0; pixel < 4; ++pixel) {
+            const QColor expected(
+                pixelFormat == SNOW_CAPTURE_PIXEL_FORMAT_BGRA8 ? pixels[pixel * 4 + 2]
+                                                               : pixels[pixel * 4],
+                pixels[pixel * 4 + 1],
+                pixelFormat == SNOW_CAPTURE_PIXEL_FORMAT_BGRA8 ? pixels[pixel * 4]
+                                                               : pixels[pixel * 4 + 2],
+                alpha[static_cast<std::size_t>(pixel)]);
+            require(wrapped.pixelColor(pixel % 2, pixel / 2) == expected &&
+                        converted.pixelColor(pixel % 2, pixel / 2) == expected,
+                    "native frame conversion changed colors or transparency");
+        }
+    }
+    require(releases == 3, "transparent native images leaked their leases");
+    for (const auto width : {0u, 3u, 0xffffffffu}) {
+        auto* invalid = new SnowCaptureFrameLease;
+        require(imageFromFrameLease(invalid, invalid->pixels.data(), 16, width, 2, 8, 0,
+                                    FrameAlphaMode::Preserve)
+                    .isNull(),
+                "invalid native dimensions were accepted");
+    }
+    require(releases == 6, "invalid image leaked a native lease");
+    SnowCaptureFrameInfo info{};
+    require(!validFrameInfo(info), "empty frame info was accepted");
+    return 0;
+}

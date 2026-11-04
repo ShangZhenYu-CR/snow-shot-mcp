@@ -1,0 +1,186 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTOCRCONTROLLER_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTOCRCONTROLLER_H
+
+#include "snow_shot/presentation/screenshotinteractionstate.h"
+#include "snow_shot/presentation/screenshotselectiongeometry.h"
+#include "snow_shot/presentation/screenshotmessageservice.h"
+#include "snow_shot/presentation/screenshotocrrecognitionservice.h"
+#include "snow_shot/presentation/screenshotqrrecognitionservice.h"
+#include "snow_shot/network/snowshotapiclient.h"
+
+#include "snow_shot/presentation/screenshotrecognitionimage.h"
+#include "snow_shot/presentation/screenshotrecognitionfileexport.h"
+#include <optional>
+#include <QObject>
+#include <QJsonObject>
+#include <QPointer>
+#include <QImage>
+#include <QRect>
+#include <QVector>
+
+#include <functional>
+#include <memory>
+
+class ScreenshotDisplaySession;
+class ScreenshotGeometryMapper;
+class ScreenshotOcrPresentation;
+class ScreenshotRecognitionWindow;
+class ScreenshotRecognitionSessionController;
+class ScreenshotTableEditingSession;
+class ScreenshotOverlayCoordinator;
+class ScreenshotOverlayWindow;
+class ScreenshotSelectionModel;
+class SnowCanvasWidget;
+class QWidget;
+class QUrl;
+class QTextDocument;
+struct ScreenshotCaptureState;
+struct ScreenshotTableCommandState;
+struct ScreenshotRecognitionResults;
+struct ScreenshotClipboardOriginalContent;
+
+namespace snow_shot::presentation {
+class WindowShortcutManager;
+}
+
+struct ScreenshotOcrControllerContext {
+    ScreenshotCaptureState& captureState;
+    ScreenshotInteractionState& interaction;
+    ScreenshotSelectionModel& selection;
+    ScreenshotDisplaySession& displaySession;
+    ScreenshotGeometryMapper& geometry;
+    ScreenshotOverlayCoordinator& overlayCoordinator;
+    ScreenshotOcrRecognitionPort& recognition;
+    ScreenshotQrRecognitionPort* qrRecognition = nullptr;
+    SnowShotApiClient* tableRecognition = nullptr;
+    std::function<void()> hideColorPicker = []() {};
+    std::function<void()> cancelCapture = []() {};
+    std::function<ScreenshotSelectionDragMode(const QPointF&)> selectionResizeDragMode =
+        [](const QPointF&) { return ScreenshotSelectionDragMode::None; };
+    std::function<bool(const QPointF&)> beginSelectionResize = [](const QPointF&) { return false; };
+    std::function<void(const QPointF&)> updateSelectionResize = [](const QPointF&) {};
+    std::function<void(const QPointF&)> finishSelectionResize = [](const QPointF&) {};
+    snow_shot::presentation::WindowShortcutManager* shortcutManager = nullptr;
+};
+
+class ScreenshotOcrController final : public QObject {
+    Q_OBJECT
+
+  public:
+    enum class Mode { Text, Table, Qr, Markdown, Html, Latex };
+
+    explicit ScreenshotOcrController(ScreenshotOcrControllerContext context,
+                                     QObject* parent = nullptr);
+    ~ScreenshotOcrController() override;
+
+    void activate();
+    void activateAndCopy();
+    void activateTextTranslation();
+    void activateTable();
+    void activateQr();
+    void activateLatex();
+    void setRecognitionModel(const QString& selection);
+    void activateImageConversion(SnowShotImageConversionFormat format);
+    void openImageConversionSettings();
+    // Retires the recognition input surface while retaining completed results in the cache.
+    void deactivate();
+    // Keeps the window alive as the mouse event receiver until the resize gesture finishes.
+    void deactivateForSelectionResize();
+    // Invalidates the capture session and cancels all recognition work.
+    void invalidateSession();
+    [[nodiscard]] bool active() const;
+    [[nodiscard]] std::optional<ScreenshotRecognitionImageSnapshot>
+    imageSnapshot(const ScreenshotResultStyle& style) const;
+    [[nodiscard]] Mode mode() const;
+    [[nodiscard]] bool tableModeActive() const;
+    [[nodiscard]] bool qrModeActive() const;
+    [[nodiscard]] bool latexModeActive() const;
+    [[nodiscard]] bool copyRecognitionToClipboard(bool endCapture = true);
+    void mergeTableSelection();
+    void splitTableSelection();
+    void resetTable();
+    [[nodiscard]] bool openSpreadsheetFile();
+    void undoTableEdit();
+    void redoTableEdit();
+    void undoTextEdit();
+    void redoTextEdit();
+
+    void setShowOriginalImage(bool show);
+    void beginTextEditing();
+    void beginTextTranslation();
+    void endTextEditing();
+    void openTranslationSettings();
+    void resetTextEditing();
+    void applyTextFormatting(const QString& value);
+    void applyTextPunctuation(const QString& value);
+    void applyTextTargetLanguage(const QString& language);
+    void requestTextTranslationServices();
+    void applyTextTranslationService(const QString& service);
+    [[nodiscard]] bool editing() const;
+    [[nodiscard]] bool translating() const;
+    [[nodiscard]] bool hasTextResult() const;
+    [[nodiscard]] QString sourceTextDraft() const;
+    [[nodiscard]] std::optional<ScreenshotRecognitionFileSnapshot> fileExportSnapshot();
+    [[nodiscard]] ScreenshotRecognitionResults cachedRecognitionResults() const;
+    [[nodiscard]] ScreenshotRecognitionResults recognitionResultsSnapshot() const;
+    void setTextDraft(const QString& text);
+    [[nodiscard]] QJsonObject workflowState() const;
+    [[nodiscard]] QJsonObject workflowResult() const;
+    [[nodiscard]] bool editWorkflow(const QJsonObject& params);
+    void cancelWorkflow();
+    void seedImportedResults(ScreenshotRecognitionResults results,
+                             const ScreenshotClipboardOriginalContent& originalContent);
+
+  signals:
+    void textEditingChanged(bool editing);
+    void textResultChanged(bool available);
+    void textDraftChanged(const QString& text);
+    void workflowStateChanged();
+
+  private:
+    struct CanvasState {
+        QPointer<ScreenshotOverlayWindow> overlay;
+        QPointer<SnowCanvasWidget> canvas;
+        bool contentVisible = true;
+        bool interactionEnabled = true;
+        bool hadSelection = false;
+        bool selectionHandlesVisible = true;
+        bool selectionBorderVisible = true;
+    };
+    void activateMode(Mode mode, bool textTranslation = false, bool copyAndEndCapture = false);
+    void handleQrLinkActivated(const QUrl& url);
+    void updateOverlays() const;
+    void
+    applyOcrBackgroundToOverlays(const std::shared_ptr<ScreenshotOcrPresentation>& presentation,
+                                 QImage filteredImage = {}, QRectF filteredImageCanvasRect = {});
+    void clearOcrBackgroundFromOverlays();
+    void deactivateImpl(bool preserveRecognitionWindow);
+    void restorePreviousToolAfterFailure();
+    void showStatus(const QString& message, bool error) const;
+    [[nodiscard]] bool ensureRecognitionWindow();
+    void updateRecognitionWindowGeometry();
+    void destroyRecognitionWindow();
+    [[nodiscard]] QString currentCacheKey() const;
+
+    ScreenshotOcrControllerContext m_context;
+    QVector<CanvasState> m_canvasStates;
+    std::shared_ptr<ScreenshotOcrPresentation> m_presentation;
+    ScreenshotActiveTool m_previousTool = ScreenshotActiveTool::Move;
+    std::unique_ptr<ScreenshotMessageService> m_messages;
+    std::unique_ptr<ScreenshotRecognitionSessionController> m_session;
+    QPointer<ScreenshotRecognitionWindow> m_recognitionWindow;
+    QString m_surfaceKey;
+    QString m_importedTargetKey;
+    std::shared_ptr<QTextDocument> m_importedFormattedDocument;
+    QString m_importedPlainText;
+    QImage m_surfaceImage;
+    QImage m_filteredImage;
+    QRectF m_filteredCanvasRect;
+    std::shared_ptr<ScreenshotOcrPresentation> m_backgroundPresentation;
+    Mode m_mode = Mode::Text;
+    bool m_active = false;
+    bool m_copyAndEndCapture = false;
+    quint64 m_activationId = 0;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTOCRCONTROLLER_H

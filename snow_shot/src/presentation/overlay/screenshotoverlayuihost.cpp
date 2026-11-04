@@ -1,0 +1,924 @@
+#include "snow_shot/presentation/screenshotstylebinding.h"
+#include "snow_shot/presentation/screenshotoverlayuihost.h"
+
+#include "../capture/screenshotcaptureperfinstrumentation.h"
+#include "snow_shot/platform/screenshotnative.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+#include "snow_shot/presentation/components/icons/iconrenderutils.h"
+#include "snow_shot/presentation/components/icons/snowshoticons.h"
+#include "snow_shot/presentation/screenshotcolorpickerwindow.h"
+#include "snow_shot/presentation/screenshotselectiontoolbarwidget.h"
+#include "snow_shot/presentation/screenshotoverlaywindow.h"
+#include "snow_shot/presentation/screenshottoolbarcommands.h"
+#include "snow_shot/presentation/screenshottoolbarwindow.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/settingsadapters.h"
+#include "widgets/detail/pointer_region.h"
+
+#include <algorithm>
+#include <optional>
+#include <utility>
+
+#include <QCoreApplication>
+#include <QEnterEvent>
+#include <QEvent>
+#include <QFontMetrics>
+#include <QGuiApplication>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPaintEvent>
+#include <QPen>
+#include <QPixmap>
+#include <QVector>
+#include <QWidget>
+#include <QtMath>
+
+#if defined(Q_OS_WIN) || defined(_WIN32)
+#include <qt_windows.h>
+#endif
+
+namespace {
+constexpr int kShortcutHintsMargin = 16;
+constexpr int kShortcutHintsPadding = 16;
+constexpr int kShortcutHintsRadius = 6;
+constexpr int kShortcutHintsFontSize = 14;
+constexpr int kShortcutHintsLineHeight = 22;
+constexpr int kShortcutHintsRowSpacing = 16;
+constexpr int kShortcutHintsColonMarginLeft = 2;
+constexpr int kShortcutHintsColonMarginRight = 8;
+constexpr int kShortcutHintsChipHorizontalPadding = 16;
+constexpr int kShortcutHintsChipVerticalPadding = 2;
+constexpr int kShortcutHintsChipRadius = 6;
+constexpr int kShortcutHintsChipSpacing = 8;
+constexpr int kShortcutHintsIconSize = 14;
+constexpr int kShortcutHintsIconTextGap = 8;
+constexpr int kShortcutHintsChipTrailingSpace = 8;
+
+namespace custom_outlined_icons = snow_shot::presentation::icons::custom::outlined;
+
+class ScreenshotShortcutHintsWidget final : public QWidget {
+  public:
+    explicit ScreenshotShortcutHintsWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setObjectName(QStringLiteral("screenshotShortcutHints"));
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        setFocusPolicy(Qt::NoFocus);
+        QFont hintFont = font();
+        hintFont.setPixelSize(kShortcutHintsFontSize);
+        hintFont.setWeight(QFont::Normal);
+        setFont(hintFont);
+        // The hint is click-through, so observe application mouse moves to hide it on hover.
+        if (QCoreApplication::instance() != nullptr) {
+            QCoreApplication::instance()->installEventFilter(this);
+        }
+        connect(&snow_shot::shortcuts::ShortcutDisplayService::instance(),
+                &snow_shot::shortcuts::ShortcutDisplayService::displayChanged, this,
+                [this]() { updateTranslatedLines(); });
+        hide();
+    }
+
+    void setPresentation(ScreenshotShortcutHintMode mode, qreal opacity) {
+        const bool contentChanged = m_context.has_value() || m_mode != mode;
+        m_mode = mode;
+        m_context.reset();
+        setOpacity(opacity);
+        if (contentChanged) {
+            updateTranslatedLines();
+        }
+        if (!hasVisiblePresentation()) {
+            hide();
+        }
+    }
+
+    void setPresentation(const ScreenshotShortcutHintContext& context, qreal opacity) {
+        if (!m_context.has_value() || *m_context != context) {
+            m_context = context;
+            updateTranslatedLines();
+        }
+        setOpacity(opacity);
+        if (!hasVisiblePresentation()) {
+            hide();
+        }
+    }
+
+    [[nodiscard]] bool hasVisiblePresentation() const {
+        return !m_rows.isEmpty() && m_opacity > 0.0;
+    }
+
+    void setObscuringSelection(const QRectF& selectionGlobal) {
+        m_selectionGlobal = selectionGlobal;
+    }
+
+    void refreshVisibility(const QPointF& cursorGlobal) {
+        m_cursorGlobal = cursorGlobal;
+        const QRectF hintAreaGlobal(mapToGlobal(QPoint(0, 0)), size());
+        const bool visible = parentWidget() != nullptr && hasVisiblePresentation() &&
+                             !screenshotShortcutHintAreaIsObscured(
+                                 hintAreaGlobal, m_selectionGlobal, m_cursorGlobal);
+        if (isHidden() == visible) {
+            setVisible(visible);
+            if (visible) {
+                raise();
+            }
+        }
+    }
+
+  protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event != nullptr && event->type() == QEvent::MouseMove) {
+            const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            refreshVisibility(mouseEvent->globalPosition());
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+    void changeEvent(QEvent* event) override {
+        QWidget::changeEvent(event);
+        if (event != nullptr && event->type() == QEvent::LanguageChange) {
+            updateTranslatedLines();
+        }
+    }
+
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setOpacity(m_opacity);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 163));
+        painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), kShortcutHintsRadius,
+                                kShortcutHintsRadius);
+
+        const QFontMetrics metrics(font());
+        const QColor contentColor(Qt::white);
+        int rowTop = kShortcutHintsPadding;
+        for (const ScreenshotShortcutHintRow& row : m_rows) {
+            const int labelWidth = metrics.horizontalAdvance(row.label);
+            painter.setPen(QColor(255, 255, 255, 184));
+            painter.drawText(
+                QRect(kShortcutHintsPadding, rowTop, labelWidth, kShortcutHintsLineHeight),
+                Qt::AlignLeft | Qt::AlignVCenter, row.label);
+
+            const int colonLeft =
+                kShortcutHintsPadding + labelWidth + kShortcutHintsColonMarginLeft;
+            const int colonWidth = metrics.horizontalAdvance(QLatin1Char(':'));
+            painter.drawText(QRect(colonLeft, rowTop, colonWidth, kShortcutHintsLineHeight),
+                             Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral(":"));
+            int chipLeft = colonLeft + colonWidth + kShortcutHintsColonMarginRight;
+            const auto icon = row.input == ScreenshotShortcutHintInput::Mouse
+                                  ? custom_outlined_icons::WheelMouse()
+                                  : custom_outlined_icons::Keyboard();
+            const QPixmap iconPixmap = snow_shot::presentation::icons::renderTintedIconPixmap(
+                icon, QSize(kShortcutHintsIconSize, kShortcutHintsIconSize), devicePixelRatioF(),
+                contentColor);
+            const QStringList chipLabels =
+                row.shortcutChips.isEmpty() ? QStringList{row.shortcut} : row.shortcutChips;
+            for (const QString& chipLabel : chipLabels) {
+                const int chipWidth = shortcutChipWidth(chipLabel, metrics);
+                const QRectF chipRect(chipLeft, rowTop - kShortcutHintsChipVerticalPadding,
+                                      chipWidth, shortcutChipHeight());
+                painter.setRenderHint(QPainter::Antialiasing, true);
+                painter.setPen(QPen(contentColor, 1.0));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRoundedRect(chipRect.adjusted(0.5, 0.5, -0.5, -0.5),
+                                        kShortcutHintsChipRadius, kShortcutHintsChipRadius);
+
+                const int iconLeft = chipLeft + kShortcutHintsChipHorizontalPadding;
+                const int iconTop =
+                    rowTop + (kShortcutHintsLineHeight - kShortcutHintsIconSize) / 2;
+                if (!iconPixmap.isNull()) {
+                    painter.drawPixmap(iconLeft, iconTop, iconPixmap);
+                }
+
+                const int textLeft = iconLeft + kShortcutHintsIconSize + kShortcutHintsIconTextGap;
+                const int textWidth = metrics.horizontalAdvance(chipLabel);
+                painter.setRenderHint(QPainter::Antialiasing, false);
+                painter.setPen(contentColor);
+                painter.drawText(QRect(textLeft, rowTop, textWidth, kShortcutHintsLineHeight),
+                                 Qt::AlignLeft | Qt::AlignVCenter, chipLabel);
+                chipLeft += chipWidth + kShortcutHintsChipSpacing;
+            }
+            rowTop += kShortcutHintsLineHeight + kShortcutHintsRowSpacing;
+        }
+    }
+
+  private:
+    void setOpacity(qreal opacity) {
+        const qreal nextOpacity = std::clamp<qreal>(opacity, 0.0, 1.0);
+        if (m_opacity != nextOpacity) {
+            m_opacity = nextOpacity;
+            update();
+        }
+    }
+
+    [[nodiscard]] static int shortcutChipHeight() {
+        return kShortcutHintsLineHeight + kShortcutHintsChipVerticalPadding * 2;
+    }
+
+    [[nodiscard]] static int shortcutChipWidth(const QString& shortcut,
+                                               const QFontMetrics& metrics) {
+        return kShortcutHintsChipHorizontalPadding * 2 + kShortcutHintsIconSize +
+               kShortcutHintsIconTextGap + metrics.horizontalAdvance(shortcut);
+    }
+
+    [[nodiscard]] static int shortcutChipsWidth(const ScreenshotShortcutHintRow& row,
+                                                const QFontMetrics& metrics) {
+        if (row.shortcutChips.isEmpty()) {
+            return shortcutChipWidth(row.shortcut, metrics);
+        }
+        int width = kShortcutHintsChipSpacing * (static_cast<int>(row.shortcutChips.size()) - 1);
+        for (const QString& chipLabel : row.shortcutChips) {
+            width += shortcutChipWidth(chipLabel, metrics);
+        }
+        return width;
+    }
+
+    void updateTranslatedLines() {
+        const QVector<ScreenshotShortcutHintRow> nextRows =
+            m_context.has_value() ? screenshotShortcutHintRows(*m_context)
+                                  : screenshotShortcutHintRows(m_mode);
+        if (m_rows != nextRows) {
+            m_rows = nextRows;
+            setAccessibleName(screenshotShortcutHintLines(m_rows).join(QLatin1Char('\n')));
+            updateSize();
+            update();
+        }
+    }
+
+    void updateSize() {
+        const QFontMetrics metrics(font());
+        int width = 0;
+        for (const ScreenshotShortcutHintRow& row : m_rows) {
+            int rowWidth = metrics.horizontalAdvance(row.label);
+            rowWidth += kShortcutHintsColonMarginLeft +
+                        metrics.horizontalAdvance(QLatin1Char(':')) +
+                        kShortcutHintsColonMarginRight;
+            rowWidth += shortcutChipsWidth(row, metrics) + kShortcutHintsChipTrailingSpace;
+            width = std::max(width, rowWidth);
+        }
+        const int rowCount = static_cast<int>(m_rows.size());
+        const int contentHeight = rowCount > 0 ? kShortcutHintsLineHeight * rowCount +
+                                                     kShortcutHintsRowSpacing * (rowCount - 1)
+                                               : 0;
+        setFixedSize(width + kShortcutHintsPadding * 2, contentHeight + kShortcutHintsPadding * 2);
+    }
+
+    QVector<ScreenshotShortcutHintRow> m_rows;
+    std::optional<ScreenshotShortcutHintContext> m_context;
+    ScreenshotShortcutHintMode m_mode = ScreenshotShortcutHintMode::Hidden;
+    qreal m_opacity = 0.0;
+    QRectF m_selectionGlobal;
+    QPointF m_cursorGlobal;
+};
+
+template <typename Widget> Widget* trackedWidget(QPointer<Widget>& pointer) {
+    return pointer.data();
+}
+
+void showPreparedWidget(QWidget* widget) {
+    if (widget == nullptr) {
+        return;
+    }
+
+    const bool wasVisible = widget->isVisible();
+    const bool concealFirstPaint = !wasVisible && widget->isWindow() &&
+                                   QGuiApplication::platformName() == QStringLiteral("windows");
+    const qreal previousOpacity = widget->windowOpacity();
+    if (concealFirstPaint) {
+        widget->setWindowOpacity(0.0);
+    }
+
+    {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared.show");
+        widget->show();
+    }
+    {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared.repaint");
+        widget->repaint();
+    }
+    {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared.posted_events");
+        QCoreApplication::sendPostedEvents(widget->window(), QEvent::UpdateRequest);
+    }
+
+#if defined(Q_OS_WIN) || defined(_WIN32)
+    if (QGuiApplication::platformName() == QStringLiteral("windows")) {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared.redraw_window");
+        const HWND hwnd = reinterpret_cast<HWND>(widget->winId());
+        if (hwnd != nullptr) {
+            static_cast<void>(RedrawWindow(hwnd, nullptr, nullptr,
+                                           RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN));
+        }
+    }
+#endif
+
+    if (concealFirstPaint) {
+        widget->setWindowOpacity(previousOpacity);
+    }
+}
+
+void showPreparedChildWidget(QWidget* widget) {
+    if (widget == nullptr) {
+        return;
+    }
+
+    const bool wasVisible = widget->isVisible();
+    {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared_child.show");
+        widget->show();
+    }
+    if (wasVisible) {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared_child.repaint");
+        widget->repaint();
+    }
+    {
+        SNOW_SHOT_CAPTURE_PERF_SCOPE("show_prepared_child.posted_events");
+        QCoreApplication::sendPostedEvents(widget, QEvent::UpdateRequest);
+    }
+}
+} // namespace
+
+ScreenshotOverlayUiHost::ScreenshotOverlayUiHost() {
+    m_selectionToolbarHidden = snow_shot::storage::ScreenshotUiSettings().selectionToolbarHidden();
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    connect(&configuration, &snow_shot::storage::ConfigurationStore::valueChanged, this,
+            [this](const QString& key, const QJsonValue& value) {
+                if (key == QStringLiteral("screenshot_ui/selection_toolbar_hidden")) {
+                    setSelectionToolbarHidden(value.toBool());
+                }
+            });
+    if (QCoreApplication::instance() != nullptr) {
+        QCoreApplication::instance()->installEventFilter(this);
+    }
+}
+
+ScreenshotOverlayUiHost::~ScreenshotOverlayUiHost() {
+    if (QCoreApplication::instance() != nullptr) {
+        QCoreApplication::instance()->removeEventFilter(this);
+    }
+    destroyUiResources();
+}
+
+bool ScreenshotOverlayUiHost::eventFilter(QObject* watched, QEvent* event) {
+    // Popovers receive pointer events in separate windows, so the overlay's
+    // mouse-move path and the toolbar's enter handler cannot observe this boundary.
+    const bool pickerVisible = m_colorPicker != nullptr && m_colorPicker->isVisible();
+    const bool guidePointerEvent =
+        event != nullptr && m_toolbarCommands != nullptr &&
+        (event->type() == QEvent::MouseMove || event->type() == QEvent::Enter);
+    const bool trackGuides =
+        guidePointerEvent && ((m_toolbar != nullptr && m_toolbar->isVisible()) ||
+                              (m_selectionToolbar != nullptr && m_selectionToolbar->isVisible()));
+    if (event != nullptr && (pickerVisible || trackGuides)) {
+        if (const auto* receiver = qobject_cast<QWidget*>(watched)) {
+            auto position = adqt::widgets::detail::pointerEventGlobalPosition(receiver, event);
+            if (trackGuides) {
+                const QPointF globalPosition =
+                    event->type() == QEvent::MouseMove
+                        ? static_cast<QMouseEvent*>(event)->globalPosition()
+                        : static_cast<QEnterEvent*>(event)->globalPosition();
+                // Match the canvas renderer's pixel alignment, including fractional DPRs
+                // and negative display origins, instead of rounding into an adjacent pixel.
+                position = QPoint(qFloor(globalPosition.x()), qFloor(globalPosition.y()));
+            }
+            if (position && screenshotUiContainsGlobalPoint(*position)) {
+                if (m_toolbarCommands != nullptr) {
+                    // Cancel deferred canvas samples even before the popup first becomes visible.
+                    m_toolbarCommands->hideColorPickersForScreenshotUi();
+                } else if (pickerVisible) {
+                    hideColorPicker();
+                }
+                // Application filters see moves even on controls without mouse tracking.
+                // Update only guide presentation; the original event still belongs to the UI.
+                if (trackGuides) {
+                    m_toolbarCommands->updateGuideLinesForScreenshotUi(*position);
+                }
+            }
+        }
+    }
+    return QObject::eventFilter(watched, event);
+}
+
+void ScreenshotOverlayUiHost::setToolbarCommandSinks(
+    ScreenshotToolbarCommandSink& toolbarCommands,
+    ScreenshotSelectionToolbarCommandSink& selectionToolbarCommands) {
+    m_toolbarCommands = &toolbarCommands;
+    m_selectionToolbarCommands = &selectionToolbarCommands;
+
+    if (m_selectionToolbar == nullptr) {
+        auto* selectionToolbar = new ScreenshotSelectionToolbarWidget(selectionToolbarCommands);
+        m_ownedWidgets.add(selectionToolbar);
+        m_selectionToolbar = selectionToolbar;
+        selectionToolbar->hide();
+        selectionToolbar->prewarm();
+    }
+
+    if (m_shortcutHints == nullptr) {
+        auto* hints = new ScreenshotShortcutHintsWidget();
+        m_ownedWidgets.add(hints);
+        m_shortcutHints = hints;
+    }
+}
+
+ScreenshotToolbarWindow* ScreenshotOverlayUiHost::ensureToolbar() {
+    if (m_toolbar == nullptr) {
+        if (m_toolbarCommands == nullptr) {
+            return nullptr;
+        }
+        auto* toolbar = new ScreenshotToolbarWindow(*m_toolbarCommands);
+        m_ownedWidgets.add(toolbar);
+        m_toolbar = toolbar;
+    }
+    m_toolbar->restoreNativeSurface();
+    return trackedWidget(m_toolbar);
+}
+
+ScreenshotToolbarWindow* ScreenshotOverlayUiHost::toolbar() const {
+    return m_toolbar.data();
+}
+
+void ScreenshotOverlayUiHost::attachToolbarToOverlay(ScreenshotOverlayWindow* overlay) {
+    ScreenshotToolbarWindow* toolbarWindow = ensureToolbar();
+    if (toolbarWindow == nullptr) {
+        return;
+    }
+
+    delete m_toolbarStyleBinding.data();
+    m_toolbarStyleBinding = nullptr;
+    if (m_toolbarStyleConnection) {
+        if (m_toolbarStyleCanvas != nullptr) {
+            m_toolbarStyleCanvas->endTextStylePopupInteraction(toolbarWindow);
+        }
+        QObject::disconnect(m_toolbarStyleConnection);
+        m_toolbarStyleConnection = {};
+    }
+    if (m_toolbarHistoryConnection) {
+        QObject::disconnect(m_toolbarHistoryConnection);
+        m_toolbarHistoryConnection = {};
+    }
+    if (m_toolbarStylePopupBeginConnection) {
+        QObject::disconnect(m_toolbarStylePopupBeginConnection);
+        m_toolbarStylePopupBeginConnection = {};
+    }
+    if (m_toolbarStylePopupEndConnection) {
+        QObject::disconnect(m_toolbarStylePopupEndConnection);
+        m_toolbarStylePopupEndConnection = {};
+    }
+    m_toolbarStyleCanvas = nullptr;
+    toolbarWindow->setOwnerWindow(overlay);
+#ifdef Q_OS_MACOS
+    snow_shot::platform::configureScreenshotToolbarWindow(toolbarWindow);
+#endif
+
+    if (overlay == nullptr || overlay->canvas() == nullptr) {
+        return;
+    }
+
+    SnowCanvasWidget* canvas = overlay->canvas();
+    m_toolbarStyleCanvas = canvas;
+    toolbarWindow->setStyleToolbarState(canvas->canvasStyleToolbarState());
+    toolbarWindow->setHistoryState(canvas->canvasHistoryState());
+    toolbarWindow->setWatermarkConfig(canvas->canvasWatermarkConfig());
+    toolbarWindow->setSpotlightConfig(canvas->canvasSpotlightConfig());
+    m_toolbarStyleConnection =
+        QObject::connect(canvas, &SnowCanvasWidget::styleToolbarStateChanged, toolbarWindow,
+                         [toolbarWindow, canvas]() {
+                             toolbarWindow->setStyleToolbarState(canvas->canvasStyleToolbarState());
+                             toolbarWindow->setWatermarkConfig(canvas->canvasWatermarkConfig());
+                             toolbarWindow->setSpotlightConfig(canvas->canvasSpotlightConfig());
+                         });
+    m_toolbarHistoryConnection = QObject::connect(
+        canvas, &SnowCanvasWidget::historyStateChanged, toolbarWindow, [toolbarWindow, canvas]() {
+            toolbarWindow->setHistoryState(canvas->canvasHistoryState());
+        });
+    if (ScreenshotToolPalette* palette = toolbarWindow->palette()) {
+        m_toolbarStyleBinding = new snow_shot::presentation::ScreenshotStyleBinding(
+            *palette, *canvas, toolbarWindow, [this, canvas](const SnowCanvasStyleEdit& edit) {
+                if (m_toolbarCommands != nullptr)
+                    m_toolbarCommands->replicateStyleEdit(edit, canvas);
+            });
+        m_toolbarStylePopupBeginConnection = QObject::connect(
+            palette, &ScreenshotToolPalette::textStylePopupInteractionBegan, toolbarWindow,
+            [canvas]() { canvas->beginTextStylePopupInteraction(); });
+        m_toolbarStylePopupEndConnection = QObject::connect(
+            palette, &ScreenshotToolPalette::textStylePopupInteractionEnded, toolbarWindow,
+            [canvas, toolbarWindow]() { canvas->endTextStylePopupInteraction(toolbarWindow); });
+    }
+}
+
+void ScreenshotOverlayUiHost::undoCanvasEdit() {
+    if (m_toolbarStyleCanvas != nullptr) {
+        static_cast<void>(m_toolbarStyleCanvas->undo());
+    }
+}
+
+void ScreenshotOverlayUiHost::redoCanvasEdit() {
+    if (m_toolbarStyleCanvas != nullptr) {
+        static_cast<void>(m_toolbarStyleCanvas->redo());
+    }
+}
+
+ScreenshotSelectionToolbarWidget* ScreenshotOverlayUiHost::selectionToolbar() const {
+    return m_selectionToolbar.data();
+}
+
+void ScreenshotOverlayUiHost::attachSelectionToolbarToOverlay(ScreenshotOverlayWindow* overlay) {
+    ScreenshotSelectionToolbarWidget* toolbarWidget = trackedWidget(m_selectionToolbar);
+    if (toolbarWidget == nullptr) {
+        return;
+    }
+    if (toolbarWidget->parentWidget() == overlay) {
+        return;
+    }
+
+    const bool wasVisible = toolbarWidget->isVisible();
+    toolbarWidget->hide();
+    toolbarWidget->setParent(overlay, Qt::Widget);
+    toolbarWidget->setAttribute(Qt::WA_TranslucentBackground, true);
+    toolbarWidget->setAttribute(Qt::WA_NoSystemBackground, true);
+    toolbarWidget->setFocusPolicy(Qt::NoFocus);
+    if (wasVisible && !m_selectionToolbarHidden && overlay != nullptr && overlay->isVisible()) {
+        showPreparedChildWidget(toolbarWidget);
+        toolbarWidget->raise();
+    }
+}
+
+void ScreenshotOverlayUiHost::createColorPicker() {
+    if (m_colorPicker == nullptr) {
+        auto* colorPicker = new ScreenshotColorPickerWindow();
+        m_ownedWidgets.add(colorPicker);
+        m_colorPicker = colorPicker;
+        colorPicker->setCenterGuideLineColor(m_colorPickerCenterGuideLineColor);
+        colorPicker->hide();
+    }
+}
+
+void ScreenshotOverlayUiHost::prepareColorPickerSurface(ScreenshotOverlayWindow* overlay) {
+    // Capture-result preparation must not move a picker that already follows
+    // the cursor on another display back to the first overlay.
+    if (m_colorPicker != nullptr && overlay != nullptr &&
+        (m_colorPicker->parentWidget() == nullptr || m_colorPicker->windowHandle() == nullptr)) {
+        m_colorPicker->setOwnerWindow(overlay);
+    }
+    if (m_colorPicker != nullptr && m_colorPicker->parentWidget() != nullptr) {
+        m_colorPicker->prepareNativeSurface();
+    }
+}
+
+void ScreenshotOverlayUiHost::releaseColorPicker() {
+    // QObjectCleanupHandler and QPointer both stop tracking a deleted object.
+    delete m_colorPicker.data();
+}
+
+ScreenshotColorPickerWindow* ScreenshotOverlayUiHost::colorPicker() const {
+    return m_colorPicker.data();
+}
+
+void ScreenshotOverlayUiHost::sampleColorPicker(const QImage& image, const QRect& physicalRect,
+                                                const QPoint& physicalPoint,
+                                                const QImage& cursorPatch,
+                                                const QRect& cursorPixelRect) {
+    if (ScreenshotColorPickerWindow* picker = colorPicker()) {
+        picker->hidePicker();
+        picker->setCaptureImage(image, physicalRect, cursorPatch, cursorPixelRect);
+        static_cast<void>(picker->updateColorSample(physicalPoint));
+    }
+}
+
+void ScreenshotOverlayUiHost::updateColorPicker(
+    ScreenshotOverlayWindow* overlay, const QImage& image, const QRect& physicalRect,
+    const QPoint& physicalPoint, const QPointF& localPosition,
+    const ScreenshotCoordinateDisplayValues& displayValues, const QImage& cursorPatch,
+    const QRect& cursorPixelRect) {
+    if (overlay == nullptr) {
+        hideColorPicker();
+        return;
+    }
+
+    ScreenshotColorPickerWindow* picker = colorPicker();
+    if (picker == nullptr) {
+        return;
+    }
+    if (picker->parentWidget() != overlay || !picker->isWindow()) {
+        picker->setOwnerWindow(overlay);
+    }
+
+    picker->setCaptureImage(image, physicalRect, cursorPatch, cursorPixelRect);
+    picker->updatePicker(physicalPoint, localPosition, true, displayValues);
+}
+
+void ScreenshotOverlayUiHost::hideColorPicker() {
+    if (m_colorPicker != nullptr) {
+        m_colorPicker->hidePicker();
+    }
+}
+
+void ScreenshotOverlayUiHost::setColorPickerCenterGuideLineColor(const QColor& color) {
+    m_colorPickerCenterGuideLineColor = color.isValid() ? color : QColor(0, 0, 0, 0);
+    if (m_colorPicker != nullptr) {
+        m_colorPicker->setCenterGuideLineColor(m_colorPickerCenterGuideLineColor);
+    }
+}
+
+void ScreenshotOverlayUiHost::resetColorPickerForNewCapture() {
+    if (m_colorPicker != nullptr) {
+        m_colorPicker->resetForNewCapture();
+    }
+}
+
+void ScreenshotOverlayUiHost::hideColorPickerForOverlay(ScreenshotOverlayWindow* overlay) const {
+    if (colorPickerBelongsToOverlay(overlay)) {
+        m_colorPicker->hidePicker();
+    }
+}
+
+bool ScreenshotOverlayUiHost::colorPickerBelongsToOverlay(
+    const ScreenshotOverlayWindow* overlay) const {
+    if (m_colorPicker == nullptr || overlay == nullptr) {
+        return false;
+    }
+
+    return m_colorPicker->parentWidget() == overlay;
+}
+
+bool ScreenshotOverlayUiHost::screenshotUiContainsGlobalPoint(const QPoint& globalPosition) const {
+    if (m_toolbar != nullptr && m_toolbar->isVisible() &&
+        m_toolbar->containsInteractiveGlobalPoint(globalPosition)) {
+        return true;
+    }
+
+    if (m_selectionToolbar != nullptr && m_selectionToolbar->isVisible() &&
+        !m_selectionToolbar->testAttribute(Qt::WA_TransparentForMouseEvents) &&
+        m_selectionToolbar->containsInteractiveGlobalPoint(globalPosition)) {
+        return true;
+    }
+
+    return false;
+}
+
+void ScreenshotOverlayUiHost::updateShortcutHints(ScreenshotOverlayWindow* overlay,
+                                                  const ScreenshotShortcutHintContext& context,
+                                                  qreal opacity, const QRectF& selectionGlobal,
+                                                  const QPoint& cursorPosition) {
+    auto* hints = static_cast<ScreenshotShortcutHintsWidget*>(m_shortcutHints.data());
+    if (overlay == nullptr || hints == nullptr || opacity <= 0.0) {
+        hideShortcutHints();
+        return;
+    }
+
+    if (hints->parentWidget() != overlay) {
+        hints->hide();
+        hints->setParent(overlay, Qt::Widget);
+        hints->setAttribute(Qt::WA_TranslucentBackground, true);
+        hints->setAttribute(Qt::WA_NoSystemBackground, true);
+        hints->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        hints->setFocusPolicy(Qt::NoFocus);
+        hints->setWindowFlags(Qt::Widget);
+    }
+    hints->setPresentation(context, opacity);
+    if (!hints->hasVisiblePresentation()) {
+        hints->hide();
+        return;
+    }
+
+    const int y =
+        std::max(kShortcutHintsMargin, overlay->height() - hints->height() - kShortcutHintsMargin);
+    hints->move(kShortcutHintsMargin, y);
+    hints->setObscuringSelection(selectionGlobal);
+    hints->refreshVisibility(cursorPosition);
+}
+
+void ScreenshotOverlayUiHost::updateShortcutHintPointer(ScreenshotOverlayWindow* overlay,
+                                                        const QPoint& cursorPosition) {
+    auto* hints = static_cast<ScreenshotShortcutHintsWidget*>(m_shortcutHints.data());
+    if (overlay != nullptr && hints != nullptr && hints->parentWidget() == overlay) {
+        hints->refreshVisibility(cursorPosition);
+    }
+}
+
+void ScreenshotOverlayUiHost::hideShortcutHints() {
+    auto* hints = static_cast<ScreenshotShortcutHintsWidget*>(m_shortcutHints.data());
+    if (hints != nullptr) {
+        hints->setPresentation(ScreenshotShortcutHintMode::Hidden, 0.0);
+    }
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarStrokeWidth(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarSelectionOpacity(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarSpotlightOpacity(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarFilterIntensity(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarPenFilterStrokeWidth(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+bool ScreenshotOverlayUiHost::stepToolbarWatermarkFontSize(int direction) {
+    auto* palette = m_toolbar != nullptr ? m_toolbar->palette() : nullptr;
+    return palette != nullptr && m_toolbarStyleCanvas != nullptr &&
+           snow_shot::presentation::stepScreenshotStyle(*palette, *m_toolbarStyleCanvas, direction);
+}
+
+void ScreenshotOverlayUiHost::resetToolbarForNewCapture() {
+    setSelectionToolbarHidden(snow_shot::storage::ScreenshotUiSettings().selectionToolbarHidden());
+    if (m_toolbar != nullptr) {
+        const bool wasVisible = m_toolbar->isVisible();
+        m_toolbar->resetForNewCapture();
+        if (wasVisible) {
+            // Refresh the translucent native surface before it is hidden. Otherwise
+            // Windows can briefly reuse the previous frame when the toolbar is shown
+            // for the next capture.
+            m_toolbar->repaint();
+        }
+    }
+    if (m_selectionToolbar != nullptr) {
+        const bool wasVisible = m_selectionToolbar->isVisible();
+        m_selectionToolbar->resetForNewCapture();
+        if (wasVisible) {
+            // The selection toolbar is normally a child of a layered overlay.
+            // Paint its reset state while that surface is still composited so
+            // a later show cannot reuse the previous selection frame.
+            m_selectionToolbar->repaint();
+        }
+    }
+}
+
+void ScreenshotOverlayUiHost::hideToolbar() {
+    if (m_toolbar != nullptr) {
+        m_toolbar->hide();
+    }
+    hideSelectionToolbar();
+}
+
+void ScreenshotOverlayUiHost::releaseToolbarNativeSurface() {
+    if (m_toolbar != nullptr) {
+        m_toolbar->releaseNativeSurface();
+    }
+}
+
+void ScreenshotOverlayUiHost::showToolbar() {
+    ScreenshotToolbarWindow* toolbarWindow = ensureToolbar();
+    if (toolbarWindow == nullptr) {
+        return;
+    }
+    toolbarWindow->prepareForDisplay();
+    // Restore before the synchronous first paint in showPreparedWidget(),
+    // otherwise one frame reaches the screen with the move tool still checked.
+    toolbarWindow->restoreRememberedDrawingTool();
+    showPreparedWidget(toolbarWindow);
+    toolbarWindow->raise();
+    raiseColorPickerAboveToolbar();
+}
+
+void ScreenshotOverlayUiHost::hideSelectionToolbar() {
+    if (m_selectionToolbar != nullptr && !m_selectionToolbar->isHidden()) {
+        m_selectionToolbar->hide();
+        // Keep the pooled widget in its canonical idle state so every subsequent
+        // attach/show cycle starts from the known Full display mode and input region.
+        m_selectionToolbar->resetForNewCapture();
+    }
+}
+
+void ScreenshotOverlayUiHost::setSelectionToolbarHidden(bool hidden) {
+    m_selectionToolbarHidden = hidden;
+    if (hidden) {
+        hideSelectionToolbar();
+    }
+}
+
+void ScreenshotOverlayUiHost::showSelectionToolbar() {
+    if (m_selectionToolbarHidden) {
+        return;
+    }
+    ScreenshotSelectionToolbarWidget* toolbarWidget = trackedWidget(m_selectionToolbar);
+    if (toolbarWidget == nullptr || toolbarWidget->parentWidget() == nullptr) {
+        return;
+    }
+    toolbarWidget->prepareForDisplay();
+    showPreparedChildWidget(toolbarWidget);
+    toolbarWidget->raise();
+    raiseColorPickerAboveToolbar();
+}
+
+void ScreenshotOverlayUiHost::raiseSelectionToolbar() {
+    if (m_selectionToolbar != nullptr) {
+        m_selectionToolbar->raise();
+    }
+    raiseColorPickerAboveToolbar();
+}
+
+void ScreenshotOverlayUiHost::raiseColorPickerAboveToolbar() {
+    if (m_colorPicker != nullptr && m_colorPicker->isVisible()) {
+        m_colorPicker->raise();
+    }
+}
+
+void ScreenshotOverlayUiHost::detachOverlayTransientUi(ScreenshotOverlayWindow* overlay) {
+    if (overlay == nullptr) {
+        return;
+    }
+
+    if (m_selectionToolbar != nullptr && m_selectionToolbar->parentWidget() == overlay) {
+        m_selectionToolbar->hide();
+        m_selectionToolbar->setParent(nullptr);
+    }
+
+    if (m_toolbarStyleCanvas == overlay->canvas() && m_toolbarStyleConnection) {
+        delete m_toolbarStyleBinding.data();
+        m_toolbarStyleBinding = nullptr;
+        m_toolbarStyleCanvas->endTextStylePopupInteraction(m_toolbar.data());
+        QObject::disconnect(m_toolbarStyleConnection);
+        m_toolbarStyleConnection = {};
+        if (m_toolbarHistoryConnection) {
+            QObject::disconnect(m_toolbarHistoryConnection);
+            m_toolbarHistoryConnection = {};
+        }
+        if (m_toolbarStylePopupBeginConnection) {
+            QObject::disconnect(m_toolbarStylePopupBeginConnection);
+            m_toolbarStylePopupBeginConnection = {};
+        }
+        if (m_toolbarStylePopupEndConnection) {
+            QObject::disconnect(m_toolbarStylePopupEndConnection);
+            m_toolbarStylePopupEndConnection = {};
+        }
+        m_toolbarStyleCanvas = nullptr;
+    }
+    if (m_toolbar != nullptr && m_toolbar->parentWidget() == overlay) {
+        m_toolbar->hide();
+        m_toolbar->setOwnerWindow(nullptr);
+    }
+    if (colorPickerBelongsToOverlay(overlay)) {
+        m_colorPicker->setOwnerWindow(nullptr);
+    }
+    if (m_shortcutHints != nullptr && m_shortcutHints->parentWidget() == overlay) {
+        hideShortcutHints();
+        m_shortcutHints->setParent(nullptr);
+    }
+}
+
+void ScreenshotOverlayUiHost::destroyUiResources() {
+    delete m_toolbarStyleBinding.data();
+    m_toolbarStyleBinding = nullptr;
+    if (m_toolbarStyleConnection) {
+        if (m_toolbarStyleCanvas != nullptr) {
+            m_toolbarStyleCanvas->endTextStylePopupInteraction(m_toolbar.data());
+        }
+        QObject::disconnect(m_toolbarStyleConnection);
+        m_toolbarStyleConnection = {};
+    }
+    if (m_toolbarHistoryConnection) {
+        QObject::disconnect(m_toolbarHistoryConnection);
+        m_toolbarHistoryConnection = {};
+    }
+    if (m_toolbarStylePopupBeginConnection) {
+        QObject::disconnect(m_toolbarStylePopupBeginConnection);
+        m_toolbarStylePopupBeginConnection = {};
+    }
+    if (m_toolbarStylePopupEndConnection) {
+        QObject::disconnect(m_toolbarStylePopupEndConnection);
+        m_toolbarStylePopupEndConnection = {};
+    }
+    m_toolbarStyleCanvas = nullptr;
+
+    if (m_toolbar != nullptr) {
+        m_toolbar->hide();
+    }
+
+    if (m_selectionToolbar != nullptr) {
+        m_selectionToolbar->hide();
+    }
+
+    if (m_colorPicker != nullptr) {
+        m_colorPicker->hidePicker();
+    }
+    if (m_shortcutHints != nullptr) {
+        m_shortcutHints->hide();
+    }
+
+    m_ownedWidgets.clear();
+    m_toolbar = nullptr;
+    m_selectionToolbar = nullptr;
+    m_colorPicker = nullptr;
+    m_shortcutHints = nullptr;
+}

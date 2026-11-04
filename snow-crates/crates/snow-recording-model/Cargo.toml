@@ -1,0 +1,16 @@
+[package]
+name = "snow-recording-model"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+snow-memory = { path = "../snow-memory", features = ["serde"] }
+snow-media = { path = "../snow-media" }
+bincode.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+uuid.workspace = true

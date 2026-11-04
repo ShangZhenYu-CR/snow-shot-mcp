@@ -1,0 +1,28 @@
+[package]
+name = "snow-ocr-process"
+version = "1.2.1"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "snow-ocr-process"
+path = "src/main.rs"
+
+[features]
+crash-diagnostics = ["dep:snow-diagnostics"]
+default = []
+gpu = ["simd-paddle-ocr-rs/gpu"]
+
+[dependencies]
+snow-memory = { path = "../snow-memory" }
+snow-diagnostics = { path = "../snow-diagnostics", optional = true }
+memmap2 = "0.9"
+num_cpus = "1.17"
+serde_json = "1"
+# The host supplies raw BGR pixels and verified local model/dictionary paths.
+# Keep image decoders, HTTP model downloads, YAML config and CLI dependencies
+# out of this packaged worker.
+simd-paddle-ocr-rs = { path = "../simd-paddle-ocr-rs" }
+
+[build-dependencies]
+winres = "0.1"

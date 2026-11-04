@@ -1,0 +1,2325 @@
+use super::*;
+use snow_draw_engine_core::arrow::{ArrowEndpointEdge, ArrowType, StrokeStyle};
+use snow_draw_engine_document::{
+    ArrowSuggestedBinding, ElementMeta, FilterData, TextLayoutSize, arrow_is_degenerate,
+    resolve_serial_number_data_diameter, text_with_measured_ink, text_with_measured_layout,
+    text_with_pinned_alignment_layout, validate_text_layout_size,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+struct BoundArrowPreview {
+    arrow: ArrowData,
+    suggested_binding: Option<ArrowSuggestedBinding>,
+}
+
+impl Editor {
+    fn pen_highlight_preview(
+        &self,
+        start: Point<f64>,
+        end: Point<f64>,
+        modifiers: Modifiers,
+    ) -> Option<ArrowData> {
+        let end = if modifiers.shift {
+            lock_linear_point_to_discrete_angle(start, end)
+        } else {
+            end
+        };
+        let style = self.state.default_pen_highlight_style;
+        ArrowData::from_global_points(
+            &[start, end],
+            style.stroke,
+            style.stroke_width,
+            StrokeStyle::Solid,
+            ArrowType::Straight,
+            None,
+            None,
+        )
+        .map(ArrowData::into_pen_highlight)
+    }
+
+    pub(crate) fn process_pen_highlight_creation_pointer_event(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingPenHighlight(state) = self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+        match event.event_type {
+            PointerEventType::Move | PointerEventType::Enter => {
+                let end = view_to_canvas(event.position, &self.camera(), self.surface_size());
+                let preview =
+                    self.pen_highlight_preview(state.start_canvas_position, end, event.modifiers);
+                self.set_creation_preview(preview.map(ElementCreationPreview::Arrow), Vec::new());
+                Ok(InteractionOutput {
+                    consumed: true,
+                    capture: PointerCaptureCommand::NoChange,
+                    cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                })
+            }
+            PointerEventType::Up => {
+                let end = view_to_canvas(event.position, &self.camera(), self.surface_size());
+                let preview =
+                    self.pen_highlight_preview(state.start_canvas_position, end, event.modifiers);
+                self.cancel_interaction();
+                if let Some(pen) = preview.filter(|pen| !arrow_is_degenerate(pen)) {
+                    let mut transaction = Transaction::new("create pen highlight");
+                    transaction.insert_arrow(
+                        document.peek_next_element_id(),
+                        ElementMeta::default(),
+                        pen,
+                    );
+                    self.queue_command(EditorCommand::ApplyTransaction(
+                        ApplyTransactionCommand::new(transaction)
+                            .selecting_created(document.peek_next_element_id()),
+                    ));
+                }
+                Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                })
+            }
+            PointerEventType::Cancel => {
+                self.cancel_interaction();
+                Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                })
+            }
+            PointerEventType::Down | PointerEventType::DoubleClick | PointerEventType::Leave => {
+                Ok(InteractionOutput::default())
+            }
+        }
+    }
+
+    fn minimum_committed_linear_length(&self) -> f64 {
+        if self.state.active_tool == ActiveTool::Line {
+            MIN_COMMITTED_LINE_LENGTH
+        } else {
+            MIN_COMMITTED_ARROW_LENGTH
+        }
+    }
+
+    fn minimum_drag_created_linear_length(&self) -> f64 {
+        MINIMUM_ARROW_SIZE_PX / self.camera().zoom.max(0.0001)
+    }
+
+    fn line_confirm_threshold(&self) -> f64 {
+        LINE_CONFIRM_THRESHOLD_PX / self.camera().zoom.max(0.0001)
+    }
+
+    pub(crate) fn begin_arrow_creation(
+        &mut self,
+        document: &DocumentModel,
+        pointer_id: u32,
+        start_canvas_position: Point<f64>,
+        start_view_position: Point<f64>,
+    ) {
+        self.state.distance_creation_generation = self
+            .state
+            .distance_creation_generation
+            .wrapping_add(1)
+            .max(1);
+        let id = document.peek_next_element_id();
+        self.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            stroke_rendering_seed: snow_draw_engine_core::arrow::stroke_rendering_seed(
+                id.index,
+                id.generation,
+            ),
+            pointer_id,
+            committed_points: vec![start_canvas_position],
+            press_view_position: start_view_position,
+            phase: ArrowCreationPhase::InitialPress,
+            distance_pixel_scale: self.view.get().distance_pixel_scale,
+            ..Default::default()
+        });
+        self.clear_transient_visuals();
+    }
+
+    pub(crate) fn arm_arrow_endpoint_creation(
+        &mut self,
+        mut state: CreateArrowState,
+        pointer_id: u32,
+        press_view_position: Point<f64>,
+    ) {
+        state.pointer_id = pointer_id;
+        state.press_view_position = press_view_position;
+        state.phase = ArrowCreationPhase::EndpointPress;
+        self.state.interaction = InteractionState::CreatingArrow(state);
+    }
+
+    fn keep_arrow_creation_active(
+        &mut self,
+        mut state: CreateArrowState,
+        preview: Option<BoundArrowPreview>,
+        snap_guides: Vec<SnapGuide>,
+    ) {
+        state.phase = ArrowCreationPhase::AwaitingEndpoint;
+        state.suggested_binding = preview
+            .as_ref()
+            .and_then(|preview| preview.suggested_binding.clone());
+        self.set_creation_preview(
+            preview.map(|preview| ElementCreationPreview::Arrow(preview.arrow)),
+            snap_guides,
+        );
+        self.state.interaction = InteractionState::CreatingArrow(state);
+        self.bump_overlay_state_revision();
+    }
+
+    fn set_arrow_creation_preview(
+        &mut self,
+        preview: Option<BoundArrowPreview>,
+        snap_guides: Vec<SnapGuide>,
+    ) {
+        let suggested_binding = preview
+            .as_ref()
+            .and_then(|preview| preview.suggested_binding.clone());
+        let suggestion_changed = match &self.state.interaction {
+            InteractionState::CreatingArrow(state) => state.suggested_binding != suggested_binding,
+            _ => false,
+        };
+        if let InteractionState::CreatingArrow(state) = &mut self.state.interaction {
+            state.suggested_binding = suggested_binding;
+        }
+        self.set_creation_preview(
+            preview.map(|preview| ElementCreationPreview::Arrow(preview.arrow)),
+            snap_guides,
+        );
+        if suggestion_changed {
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    pub(crate) fn queue_arrow_creation(
+        &mut self,
+        document: &DocumentModel,
+        mut arrow: ArrowData,
+    ) -> Result<(), ErrorCode> {
+        validate_arrow(&arrow)?;
+        let label = if arrow.is_generated_annotation() {
+            let text = snow_draw_engine_document::generated_annotation_label(&arrow, None)
+                .ok_or(ErrorCode::InvalidArgument)?;
+            Some(self.measured_distance_label(document.peek_next_element_id(), &arrow, &text))
+        } else {
+            None
+        };
+        let mut transaction = Transaction::new(if arrow.is_bracket() {
+            "create bracket"
+        } else if arrow.is_angle() {
+            "create angle"
+        } else if arrow.is_distance() {
+            "create distance"
+        } else if arrow.is_line() {
+            "create line"
+        } else {
+            "create arrow"
+        });
+        let text_id = if label.is_some() {
+            let mut text_id = document.peek_next_element_id();
+            text_id.index = text_id
+                .index
+                .checked_add(1)
+                .ok_or(ErrorCode::InvalidState)?;
+            arrow.text_element_id = Some(text_id);
+            Some(text_id)
+        } else {
+            None
+        };
+        transaction.insert_arrow(
+            document.peek_next_element_id(),
+            ElementMeta::default(),
+            arrow,
+        );
+        if let Some((text_id, label)) = text_id.zip(label) {
+            transaction.insert_text(text_id, ElementMeta::default(), label);
+        }
+        self.queue_command(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::new(transaction)
+                .selecting_created(document.peek_next_element_id()),
+        ));
+        Ok(())
+    }
+
+    pub fn queue_create_text_element(
+        &mut self,
+        document: &DocumentModel,
+        center: Point<f64>,
+        text_content: impl Into<String>,
+        layout: TextLayoutSize,
+    ) -> Result<Option<EditorCommand>, ErrorCode> {
+        let text_content = text_content.into();
+        if text_content.trim().is_empty() {
+            return Ok(None);
+        }
+        let layout = validate_text_layout_size(layout)?;
+        let mut text = TextData {
+            center,
+            text: text_content,
+            ..self.state.default_text.clone()
+        };
+        // Fixed-width creation keeps the configured wrap rectangle; the
+        // measured ink joins the element either way.
+        text = if text.auto_resize {
+            text_with_measured_layout(&text, layout)?
+        } else {
+            text_with_measured_ink(&text, layout)?
+        };
+        validate_text(&text)?;
+        let id = document.peek_next_element_id();
+        let mut transaction = Transaction::new("create text");
+        transaction.insert_text(id, ElementMeta::default(), text);
+        Ok(Some(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::with_history_undo_snapshot(
+                transaction,
+                self.capture_document_sync_snapshot(document),
+            )
+            .selecting_created(id),
+        )))
+    }
+
+    pub(crate) fn serial_number_creation_preview(
+        &self,
+        center: Point<f64>,
+    ) -> Result<SerialNumberData, ErrorCode> {
+        // Creation uses the same session counter as the toolbar. Document
+        // insertions advance automatic counters at the mutation boundary;
+        // edits to existing badges cannot become implicit sequence starts.
+        let mut serial = SerialNumberData {
+            center,
+            stroke_rendering_seed: snow_draw_engine_core::arrow::stroke_rendering_seed(
+                (center.x as f32).to_bits(),
+                (center.y as f32).to_bits(),
+            ),
+            ..self.state.default_serial_number.clone()
+        };
+        serial.text_element_id = None;
+        serial.diameter = resolve_serial_number_data_diameter(&serial, serial.diameter);
+        validate_serial_number(&serial)?;
+        Ok(serial)
+    }
+
+    pub(crate) fn queue_serial_number_creation(
+        &mut self,
+        document: &DocumentModel,
+        serial: SerialNumberData,
+    ) -> Result<ElementId, ErrorCode> {
+        validate_serial_number(&serial)?;
+        let id = document.peek_next_element_id();
+        let next_default_number = if serial.serial_number_type.supports_number() {
+            serial.number.saturating_add(1)
+        } else {
+            self.state.default_serial_number.number
+        };
+        let mut transaction = Transaction::new("create serial number");
+        transaction.insert_serial_number(id, ElementMeta::default(), serial);
+        self.queue_command(EditorCommand::ApplyTransaction(
+            ApplyTransactionCommand::new(transaction),
+        ));
+        self.state.default_serial_number.number = next_default_number;
+        Ok(id)
+    }
+
+    pub(crate) fn snap_serial_number_creation_center(
+        &self,
+        document: &DocumentModel,
+        current: Point<f64>,
+        modifiers: Modifiers,
+    ) -> (Point<f64>, Vec<SnapGuide>) {
+        self.snap_creation_point(document, current, modifiers)
+    }
+
+    pub(crate) fn finalize_arrow_creation_from_points(
+        &mut self,
+        document: &DocumentModel,
+        points: &[Point<f64>],
+        modifiers: Modifiers,
+    ) -> Result<bool, ErrorCode> {
+        let Some(preview) = self.arrow_preview_from_points(document, points, modifiers, true)
+        else {
+            return Ok(false);
+        };
+        if arrow_length(&preview.arrow) < self.minimum_committed_linear_length() {
+            return Ok(false);
+        }
+        self.cancel_interaction();
+        self.queue_arrow_creation(document, preview.arrow)?;
+        Ok(true)
+    }
+
+    pub(crate) fn snap_arrow_creation_point(
+        &self,
+        document: &DocumentModel,
+        current: Point<f64>,
+        modifiers: Modifiers,
+    ) -> (Point<f64>, Vec<SnapGuide>) {
+        self.snap_creation_point(document, current, modifiers)
+    }
+
+    fn arrow_creation_preview(
+        &self,
+        document: &DocumentModel,
+        committed_points: &[Point<f64>],
+        current: Point<f64>,
+        modifiers: Modifiers,
+    ) -> (Point<f64>, Option<BoundArrowPreview>, Vec<SnapGuide>) {
+        let (mut snapped_current, guides) =
+            self.snap_arrow_creation_point(document, current, modifiers);
+        if modifiers.shift
+            && let Some(origin) = committed_points.last().copied()
+            && (self.state.active_tool == ActiveTool::Line
+                || self.state.default_arrow_style.arrow_type != ArrowType::Elbow)
+        {
+            snapped_current = lock_linear_point_to_discrete_angle(origin, snapped_current);
+        }
+        if self.state.active_tool == ActiveTool::Line
+            && committed_points.len() >= 2
+            && committed_points.first().is_some_and(|first| {
+                point_distance(*first, snapped_current) <= self.line_confirm_threshold()
+            })
+        {
+            snapped_current = committed_points[0];
+        }
+        let mut points = committed_points.to_vec();
+        let should_append = points.last().is_none_or(|last| {
+            point_distance(*last, snapped_current) >= self.line_confirm_threshold()
+        });
+        if should_append {
+            points.push(snapped_current);
+        }
+
+        let preview_points = if points.len() >= 2 {
+            points
+        } else {
+            committed_points.to_vec()
+        };
+        let preview = self.arrow_preview_from_points(document, &preview_points, modifiers, false);
+        (snapped_current, preview, guides)
+    }
+
+    fn arrow_preview_from_points(
+        &self,
+        document: &DocumentModel,
+        points: &[Point<f64>],
+        modifiers: Modifiers,
+        finalize: bool,
+    ) -> Option<BoundArrowPreview> {
+        let arrow = if self.state.active_tool == ActiveTool::Line {
+            let style = self.state.default_line_style;
+            preview_arrow_from_points(
+                points,
+                ArrowStyle {
+                    arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color(
+                    ),
+                    arrow_outline_width: 0.0,
+                    stroke: style.stroke,
+                    stroke_width: style.stroke_width,
+                    start_arrowhead: None,
+                    end_arrowhead: None,
+                    stroke_style: style.stroke_style,
+                    stroke_rendering_style: style.stroke_rendering_style,
+                    arrow_type: style.arrow_type,
+                    arrow_shaft_type: style.arrow_shaft_type,
+                    arrow_ratio: style.arrow_ratio,
+                },
+            )?
+            .into_line(style.fill, style.fill_style)
+        } else {
+            preview_arrow_from_points(points, self.state.default_arrow_style)?
+        };
+        let arrow_id = document.peek_next_element_id();
+        let bindables = self.bindable_elements(document, &[]);
+        let arrow_context = self.arrow_engine_context(modifiers);
+
+        let mut preview_arrow = arrow;
+        preview_arrow.stroke_rendering_seed = match &self.state.interaction {
+            InteractionState::CreatingArrow(state) => state.stroke_rendering_seed,
+            _ => snow_draw_engine_core::arrow::stroke_rendering_seed(
+                arrow_id.index,
+                arrow_id.generation,
+            ),
+        };
+        let mut suggested_binding = None;
+        for (edge, pointer) in [
+            (ArrowEndpointEdge::Start, points.first().copied()?),
+            (ArrowEndpointEdge::End, points.last().copied()?),
+        ] {
+            let result = compute_arrow_endpoint_drag(
+                arrow_id,
+                &preview_arrow,
+                edge,
+                pointer,
+                &bindables,
+                arrow_context,
+                arrow_endpoint_drag_options(modifiers, finalize),
+            );
+            preview_arrow = result.arrow;
+            suggested_binding = result.suggested_binding;
+        }
+
+        Some(BoundArrowPreview {
+            arrow: preview_arrow,
+            suggested_binding,
+        })
+    }
+
+    pub(crate) fn process_rectangle_creation_pointer_event(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        match event.event_type {
+            PointerEventType::Down => Ok(InteractionOutput::default()),
+            PointerEventType::DoubleClick => Ok(InteractionOutput::default()),
+            PointerEventType::Move | PointerEventType::Enter => {
+                self.handle_rectangle_pointer_move(document, event)
+            }
+            PointerEventType::Up => self.handle_rectangle_pointer_up(document, event),
+            PointerEventType::Cancel => self.handle_rectangle_pointer_cancel(document, event),
+            PointerEventType::Leave => Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Default),
+            }),
+        }
+    }
+
+    pub(crate) fn handle_rectangle_pointer_move(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingRectangle(state) = &self.state.interaction else {
+            return Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Default),
+            });
+        };
+        let state = *state;
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let (preview, snap_guides) = self.preview_rectangle_with_snapping(
+            document,
+            state.start_canvas_position,
+            current_canvas,
+            event.modifiers,
+        );
+        let preview = if matches!(
+            self.active_tool(),
+            ActiveTool::RectangleFilter | ActiveTool::RectangleEraser
+        ) {
+            preview.map(|rect| {
+                let mut filter = if self.active_tool() == ActiveTool::RectangleEraser {
+                    FilterData {
+                        filter_type: snow_draw_engine_document::CanvasFilterType::RestoreBackground,
+                        strength: 1.0,
+                        opacity: 1.0,
+                        ..FilterData::default()
+                    }
+                } else {
+                    self.state.default_filter
+                };
+                filter.center = rect.center;
+                filter.width = rect.width;
+                filter.height = rect.height;
+                filter.rotation = rect.rotation;
+                ElementCreationPreview::Filter(filter)
+            })
+        } else if self.active_tool() == ActiveTool::SpeechBubble {
+            preview.map(|mut body| {
+                body.corner_radii = self.state.default_speech_bubble_style.corner_radii;
+                ElementCreationPreview::SpeechBubble(
+                    snow_draw_engine_document::SpeechBubbleData::new(body),
+                )
+            })
+        } else if self.active_tool() == ActiveTool::Magnifier {
+            preview
+                .map(|rect| ElementCreationPreview::Magnifier(self.magnifier_creation_data(rect)))
+        } else {
+            preview.map(ElementCreationPreview::Rectangle)
+        };
+        self.set_creation_preview(preview, snap_guides);
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: PointerCaptureCommand::NoChange,
+            cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+        })
+    }
+
+    pub(crate) fn handle_rectangle_pointer_up(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingRectangle(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let state = *state;
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let (preview, _) = self.preview_rectangle_with_snapping(
+            document,
+            state.start_canvas_position,
+            current_canvas,
+            event.modifiers,
+        );
+        self.cancel_interaction();
+
+        if let Some(rect) = preview {
+            if self.active_tool() == ActiveTool::SpeechBubble {
+                let id = document.peek_next_element_id();
+                let mut body = rect;
+                body.corner_radii = self.state.default_speech_bubble_style.corner_radii;
+                let bubble = snow_draw_engine_document::SpeechBubbleData::new(body);
+                let mut transaction = Transaction::new("create speech bubble");
+                transaction.insert_speech_bubble(id, ElementMeta::default(), bubble);
+                let undo = self.capture_document_sync_snapshot(document);
+                self.state.pending_speech_bubble_text_edit = Some(id);
+                self.queue_command(EditorCommand::ApplyTransaction(
+                    ApplyTransactionCommand::with_history_undo_snapshot(transaction, undo)
+                        .selecting_created(id),
+                ));
+                return Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+                });
+            }
+            if self.active_tool() == ActiveTool::Magnifier {
+                let value = self.magnifier_creation_data(rect);
+                snow_draw_engine_document::validate_magnifier(&value)?;
+                let mut transaction = Transaction::new("create magnifier");
+                transaction.insert_magnifier(
+                    document.peek_next_element_id(),
+                    ElementMeta::default(),
+                    value,
+                );
+                self.queue_command(EditorCommand::ApplyTransaction(
+                    ApplyTransactionCommand::new(transaction)
+                        .selecting_created(document.peek_next_element_id()),
+                ));
+                return Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+                });
+            }
+            if matches!(
+                self.active_tool(),
+                ActiveTool::RectangleFilter | ActiveTool::RectangleEraser
+            ) {
+                let mut filter = if self.active_tool() == ActiveTool::RectangleEraser {
+                    FilterData {
+                        filter_type: snow_draw_engine_document::CanvasFilterType::RestoreBackground,
+                        strength: 1.0,
+                        opacity: 1.0,
+                        ..FilterData::default()
+                    }
+                } else {
+                    self.state.default_filter
+                };
+                filter.center = rect.center;
+                filter.width = rect.width;
+                filter.height = rect.height;
+                filter.rotation = rect.rotation;
+                validate_filter(&filter)?;
+                let mut transaction =
+                    Transaction::new(if self.active_tool() == ActiveTool::RectangleEraser {
+                        "create rectangle eraser"
+                    } else {
+                        "create filter"
+                    });
+                transaction.insert_filter(
+                    document.peek_next_element_id(),
+                    ElementMeta::default(),
+                    filter,
+                );
+                self.queue_command(EditorCommand::ApplyTransaction(
+                    ApplyTransactionCommand::new(transaction)
+                        .selecting_created(document.peek_next_element_id()),
+                ));
+                return Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+                });
+            }
+            validate_rectangle(&rect)?;
+            let mut transaction = Transaction::new(if rect.is_highlight() {
+                "create highlight"
+            } else if rect.is_spotlight() {
+                "create spotlight"
+            } else {
+                "create rectangle"
+            });
+            transaction.insert_rectangle(
+                document.peek_next_element_id(),
+                ElementMeta::default(),
+                rect,
+            );
+            self.queue_command(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::new(transaction)
+                    .selecting_created(document.peek_next_element_id()),
+            ));
+        }
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+        })
+    }
+
+    pub(crate) fn handle_rectangle_pointer_cancel(
+        &mut self,
+        _document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingRectangle(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let state = *state;
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        self.cancel_interaction();
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(self.tool_policy().default_cursor),
+        })
+    }
+
+    pub(crate) fn process_arrow_creation_pointer_event(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        if self.state.active_tool == ActiveTool::Bracket {
+            return self.process_bracket_creation_pointer_event(document, event);
+        }
+        if self.state.active_tool == ActiveTool::Angle {
+            return self.process_angle_creation_pointer_event(document, event);
+        }
+        if self.state.active_tool == ActiveTool::Distance {
+            return self.process_distance_creation_pointer_event(document, event);
+        }
+        match event.event_type {
+            PointerEventType::Down => self.handle_arrow_pointer_down(document, event),
+            PointerEventType::DoubleClick => self.handle_arrow_double_click(document, event),
+            PointerEventType::Move | PointerEventType::Enter => {
+                self.handle_arrow_pointer_move(document, event)
+            }
+            PointerEventType::Up => self.handle_arrow_pointer_up(document, event),
+            PointerEventType::Cancel => self.handle_arrow_pointer_cancel(document, event),
+            PointerEventType::Leave => Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Crosshair),
+            }),
+        }
+    }
+
+    pub(crate) fn handle_arrow_double_click(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingArrow(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        if event.button != Some(PointerButton::Primary)
+            || state.pointer_id != event.pointer_id
+            || state.phase != ArrowCreationPhase::AwaitingEndpoint
+        {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let (snapped_current, _) =
+            self.snap_arrow_creation_point(document, current_canvas, event.modifiers);
+        let Some(last_committed) = state.committed_points.last().copied() else {
+            return Ok(InteractionOutput::default());
+        };
+
+        // Qt emits the first click as a normal press/release before the
+        // double-click event. That release has already committed the terminal
+        // point, so match Excalidraw's commit-zone behavior: only a second
+        // click at that point finalizes the existing linear element.
+        if point_distance(last_committed, snapped_current) >= self.line_confirm_threshold() {
+            return Ok(InteractionOutput::default());
+        }
+
+        let points = state.committed_points.clone();
+        let committed =
+            self.finalize_arrow_creation_from_points(document, &points, event.modifiers)?;
+        Ok(InteractionOutput {
+            consumed: committed,
+            capture: if committed {
+                self.release_capture_command()
+            } else {
+                PointerCaptureCommand::NoChange
+            },
+            cursor: CursorCommand::Set(CursorStyle::Crosshair),
+        })
+    }
+
+    pub(crate) fn handle_arrow_pointer_down(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingArrow(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let state = state.clone();
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        if state.phase != ArrowCreationPhase::AwaitingEndpoint {
+            return Ok(InteractionOutput::default());
+        }
+
+        match event.button {
+            Some(PointerButton::Primary) => {
+                let current_canvas =
+                    view_to_canvas(event.position, &self.camera(), self.surface_size());
+                let (snapped_current, preview, snap_guides) = self.arrow_creation_preview(
+                    document,
+                    &state.committed_points,
+                    current_canvas,
+                    event.modifiers,
+                );
+
+                // Excalidraw elbow arrows are defined by exactly two clicks:
+                // the first sets the start and the second sets the end. They do
+                // not enter the multi-point creation flow used by lines and
+                // non-elbow arrows.
+                if self.state.active_tool == ActiveTool::Arrow
+                    && self.state.default_arrow_style.arrow_type == ArrowType::Elbow
+                    && let Some(start) = state.committed_points.first().copied()
+                    && self.finalize_arrow_creation_from_points(
+                        document,
+                        &[start, snapped_current],
+                        event.modifiers,
+                    )?
+                {
+                    return Ok(InteractionOutput {
+                        consumed: true,
+                        capture: PointerCaptureCommand::NoChange,
+                        cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                    });
+                }
+
+                self.arm_arrow_endpoint_creation(state, event.pointer_id, event.position);
+                self.set_arrow_creation_preview(preview, snap_guides);
+
+                Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.capture_command_for_start(event.pointer_id),
+                    cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                })
+            }
+            Some(PointerButton::Secondary) => {
+                if !self.finalize_arrow_creation_from_points(
+                    document,
+                    &state.committed_points,
+                    event.modifiers,
+                )? {
+                    self.cancel_interaction();
+                }
+                Ok(InteractionOutput {
+                    consumed: true,
+                    capture: self.release_capture_command(),
+                    cursor: CursorCommand::Set(CursorStyle::Crosshair),
+                })
+            }
+            _ => Ok(InteractionOutput::default()),
+        }
+    }
+
+    pub(crate) fn handle_arrow_pointer_move(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingArrow(state) = &self.state.interaction else {
+            return Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Crosshair),
+            });
+        };
+        let state = state.clone();
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let (_, preview, snap_guides) = self.arrow_creation_preview(
+            document,
+            &state.committed_points,
+            current_canvas,
+            event.modifiers,
+        );
+        self.set_arrow_creation_preview(preview, snap_guides);
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: PointerCaptureCommand::NoChange,
+            cursor: CursorCommand::Set(CursorStyle::Crosshair),
+        })
+    }
+
+    pub(crate) fn handle_arrow_pointer_up(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingArrow(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let state = state.clone();
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let (snapped_current, preview, snap_guides) = self.arrow_creation_preview(
+            document,
+            &state.committed_points,
+            current_canvas,
+            event.modifiers,
+        );
+        let is_click_release = pointer_drag_distance(state.press_view_position, event.position)
+            < MINIMUM_ARROW_SIZE_PX;
+        let committed_arrow = preview
+            .as_ref()
+            .map(|preview| preview.arrow.clone())
+            .filter(|arrow| {
+                arrow_length(arrow) >= self.minimum_drag_created_linear_length()
+                    && state.committed_points.last().is_none_or(|last| {
+                        point_distance(*last, snapped_current) >= self.line_confirm_threshold()
+                    })
+            });
+
+        match state.phase {
+            ArrowCreationPhase::InitialPress => {
+                if !is_click_release {
+                    if let Some(arrow) = committed_arrow {
+                        self.cancel_interaction();
+                        self.queue_arrow_creation(document, arrow)?;
+                    } else {
+                        self.cancel_interaction();
+                    }
+                } else {
+                    self.keep_arrow_creation_active(state, preview, snap_guides);
+                }
+            }
+            ArrowCreationPhase::AwaitingEndpoint => {
+                return Ok(InteractionOutput::default());
+            }
+            ArrowCreationPhase::EndpointPress => {
+                if !is_click_release {
+                    if let Some(arrow) = committed_arrow {
+                        self.cancel_interaction();
+                        self.queue_arrow_creation(document, arrow)?;
+                    } else {
+                        self.keep_arrow_creation_active(state, preview, snap_guides);
+                    }
+                } else if state.committed_points.last().is_some_and(|last| {
+                    point_distance(*last, snapped_current) < self.line_confirm_threshold()
+                }) {
+                    if !self.finalize_arrow_creation_from_points(
+                        document,
+                        &state.committed_points,
+                        event.modifiers,
+                    )? {
+                        self.keep_arrow_creation_active(state, preview, snap_guides);
+                    }
+                } else {
+                    let mut next_state = state;
+                    next_state.committed_points.push(snapped_current);
+                    let preview = self.arrow_preview_from_points(
+                        document,
+                        &next_state.committed_points,
+                        event.modifiers,
+                        false,
+                    );
+                    self.keep_arrow_creation_active(next_state, preview, snap_guides);
+                }
+            }
+        }
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(CursorStyle::Crosshair),
+        })
+    }
+
+    pub(crate) fn handle_arrow_pointer_cancel(
+        &mut self,
+        _document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingArrow(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        self.cancel_interaction();
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(CursorStyle::Crosshair),
+        })
+    }
+
+    pub(crate) fn process_serial_number_creation_pointer_event(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        match event.event_type {
+            PointerEventType::Down => Ok(InteractionOutput::default()),
+            PointerEventType::DoubleClick => Ok(InteractionOutput::default()),
+            PointerEventType::Move | PointerEventType::Enter => {
+                self.handle_serial_number_pointer_move(document, event)
+            }
+            PointerEventType::Up => self.handle_serial_number_pointer_up(document, event),
+            PointerEventType::Cancel => self.handle_serial_number_pointer_cancel(document, event),
+            PointerEventType::Leave => Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Default),
+            }),
+        }
+    }
+
+    pub(crate) fn handle_serial_number_pointer_move(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingSerialNumber(state) = &self.state.interaction else {
+            return Ok(InteractionOutput {
+                consumed: false,
+                capture: PointerCaptureCommand::NoChange,
+                cursor: CursorCommand::Set(CursorStyle::Default),
+            });
+        };
+        let state = state.clone();
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        let current_canvas = view_to_canvas(event.position, &self.camera(), self.surface_size());
+        let mut state = state;
+        if let Some((_, text)) = &mut state.text {
+            text.center = current_canvas;
+        } else if pointer_drag_distance(state.start_view_position, event.position)
+            >= POINTER_DRAG_THRESHOLD
+        {
+            let mut serial = document.serial_number(state.serial_id)?.clone();
+            let text_id = document.peek_next_element_id();
+            // The drag label starts from the same definition the floating
+            // toolbar's Create Text button uses, so both paths style and size
+            // the bound label identically before the host measurement lands.
+            let mut text = crate::text::new_serial_bound_label(&self.state.default_text)?;
+            text.center = current_canvas;
+            serial.text_element_id = Some(text_id);
+            let mut transaction = Transaction::new("create serial number text");
+            transaction.insert_text(text_id, ElementMeta::default(), text.clone());
+            transaction.update_serial_number(state.serial_id, serial);
+            self.queue_command(EditorCommand::ApplyTransaction(
+                ApplyTransactionCommand::new(transaction),
+            ));
+            state.text = Some((text_id, text));
+        }
+        self.state.interaction = InteractionState::CreatingSerialNumber(state);
+        self.bump_scene_state_revision();
+        self.bump_overlay_state_revision();
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: PointerCaptureCommand::NoChange,
+            cursor: CursorCommand::Set(CursorStyle::Default),
+        })
+    }
+
+    pub(crate) fn handle_serial_number_pointer_up(
+        &mut self,
+        document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingSerialNumber(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let state = state.clone();
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        if event.button != Some(PointerButton::Primary) {
+            return Ok(InteractionOutput::default());
+        }
+        // Include the release position even if the host coalesced all move events.
+        self.handle_serial_number_pointer_move(document, event)?;
+        let InteractionState::CreatingSerialNumber(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        let text = state.text.clone();
+        let serial_id = state.serial_id;
+        self.cancel_interaction();
+        // The badge is inserted on pointer down. Selecting it after the drag finishes
+        // preserves the gesture that creates and positions its attached label.
+        self.select_created_element(document, serial_id);
+        if let Some((id, text)) = text {
+            if let Ok(original) = document.text(id)
+                && original != &text
+            {
+                let mut transaction = Transaction::new("place serial number text");
+                transaction.update_text(id, text);
+                self.queue_command(EditorCommand::ApplyTransaction(
+                    ApplyTransactionCommand::new(transaction),
+                ));
+            }
+            self.state.pending_text_edit = Some(id);
+        }
+
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(CursorStyle::Default),
+        })
+    }
+
+    pub(crate) fn handle_serial_number_pointer_cancel(
+        &mut self,
+        _document: &DocumentModel,
+        event: PointerEvent,
+    ) -> Result<InteractionOutput, ErrorCode> {
+        let InteractionState::CreatingSerialNumber(state) = &self.state.interaction else {
+            return Ok(InteractionOutput::default());
+        };
+        if state.pointer_id != event.pointer_id {
+            return Ok(InteractionOutput::default());
+        }
+
+        self.cancel_interaction();
+        Ok(InteractionOutput {
+            consumed: true,
+            capture: self.release_capture_command(),
+            cursor: CursorCommand::Set(CursorStyle::Default),
+        })
+    }
+
+    /// Requests a host-side font measurement for the empty label attached by an
+    /// active serial number drag. The drag attaches the label with placeholder
+    /// geometry because only the host can measure text; until the measured
+    /// layout is applied, the painted fill bubble outruns the item bounds used
+    /// for incremental dirty regions.
+    pub fn serial_number_label_layout_request(
+        &self,
+        document: &DocumentModel,
+    ) -> Option<SerialNumberLabelLayoutRequest> {
+        let InteractionState::CreatingSerialNumber(state) = &self.state.interaction else {
+            return None;
+        };
+        let (id, text) = state.text.as_ref()?;
+        if state.label_measured || document.text(*id).is_err() {
+            return None;
+        }
+        Some(SerialNumberLabelLayoutRequest {
+            text_id: *id,
+            font_size: text.font_size,
+            font_family: text.font_family.clone(),
+        })
+    }
+
+    /// Applies the host-measured empty-label layout to the drag-attached label.
+    /// The measurement updates the in-flight drag state (the authority while the
+    /// pointer is captured, like the live center); the release transaction
+    /// persists it into the document, so no extra undo entry is created. The
+    /// layout is stored unconditionally, with the center following the pinned
+    /// alignment edge: a label that does not auto-resize must still receive the
+    /// measurement, exactly like the floating toolbar's Create Text path.
+    pub fn apply_serial_number_label_layout(
+        &mut self,
+        document: &DocumentModel,
+        text_id: ElementId,
+        layout: TextLayoutSize,
+    ) -> Result<bool, ErrorCode> {
+        let layout = validate_text_layout_size(layout)?;
+        let InteractionState::CreatingSerialNumber(state) = &mut self.state.interaction else {
+            return Ok(false);
+        };
+        let Some((id, text)) = &state.text else {
+            return Ok(false);
+        };
+        if *id != text_id || state.label_measured || document.text(text_id).is_err() {
+            return Ok(false);
+        }
+        let updated = text_with_pinned_alignment_layout(text, layout)?;
+        validate_text(&updated)?;
+        let applied = updated != *text;
+        state.label_measured = true;
+        if applied {
+            state.text = Some((text_id, updated));
+        }
+        self.bump_scene_state_revision();
+        self.bump_overlay_state_revision();
+        Ok(applied)
+    }
+}
+
+/// A pending host measurement for the empty label attached by a serial number
+/// drag; the host measures the empty draft for this font and applies the result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialNumberLabelLayoutRequest {
+    pub text_id: ElementId,
+    pub font_size: f64,
+    pub font_family: Option<String>,
+}
+
+#[cfg(test)]
+mod line_creation_tests {
+    use super::*;
+    use snow_draw_engine_core::{
+        ColorRgba8, CornerRadii, SnapGuideAxis, SnapGuideKind, arrow::StrokeStyle,
+    };
+    use snow_draw_engine_document::{
+        CanvasFilterType, ElementData, FillStyle, HighlightShape, RectangleElementKind,
+    };
+    use snow_draw_engine_interaction::{PointerButtons, PointerDevice};
+
+    fn editor_with_non_dominant_x_snap_reference() -> (Editor, DocumentModel) {
+        let mut config = EngineConfig::default();
+        config.snap.enabled = true;
+        config.snap.enable_gap_snaps = false;
+        let editor = Editor::new(config).unwrap();
+        let mut document = DocumentModel::new();
+        let (reference, _) = editor.preview_rectangle_with_snapping(
+            &document,
+            Point::new(19.0, 29.0),
+            Point::new(29.0, 49.0),
+            Modifiers::default(),
+        );
+        let reference = reference.expect("reference rectangle should be valid");
+        let mut transaction = Transaction::new("insert snap reference");
+        transaction.insert_rectangle(
+            document.peek_next_element_id(),
+            ElementMeta::default(),
+            reference,
+        );
+        document.apply_transaction(transaction).unwrap();
+        (editor, document)
+    }
+
+    fn assert_vertical_point_guide_matches_right_edge(rect: &RectangleData, guides: &[SnapGuide]) {
+        let bounds = rectangle_to_draw_rect(rect);
+        let guide = guides
+            .iter()
+            .find(|guide| {
+                guide.kind == SnapGuideKind::Point && guide.axis == SnapGuideAxis::Vertical
+            })
+            .expect("the applied X snap should return a vertical point guide");
+        assert!((guide.start.x - bounds.max_x).abs() <= 1e-9);
+        assert!((guide.end.x - bounds.max_x).abs() <= 1e-9);
+    }
+
+    #[test]
+    fn alt_rectangle_creation_scales_from_the_press_center() {
+        let document = DocumentModel::new();
+        let editor = Editor::new(EngineConfig::default()).unwrap();
+        let start = Point::new(10.0, 20.0);
+        let current = Point::new(15.0, 30.0);
+
+        let (preview, _) = editor.preview_rectangle_with_snapping(
+            &document,
+            start,
+            current,
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        );
+        let rect = preview.expect("Alt rectangle drag should produce a preview");
+        assert_eq!(rect.center, start);
+        assert_eq!(rect.width, 10.0);
+        assert_eq!(rect.height, 20.0);
+
+        let (preview, _) = editor.preview_rectangle_with_snapping(
+            &document,
+            start,
+            current,
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        let rect = preview.expect("Alt+Shift rectangle drag should produce a preview");
+        assert_eq!(rect.center, start);
+        assert_eq!(rect.width, rect.height);
+    }
+
+    #[test]
+    fn shift_rectangle_creation_applies_non_dominant_x_object_snap() {
+        let (editor, document) = editor_with_non_dominant_x_snap_reference();
+        let (preview, guides) = editor.preview_rectangle_with_snapping(
+            &document,
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 20.0),
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        let rect = preview.expect("Shift rectangle drag should produce a preview");
+        let bounds = rectangle_to_draw_rect(&rect);
+
+        assert!((bounds.max_x - 19.0).abs() <= 1e-9);
+        assert!((rect.width - 19.0).abs() <= 1e-9);
+        assert_eq!(rect.width, rect.height);
+        assert_vertical_point_guide_matches_right_edge(&rect, &guides);
+    }
+
+    #[test]
+    fn alt_shift_rectangle_creation_applies_non_dominant_x_object_snap_from_center() {
+        let (editor, document) = editor_with_non_dominant_x_snap_reference();
+        let start = Point::new(0.0, 0.0);
+        let (preview, guides) = editor.preview_rectangle_with_snapping(
+            &document,
+            start,
+            Point::new(10.0, 20.0),
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        let rect = preview.expect("Alt+Shift rectangle drag should produce a preview");
+        let bounds = rectangle_to_draw_rect(&rect);
+
+        assert_eq!(rect.center, start);
+        assert!((bounds.max_x - 19.0).abs() <= 1e-9);
+        assert!((rect.width - 38.0).abs() <= 1e-9);
+        assert_eq!(rect.width, rect.height);
+        assert_vertical_point_guide_matches_right_edge(&rect, &guides);
+    }
+
+    #[test]
+    fn line_drag_queues_one_canonical_line_element() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+
+        assert!(
+            editor
+                .finalize_arrow_creation_from_points(
+                    &document,
+                    &[Point::new(20.0, 30.0), Point::new(28.0, 30.0)],
+                    Modifiers::default(),
+                )
+                .unwrap()
+        );
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("a meaningful Line drag should queue one transaction");
+        };
+        assert_eq!(command.transaction.label(), "create line");
+        document.apply_transaction(command.transaction).unwrap();
+
+        let record = document.element(id).unwrap();
+        assert_eq!(record.data.kind(), ElementKind::Line);
+        let ElementData::Arrow(line) = &record.data else {
+            panic!("Line should use the shared linear geometry record");
+        };
+        assert!(line.is_line());
+        assert_eq!(line.arrow_type, ArrowType::Curve);
+        assert_eq!(line.start_arrowhead, None);
+        assert_eq!(line.end_arrowhead, None);
+    }
+
+    #[test]
+    fn configured_straight_line_drag_preserves_the_type() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        let mut style = editor.shape_style(&document);
+        style.arrow_type = ArrowType::Straight;
+        editor
+            .set_shape_style_patch(
+                &document,
+                ShapeStylePatch {
+                    kind: ShapeKind::Line,
+                    style,
+                    properties: SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            editor
+                .finalize_arrow_creation_from_points(
+                    &document,
+                    &[Point::new(20.0, 30.0), Point::new(60.0, 70.0)],
+                    Modifiers::default(),
+                )
+                .unwrap()
+        );
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("a meaningful straight Line drag should queue one transaction");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        let ElementData::Arrow(line) = &document.element(id).unwrap().data else {
+            panic!("Line should use the shared linear geometry record");
+        };
+        assert_eq!(line.arrow_type, ArrowType::Straight);
+        assert_eq!(line.start_arrowhead, None);
+        assert_eq!(line.end_arrowhead, None);
+    }
+
+    #[test]
+    fn subthreshold_line_drag_queues_no_element_or_history_transaction() {
+        let document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+
+        assert!(
+            !editor
+                .finalize_arrow_creation_from_points(
+                    &document,
+                    &[Point::new(0.0, 0.0), Point::new(7.99, 0.0)],
+                    Modifiers::default(),
+                )
+                .unwrap()
+        );
+        assert!(editor.pending_command.is_none());
+        assert!(document.element(document.peek_next_element_id()).is_err());
+    }
+
+    #[test]
+    fn line_preview_snaps_near_closure_to_exact_first_point() {
+        let document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        let committed = [Point::new(10.0, 10.0), Point::new(80.0, 80.0)];
+
+        let (snapped, preview, _) = editor.arrow_creation_preview(
+            &document,
+            &committed,
+            Point::new(16.0, 14.0),
+            Modifiers::default(),
+        );
+        assert_eq!(snapped, committed[0]);
+        let preview = preview.unwrap();
+        assert_eq!(
+            preview.arrow.global_points().first(),
+            preview.arrow.global_points().last()
+        );
+        assert_eq!(preview.arrow.global_points().len(), 3);
+    }
+
+    #[test]
+    fn line_double_click_finishes_without_a_duplicate_terminal_point() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![
+                Point::new(-50.0, 0.0),
+                Point::new(0.0, 40.0),
+                Point::new(50.0, 0.0),
+            ],
+            press_view_position: Point::new(150.0, 100.0),
+            phase: ArrowCreationPhase::AwaitingEndpoint,
+            ..Default::default()
+        });
+
+        editor
+            .process_arrow_creation_pointer_event(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::DoubleClick,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(150.0, 100.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons(PointerButtons::PRIMARY),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("double-click should finish the active Line");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+
+        assert_eq!(document.arrow(id).unwrap().global_points().len(), 3);
+        assert!(matches!(editor.state.interaction, InteractionState::Idle));
+    }
+
+    #[test]
+    fn arrow_double_click_finishes_without_a_duplicate_terminal_point() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Arrow).unwrap();
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![
+                Point::new(-50.0, 0.0),
+                Point::new(0.0, 40.0),
+                Point::new(50.0, 0.0),
+            ],
+            press_view_position: Point::new(150.0, 100.0),
+            phase: ArrowCreationPhase::AwaitingEndpoint,
+            ..Default::default()
+        });
+
+        editor
+            .process_arrow_creation_pointer_event(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::DoubleClick,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(150.0, 100.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons(PointerButtons::PRIMARY),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("double-click should finish the active Arrow");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+
+        let arrow = document.arrow(id).unwrap();
+        assert!(!arrow.is_line());
+        assert_eq!(arrow.global_points().len(), 3);
+        assert!(matches!(editor.state.interaction, InteractionState::Idle));
+    }
+
+    #[test]
+    fn double_click_away_from_terminal_does_not_finish_linear_creation() {
+        let document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![Point::new(-50.0, 0.0), Point::new(50.0, 0.0)],
+            press_view_position: Point::new(150.0, 100.0),
+            phase: ArrowCreationPhase::AwaitingEndpoint,
+            ..Default::default()
+        });
+
+        let output = editor
+            .process_arrow_creation_pointer_event(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::DoubleClick,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(250.0, 100.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons(PointerButtons::PRIMARY),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(!output.consumed);
+        assert!(editor.pending_command.is_none());
+        assert!(matches!(
+            editor.state.interaction,
+            InteractionState::CreatingArrow(_)
+        ));
+    }
+
+    #[test]
+    fn repeated_single_click_on_terminal_point_finishes_arrow_creation() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Arrow).unwrap();
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![Point::new(-50.0, 0.0), Point::new(50.0, 0.0)],
+            press_view_position: Point::new(150.0, 100.0),
+            phase: ArrowCreationPhase::EndpointPress,
+            ..Default::default()
+        });
+
+        editor
+            .handle_arrow_pointer_up(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::Up,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(150.0, 100.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons::default(),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("clicking the commit zone should finish Arrow creation");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(document.arrow(id).unwrap().global_points().len(), 2);
+        assert!(matches!(editor.state.interaction, InteractionState::Idle));
+    }
+
+    #[test]
+    fn elbow_arrow_finishes_on_the_second_pointer_down() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Arrow).unwrap();
+        editor.state.default_arrow_style.arrow_type = ArrowType::Elbow;
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![Point::new(-50.0, -40.0)],
+            press_view_position: Point::new(50.0, 60.0),
+            phase: ArrowCreationPhase::AwaitingEndpoint,
+            ..Default::default()
+        });
+
+        let output = editor
+            .handle_arrow_pointer_down(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::Down,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(150.0, 140.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons(PointerButtons::PRIMARY),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(output.consumed);
+        assert!(matches!(editor.state.interaction, InteractionState::Idle));
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("the second Elbow Arrow click should queue its creation");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+
+        let arrow = document.arrow(id).unwrap();
+        assert!(arrow.is_elbow());
+        assert_eq!(arrow.start(), Point::new(-50.0, -40.0));
+        assert_eq!(arrow.end(), Point::new(50.0, 40.0));
+        assert!(arrow.global_points().windows(2).all(|segment| {
+            (segment[0].x - segment[1].x).abs() <= 1e-6
+                || (segment[0].y - segment[1].y).abs() <= 1e-6
+        }));
+    }
+
+    #[test]
+    fn secondary_click_finishes_single_node_linear_creation_without_a_transaction() {
+        for (tool, arrow_type) in [
+            (ActiveTool::Arrow, ArrowType::Straight),
+            (ActiveTool::Arrow, ArrowType::Curve),
+            (ActiveTool::Arrow, ArrowType::Elbow),
+            (ActiveTool::Line, ArrowType::Straight),
+            (ActiveTool::Line, ArrowType::Curve),
+        ] {
+            let document = DocumentModel::new();
+            let mut editor = Editor::new(EngineConfig::default()).unwrap();
+            editor.set_surface_size(400, 300).unwrap();
+            editor.set_active_tool(tool).unwrap();
+            editor.state.default_arrow_style.arrow_type = arrow_type;
+            editor.state.default_line_style.arrow_type = arrow_type;
+            let pointer = |event_type, position, button, buttons| {
+                InputEvent::Pointer(PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type,
+                    device: PointerDevice::Mouse,
+                    position,
+                    button,
+                    buttons: PointerButtons(buttons),
+                    modifiers: Modifiers::default(),
+                })
+            };
+            for (event_type, buttons) in [
+                (PointerEventType::Down, PointerButtons::PRIMARY),
+                (PointerEventType::Up, 0),
+            ] {
+                let update = editor
+                    .process_input(
+                        &document,
+                        pointer(
+                            event_type,
+                            Point::new(60.0, 80.0),
+                            Some(PointerButton::Primary),
+                            buttons,
+                        ),
+                    )
+                    .unwrap();
+                assert!(update.interaction.consumed);
+                assert!(update.command.is_none());
+            }
+            assert!(matches!(
+                &editor.state.interaction,
+                InteractionState::CreatingArrow(state)
+                    if state.committed_points.len() == 1
+                        && state.phase == ArrowCreationPhase::AwaitingEndpoint
+            ));
+            editor
+                .process_input(
+                    &document,
+                    pointer(PointerEventType::Move, Point::new(180.0, 120.0), None, 0),
+                )
+                .unwrap();
+            assert!(editor.state.creation_preview.is_some());
+
+            let update = editor
+                .process_input(
+                    &document,
+                    pointer(
+                        PointerEventType::Down,
+                        Point::new(25.0, 180.0),
+                        Some(PointerButton::Secondary),
+                        PointerButtons::SECONDARY,
+                    ),
+                )
+                .unwrap();
+
+            assert!(update.interaction.consumed);
+            assert!(update.command.is_none());
+            assert!(matches!(editor.state.interaction, InteractionState::Idle));
+            assert!(editor.state.creation_preview.is_none());
+            assert!(editor.state.ui.snap_guides.is_empty());
+            assert!(editor.captured_pointer.is_none());
+            assert_eq!(editor.active_tool(), tool);
+        }
+    }
+
+    #[test]
+    fn secondary_double_click_does_not_finish_line_creation() {
+        let document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(200, 200).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        editor.state.interaction = InteractionState::CreatingArrow(CreateArrowState {
+            pointer_id: 4,
+            committed_points: vec![Point::new(-50.0, 0.0), Point::new(50.0, 0.0)],
+            press_view_position: Point::new(150.0, 100.0),
+            phase: ArrowCreationPhase::AwaitingEndpoint,
+            ..Default::default()
+        });
+
+        let output = editor
+            .handle_arrow_double_click(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 4,
+                    event_type: PointerEventType::DoubleClick,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(150.0, 100.0),
+                    button: Some(PointerButton::Secondary),
+                    buttons: PointerButtons(PointerButtons::SECONDARY),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(!output.consumed);
+        assert!(editor.pending_command.is_none());
+        assert!(matches!(
+            editor.state.interaction,
+            InteractionState::CreatingArrow(_)
+        ));
+    }
+
+    #[test]
+    fn filter_drag_queues_one_filter_with_default_style() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Filter).unwrap();
+        editor.state.interaction = InteractionState::CreatingRectangle(CreateRectangleState {
+            stroke_rendering_seed: 0,
+            pointer_id: 7,
+            start_canvas_position: Point::new(10.0, 20.0),
+        });
+
+        editor
+            .handle_rectangle_pointer_up(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 7,
+                    event_type: PointerEventType::Up,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(90.0, 60.0),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons::default(),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("a meaningful Filter drag should queue one transaction");
+        };
+        assert_eq!(command.transaction.label(), "create filter");
+        assert_eq!(command.transaction.operations().len(), 1);
+        document.apply_transaction(command.transaction).unwrap();
+
+        let ElementData::Filter(filter) = &document.element(id).unwrap().data else {
+            panic!("Filter should retain its first-class document identity");
+        };
+        assert_eq!(filter.filter_type, CanvasFilterType::Mosaic);
+        assert_eq!(filter.strength, 0.5);
+        assert_eq!(filter.opacity, 1.0);
+        assert_eq!(filter.center, Point::new(50.0, 40.0));
+        assert_eq!((filter.width, filter.height), (80.0, 40.0));
+    }
+
+    #[test]
+    fn spotlight_drag_previews_and_commits_a_transparent_crosshair_rectangle() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Spotlight).unwrap();
+        editor.state.interaction = InteractionState::CreatingRectangle(CreateRectangleState {
+            stroke_rendering_seed: 0,
+            pointer_id: 9,
+            start_canvas_position: Point::new(10.0, 20.0),
+        });
+        let event = |event_type, position| PointerEvent {
+            pressure: None,
+            timestamp_ms: 0,
+            pointer_id: 9,
+            event_type,
+            device: PointerDevice::Mouse,
+            position,
+            button: Some(PointerButton::Primary),
+            buttons: PointerButtons::default(),
+            modifiers: Modifiers::default(),
+        };
+
+        let move_output = editor
+            .handle_rectangle_pointer_move(
+                &document,
+                event(PointerEventType::Move, Point::new(90.0, 60.0)),
+            )
+            .unwrap();
+        assert_eq!(
+            move_output.cursor,
+            CursorCommand::Set(CursorStyle::Crosshair)
+        );
+        let Some(ElementCreationPreview::Rectangle(preview)) =
+            editor.state.creation_preview.as_ref()
+        else {
+            panic!("the first Spotlight drag must activate a rectangle preview");
+        };
+        assert!(preview.is_spotlight());
+        assert_eq!(preview.opacity, 1.0);
+        assert_eq!(preview.fill.a, 0);
+        assert_eq!(preview.stroke.a, 0);
+
+        let up_output = editor
+            .handle_rectangle_pointer_up(
+                &document,
+                event(PointerEventType::Up, Point::new(90.0, 60.0)),
+            )
+            .unwrap();
+        assert_eq!(up_output.cursor, CursorCommand::Set(CursorStyle::Crosshair));
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("a meaningful Spotlight drag should queue one transaction");
+        };
+        assert_eq!(command.transaction.label(), "create spotlight");
+        document.apply_transaction(command.transaction).unwrap();
+        let spotlight = document.rectangle(id).unwrap();
+        assert!(spotlight.is_spotlight());
+        assert_eq!(spotlight.center, Point::new(50.0, 40.0));
+        assert_eq!((spotlight.width, spotlight.height), (80.0, 40.0));
+        assert_eq!(spotlight.opacity, 1.0);
+        assert_eq!(spotlight.fill.a, 0);
+        assert_eq!(spotlight.stroke.a, 0);
+    }
+
+    #[test]
+    fn pen_highlight_drag_previews_and_commits_one_straight_two_point_line() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::PenHighlight).unwrap();
+        editor.state.interaction = InteractionState::CreatingPenHighlight(CreateRectangleState {
+            stroke_rendering_seed: 0,
+            pointer_id: 7,
+            start_canvas_position: Point::new(10.0, 20.0),
+        });
+        let event = |event_type, position| PointerEvent {
+            pressure: None,
+            timestamp_ms: 0,
+            pointer_id: 7,
+            event_type,
+            device: PointerDevice::Mouse,
+            position,
+            button: Some(PointerButton::Primary),
+            buttons: PointerButtons::default(),
+            modifiers: Modifiers::default(),
+        };
+
+        editor
+            .process_pen_highlight_creation_pointer_event(
+                &document,
+                event(PointerEventType::Move, Point::new(70.0, 50.0)),
+            )
+            .unwrap();
+        let Some(ElementCreationPreview::Arrow(preview)) = editor.state.creation_preview.as_ref()
+        else {
+            panic!("pen drag should expose an arrow preview");
+        };
+        assert!(preview.is_pen_highlight());
+        assert_eq!(preview.global_points().len(), 2);
+        assert_eq!(preview.stroke_width, 30.0);
+
+        editor
+            .process_pen_highlight_creation_pointer_event(
+                &document,
+                event(PointerEventType::Up, Point::new(70.0, 50.0)),
+            )
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("pen drag should queue one transaction");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        let ElementData::Arrow(pen) = &document.element(id).unwrap().data else {
+            panic!("pen highlight should use linear document geometry");
+        };
+        assert!(pen.is_pen_highlight());
+        assert_eq!(
+            pen.global_points(),
+            &[Point::new(10.0, 20.0), Point::new(70.0, 50.0)]
+        );
+        assert_eq!(pen.arrow_type, ArrowType::Straight);
+        assert_eq!(pen.start_arrowhead, None);
+        assert_eq!(pen.end_arrowhead, None);
+    }
+
+    #[test]
+    fn pen_highlight_shift_snaps_preview_and_release_to_fifteen_degree_angles() {
+        for zoom in [0.5, 1.0, 2.0] {
+            for degrees in [
+                -173.0_f64, -98.0, -52.0, -8.0, 8.0, 22.0, 38.0, 83.0, 142.0, 173.0,
+            ] {
+                let mut document = DocumentModel::new();
+                let id = document.peek_next_element_id();
+                let mut editor = Editor::new(EngineConfig::default()).unwrap();
+                editor.set_surface_size(800, 600).unwrap();
+                editor
+                    .set_camera(Camera {
+                        center: Point::new(-30.0, 40.0),
+                        zoom,
+                    })
+                    .unwrap();
+                editor.set_active_tool(ActiveTool::PenHighlight).unwrap();
+                let start = Point::new(10.0, 20.0);
+                let angle = degrees.to_radians();
+                let end = Point::new(start.x + 100.0 * angle.cos(), start.y + 100.0 * angle.sin());
+                let locked_angle = (degrees / 15.0).round() * 15.0;
+                let locked_angle = locked_angle.to_radians();
+                let projected_length = 100.0 * (angle - locked_angle).cos();
+                let expected = Point::new(
+                    start.x + projected_length * locked_angle.cos(),
+                    start.y + projected_length * locked_angle.sin(),
+                );
+                let event = |event_type, shift| PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 7,
+                    event_type,
+                    device: PointerDevice::Mouse,
+                    position: snow_draw_engine_core::canvas_to_view(
+                        end,
+                        &editor.camera(),
+                        editor.surface_size(),
+                    ),
+                    button: Some(PointerButton::Primary),
+                    buttons: PointerButtons::default(),
+                    modifiers: Modifiers {
+                        shift,
+                        ..Modifiers::default()
+                    },
+                };
+                let move_event = event(PointerEventType::Move, true);
+                let free_event = event(PointerEventType::Move, false);
+                let up_event = event(PointerEventType::Up, true);
+                editor.state.interaction =
+                    InteractionState::CreatingPenHighlight(CreateRectangleState {
+                        stroke_rendering_seed: 0,
+                        pointer_id: 7,
+                        start_canvas_position: start,
+                    });
+                editor
+                    .process_pen_highlight_creation_pointer_event(&document, move_event)
+                    .unwrap();
+                let Some(ElementCreationPreview::Arrow(preview)) =
+                    editor.state.creation_preview.as_ref()
+                else {
+                    panic!("Shift pen drag should expose a preview");
+                };
+                let points = preview.global_points();
+                assert!(point_distance(points[0], start) < 1e-9);
+                assert!(
+                    point_distance(points[1], expected) < 1e-9,
+                    "zoom={zoom}, angle={degrees}"
+                );
+
+                // Releasing Shift restores the pointer angle; pressing it only
+                // at pointer-up must still constrain the committed stroke.
+                editor
+                    .process_pen_highlight_creation_pointer_event(&document, free_event)
+                    .unwrap();
+                let Some(ElementCreationPreview::Arrow(preview)) =
+                    editor.state.creation_preview.as_ref()
+                else {
+                    panic!("unconstrained pen drag should retain a preview");
+                };
+                assert!(point_distance(preview.global_points()[1], end) < 1e-9);
+                editor
+                    .process_pen_highlight_creation_pointer_event(&document, up_event)
+                    .unwrap();
+                let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take()
+                else {
+                    panic!("Shift pen release should queue a transaction");
+                };
+                document.apply_transaction(command.transaction).unwrap();
+                let pen = document.arrow(id).unwrap();
+                assert!(pen.is_pen_highlight());
+                assert!(point_distance(pen.global_points()[1], expected) < 1e-9);
+                assert!(editor.state.creation_preview.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pen_highlight_cancel_and_degenerate_release_commit_nothing() {
+        for event_type in [PointerEventType::Cancel, PointerEventType::Up] {
+            let document = DocumentModel::new();
+            let mut editor = Editor::new(EngineConfig::default()).unwrap();
+            editor.set_active_tool(ActiveTool::PenHighlight).unwrap();
+            editor.state.interaction =
+                InteractionState::CreatingPenHighlight(CreateRectangleState {
+                    stroke_rendering_seed: 0,
+                    pointer_id: 3,
+                    start_canvas_position: Point::new(20.0, 20.0),
+                });
+            editor
+                .process_pen_highlight_creation_pointer_event(
+                    &document,
+                    PointerEvent {
+                        pressure: None,
+                        timestamp_ms: 0,
+                        pointer_id: 3,
+                        event_type,
+                        device: PointerDevice::Mouse,
+                        position: Point::new(20.0, 20.0),
+                        button: Some(PointerButton::Primary),
+                        buttons: PointerButtons::default(),
+                        modifiers: Modifiers::default(),
+                    },
+                )
+                .unwrap();
+            assert!(editor.pending_command.is_none());
+            assert!(editor.state.creation_preview.is_none());
+        }
+    }
+
+    #[test]
+    fn creating_arrow_near_bindable_surfaces_binding_highlight() {
+        let mut document = DocumentModel::new();
+        let mut insert = Transaction::new("insert bindable rectangle");
+        insert.insert_rectangle(
+            document.peek_next_element_id(),
+            ElementMeta::default(),
+            RectangleData {
+                text_element_id: None,
+                stroke_rendering_style: Default::default(),
+                stroke_rendering_seed: 0,
+                rectangle_kind: RectangleElementKind::Rectangle,
+                highlight_shape: HighlightShape::Rectangle,
+                center: Point::new(0.0, 0.0),
+                width: 100.0,
+                height: 100.0,
+                rotation: 0.0,
+                fill: ColorRgba8::default(),
+                fill_style: FillStyle::Solid,
+                stroke: ColorRgba8::default(),
+                stroke_width: 2.0,
+                stroke_style: StrokeStyle::Solid,
+                corner_radii: CornerRadii::default(),
+                opacity: 1.0,
+            },
+        );
+        document.apply_transaction(insert).unwrap();
+
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_surface_size(400, 400).unwrap();
+        editor.set_active_tool(ActiveTool::Arrow).unwrap();
+        editor.begin_arrow_creation(
+            &document,
+            1,
+            Point::new(-150.0, 0.0),
+            Point::new(50.0, 200.0),
+        );
+        editor
+            .handle_arrow_pointer_move(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 1,
+                    event_type: PointerEventType::Move,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(253.0, 203.0),
+                    button: None,
+                    buttons: PointerButtons::default(),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+
+        let highlight = editor
+            .presentation_state(&document)
+            .binding_highlight
+            .expect("binding highlight while drawing toward the bindable");
+        assert!((highlight.rect.center.x - 0.0).abs() < 1e-9);
+        assert!((highlight.rect.width - 100.0).abs() < 1e-9);
+        let mid_point = highlight.mid_point.expect("snapped midpoint");
+        assert!((mid_point.x - 50.0).abs() < 0.1 && mid_point.y.abs() < 0.1);
+
+        editor
+            .handle_arrow_pointer_move(
+                &document,
+                PointerEvent {
+                    pressure: None,
+                    timestamp_ms: 0,
+                    pointer_id: 1,
+                    event_type: PointerEventType::Move,
+                    device: PointerDevice::Mouse,
+                    position: Point::new(500.0, 500.0),
+                    button: None,
+                    buttons: PointerButtons::default(),
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+        assert!(
+            editor
+                .presentation_state(&document)
+                .binding_highlight
+                .is_none()
+        );
+    }
+    #[test]
+    fn stroke_rendering_rectangle_preview_and_commit_keep_latched_seed() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        let mut document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Shape).unwrap();
+        editor
+            .state
+            .default_rectangle_shape_style
+            .stroke_rendering_style = StrokeRenderingStyle::Cartoonist;
+        editor.state.interaction = InteractionState::CreatingRectangle(CreateRectangleState {
+            pointer_id: 9,
+            start_canvas_position: Point::new(10.0, 20.0),
+            stroke_rendering_seed: 417,
+        });
+        let event = |event_type| PointerEvent {
+            pressure: None,
+            timestamp_ms: 0,
+            pointer_id: 9,
+            event_type,
+            device: PointerDevice::Mouse,
+            position: Point::new(120.0, 90.0),
+            button: Some(PointerButton::Primary),
+            buttons: PointerButtons::default(),
+            modifiers: Modifiers::default(),
+        };
+        editor
+            .handle_rectangle_pointer_move(&document, event(PointerEventType::Move))
+            .unwrap();
+        let Some(ElementCreationPreview::Rectangle(preview)) =
+            editor.state.creation_preview.clone()
+        else {
+            panic!("rectangle preview missing");
+        };
+        assert_eq!(preview.stroke_rendering_seed, 417);
+        // A changed allocation cursor cannot change the appearance of an active gesture.
+        let unrelated_id = document.allocate_element_id();
+        let mut unrelated = Transaction::new("unrelated element");
+        let mut other = preview;
+        other.center.x += 500.0;
+        unrelated.insert_rectangle(unrelated_id, ElementMeta::default(), other);
+        document.apply_transaction(unrelated).unwrap();
+        let committed_id = document.peek_next_element_id();
+        editor
+            .handle_rectangle_pointer_up(&document, event(PointerEventType::Up))
+            .unwrap();
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("rectangle transaction missing");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(*document.rectangle(committed_id).unwrap(), preview);
+    }
+
+    #[test]
+    fn stroke_rendering_arrow_and_line_preview_commit_preserve_seed_and_style() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        for tool in [ActiveTool::Arrow, ActiveTool::Line] {
+            let mut document = DocumentModel::new();
+            let mut editor = Editor::new(EngineConfig::default()).unwrap();
+            editor.set_active_tool(tool).unwrap();
+            editor.state.default_arrow_style.stroke_rendering_style = StrokeRenderingStyle::Artist;
+            editor.state.default_line_style.stroke_rendering_style =
+                StrokeRenderingStyle::Cartoonist;
+            let points = [Point::new(20.0, 30.0), Point::new(160.0, 110.0)];
+            editor.begin_arrow_creation(&document, 1, points[0], points[0]);
+            let preview = editor
+                .arrow_preview_from_points(&document, &points, Modifiers::default(), false)
+                .unwrap()
+                .arrow;
+            let id = document.peek_next_element_id();
+            assert_ne!(preview.stroke_rendering_seed, 0);
+            assert!(
+                editor
+                    .finalize_arrow_creation_from_points(&document, &points, Modifiers::default())
+                    .unwrap()
+            );
+            let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take()
+            else {
+                panic!("arrow transaction missing");
+            };
+            document.apply_transaction(command.transaction).unwrap();
+            let committed = document.arrow(id).unwrap();
+            assert_eq!(
+                committed.stroke_rendering_seed,
+                preview.stroke_rendering_seed
+            );
+            assert_eq!(
+                committed.stroke_rendering_style,
+                preview.stroke_rendering_style
+            );
+            assert_eq!(committed.is_line(), tool == ActiveTool::Line);
+        }
+    }
+
+    #[test]
+    fn stroke_rendering_line_style_patch_refreshes_preview_before_commit() {
+        use snow_draw_engine_core::arrow::StrokeRenderingStyle;
+        let mut document = DocumentModel::new();
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        editor.set_active_tool(ActiveTool::Line).unwrap();
+        editor.state.default_line_style.stroke_style = StrokeStyle::Dotted;
+        let points = [Point::new(20.0, 30.0), Point::new(160.0, 110.0)];
+        editor.begin_arrow_creation(&document, 1, points[0], points[0]);
+        let preview = editor
+            .arrow_preview_from_points(&document, &points, Modifiers::default(), false)
+            .unwrap();
+        let original = preview.arrow.clone();
+        editor.set_arrow_creation_preview(Some(preview), Vec::new());
+
+        for rendering_style in [
+            StrokeRenderingStyle::Artist,
+            StrokeRenderingStyle::Cartoonist,
+            StrokeRenderingStyle::Architect,
+        ] {
+            let revision = editor.scene_state_revision;
+            let mut style = editor.state.default_line_style;
+            style.stroke_rendering_style = rendering_style;
+            style.stroke_style = StrokeStyle::Solid;
+            assert!(
+                editor
+                    .set_shape_style_patch(
+                        &document,
+                        ShapeStylePatch {
+                            kind: ShapeKind::Line,
+                            style,
+                            properties: crate::SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE,
+                        },
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let Some(ElementCreationPreview::Arrow(preview)) =
+                editor.state.creation_preview.as_ref()
+            else {
+                panic!("line preview missing");
+            };
+            let mut expected = original.clone();
+            expected.stroke_rendering_style = rendering_style;
+            assert_eq!(*preview, expected);
+            assert_ne!(editor.scene_state_revision, revision);
+        }
+
+        let Some(ElementCreationPreview::Arrow(preview)) = editor.state.creation_preview.clone()
+        else {
+            panic!("line preview missing");
+        };
+        let id = document.peek_next_element_id();
+        assert!(
+            editor
+                .finalize_arrow_creation_from_points(&document, &points, Modifiers::default())
+                .unwrap()
+        );
+        let Some(EditorCommand::ApplyTransaction(command)) = editor.pending_command.take() else {
+            panic!("line transaction missing");
+        };
+        document.apply_transaction(command.transaction).unwrap();
+        assert_eq!(*document.arrow(id).unwrap(), preview);
+    }
+}

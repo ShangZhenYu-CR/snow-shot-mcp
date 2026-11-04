@@ -1,0 +1,1306 @@
+use super::*;
+
+pub(crate) fn compose_overlay_items(
+    snap_config: SnapConfig,
+    presentation: &EditorPresentationState,
+    frame_view: FrameView,
+) -> Vec<OverlayDisplayItem> {
+    let mut items = Vec::new();
+    let zoom = frame_view.camera.zoom;
+
+    for element in &presentation.marquee_candidate_elements {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionCandidateFrame,
+            selection_member_frame_for_rect(element, &presentation.text_rect_ids, zoom),
+        )));
+    }
+
+    for arrow in &presentation.marquee_candidate_arrows {
+        if arrow_is_degenerate(&arrow.arrow) {
+            continue;
+        }
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionCandidateFrame,
+            selection_outline_for_arrow_bounds(arrow_bounds(&arrow.arrow), zoom),
+        )));
+    }
+
+    for highlight in &presentation.auto_filter_highlights {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionMarquee,
+            *highlight,
+        )));
+    }
+    if let Some(marquee) = presentation.marquee {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionMarquee,
+            marquee,
+        )));
+    }
+
+    if let Some(rect) = presentation.hovered_rect {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionCandidateFrame,
+            rect,
+        )));
+    }
+
+    if let Some(value) = presentation.hovered_magnifier {
+        items.push(OverlayDisplayItem::FocusConnection(
+            magnifier_source_outline(value, zoom),
+        ));
+    }
+
+    if let Some(rect) = presentation.hovered_text_rect {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::TextHoverUnderline,
+            text_hover_underline_for_rect(rect, zoom),
+        )));
+    }
+
+    if let Some(free_draw) = presentation.hovered_free_draw.as_ref()
+        && free_draw.vertices.len() >= 2
+    {
+        items.push(OverlayDisplayItem::FocusConnection(hover_free_draw_item(
+            free_draw, zoom,
+        )));
+    }
+
+    if let Some(arrow) = presentation.hovered_arrow.as_ref()
+        && !arrow_is_degenerate(arrow)
+    {
+        items.push(OverlayDisplayItem::FocusConnection(hover_arrow_item(
+            arrow, zoom,
+        )));
+    }
+
+    if let Some(pen_filter) = presentation.hovered_pen_filter.as_ref()
+        && pen_filter.global_points().len() >= 2
+    {
+        items.push(OverlayDisplayItem::PenFilterContour(hover_pen_filter_item(
+            pen_filter,
+        )));
+    }
+
+    let selected_item_count =
+        presentation.selection_elements.len() + presentation.selection_arrows.len();
+    if selection_box_visible_for_members(
+        &presentation.selection_elements,
+        &presentation.selection_arrows,
+    ) {
+        if let Some(bounds) = presentation.selection_bounds {
+            append_selection_overlay_items(
+                &mut items,
+                SelectionOverlayRequest {
+                    bounds,
+                    selected_elements: &presentation.selection_elements,
+                    text_rect_ids: &presentation.text_rect_ids,
+                    selected_item_count,
+                    selected_arrow_count: presentation.selection_arrows.len(),
+                    single_rect: presentation.selected_single_rect.as_ref(),
+                    single_text_rect: presentation.selected_single_text_rect.as_ref(),
+                    zoom,
+                },
+            );
+            if selected_item_count > 1 {
+                append_selected_arrow_candidate_overlay_items(
+                    &mut items,
+                    &presentation.selection_arrows,
+                    zoom,
+                );
+            }
+        } else {
+            append_selected_arrow_overlay_items(&mut items, &presentation.selection_arrows, zoom);
+        }
+    }
+
+    if let Some(ElementCreationPreview::Magnifier(value)) = &presentation.creation_preview {
+        items.push(OverlayDisplayItem::FocusConnection(
+            magnifier_source_outline(*value, zoom),
+        ));
+    }
+
+    for selected in &presentation.selected_magnifiers {
+        let value = selected.magnifier;
+        items.push(OverlayDisplayItem::FocusConnection(
+            magnifier_source_outline(value, zoom),
+        ));
+        let center = snow_draw_engine_editor::magnifier_move_grip(value, zoom);
+        let size = 14.0 / zoom.max(0.0001);
+        items.push(OverlayDisplayItem::Rectangle(UiRectangleDisplayItem {
+            kind: UiShapeKind::MagnifierMoveHandle,
+            center_x: center.x,
+            center_y: center.y,
+            width: size,
+            height: size,
+            rotation: 0.0,
+            fill: SNOW_SHOT_CONTROL_FILL,
+            fill_style: DisplayFillStyle::Solid,
+            stroke: SELECTION_COLOR,
+            stroke_width: 1.0 / zoom.max(0.0001),
+            corner_radii: CornerRadii::splat(3.0 / zoom.max(0.0001)),
+        }));
+    }
+
+    if presentation.selection_arrows.len() == 1 && presentation.selection_elements.is_empty() {
+        let arrow = &presentation.selection_arrows[0].arrow;
+        if arrow.is_bracket() && arrow.points.len() == 3 {
+            let points = arrow.global_points();
+            items.push(OverlayDisplayItem::FocusConnection(focus_connection_item(
+                points[0], points[2], zoom,
+            )));
+        }
+    }
+    for handle in &presentation.arrow_handles {
+        if handle.kind == ArrowHandleKind::FocusPoint
+            && let Some(anchor) = handle.anchor
+        {
+            items.push(OverlayDisplayItem::FocusConnection(focus_connection_item(
+                anchor,
+                handle.center,
+                zoom,
+            )));
+        }
+        items.push(OverlayDisplayItem::Rectangle(arrow_handle_item(
+            *handle, zoom,
+        )));
+    }
+
+    for guide in &presentation.snap_guides {
+        items.push(OverlayDisplayItem::SnapGuide(
+            SnapGuideDisplayItem::from_guide(guide, snap_config),
+        ));
+    }
+
+    if let Some(highlight) = presentation.binding_highlight.as_ref() {
+        items.push(OverlayDisplayItem::Rectangle(
+            binding_highlight_outline_item(highlight),
+        ));
+        for near_mid_point in &highlight.near_mid_points {
+            items.push(OverlayDisplayItem::Rectangle(
+                binding_near_midpoint_dot_item(*near_mid_point, zoom),
+            ));
+        }
+        if let Some(mid_point) = highlight.mid_point {
+            items.push(OverlayDisplayItem::Rectangle(
+                binding_snapped_midpoint_dot_item(mid_point, zoom),
+            ));
+        }
+    }
+
+    if let Some(point) = presentation.free_draw_endpoint {
+        items.push(OverlayDisplayItem::Rectangle(
+            binding_snapped_midpoint_dot_item(point, zoom),
+        ));
+    }
+
+    for (anchor, center) in &presentation.speech_bubble_handle_leaders {
+        items.push(OverlayDisplayItem::FocusConnection(focus_connection_item(
+            *anchor, *center, zoom,
+        )));
+    }
+    for tail in presentation
+        .speech_bubble_handles
+        .iter()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+    {
+        items.push(OverlayDisplayItem::FocusConnection(focus_connection_item(
+            tail[0].1, tail[2].1, zoom,
+        )));
+        items.push(OverlayDisplayItem::FocusConnection(focus_connection_item(
+            tail[1].1, tail[2].1, zoom,
+        )));
+    }
+    for (kind, center) in &presentation.speech_bubble_handles {
+        let size = if *kind == 0 {
+            arrow_point_handle_size(zoom)
+        } else {
+            selection_handle_size(zoom)
+        };
+        let kind = match kind {
+            0 => UiShapeKind::SpeechBubbleAddTailHandle,
+            1 => UiShapeKind::SpeechBubbleTailBaseHandle,
+            _ => UiShapeKind::SpeechBubbleTailTipHandle,
+        };
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            kind,
+            selection_handle_rect(*center, size, 0.0, true, zoom),
+        )));
+    }
+    if let Some(center) = presentation.shape_text_handle {
+        items.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::ShapeTextHandle,
+            selection_handle_rect(center, arrow_point_handle_size(zoom), 0.0, true, zoom),
+        )));
+    }
+    items.retain(|item| overlay_item_visible(item, frame_view));
+    items
+}
+
+struct SelectionOverlayRequest<'a> {
+    bounds: SelectionBounds,
+    selected_elements: &'a [SelectionRectState],
+    text_rect_ids: &'a [ElementId],
+    selected_item_count: usize,
+    selected_arrow_count: usize,
+    single_rect: Option<&'a RectangleData>,
+    single_text_rect: Option<&'a RectangleData>,
+    zoom: f64,
+}
+
+fn append_selection_overlay_items(
+    out: &mut Vec<OverlayDisplayItem>,
+    request: SelectionOverlayRequest<'_>,
+) {
+    let SelectionOverlayRequest {
+        bounds,
+        selected_elements,
+        text_rect_ids,
+        selected_item_count,
+        selected_arrow_count,
+        single_rect,
+        single_text_rect,
+        zoom,
+    } = request;
+
+    if selected_item_count > 1 {
+        for element in selected_elements {
+            out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+                UiShapeKind::SelectionCandidateFrame,
+                selection_member_frame_for_rect(element, text_rect_ids, zoom),
+            )));
+        }
+    }
+
+    let frame_padding = if selected_item_count == 1 && single_text_rect.is_some() {
+        text_selection_frame_padding(zoom)
+    } else {
+        selection_frame_padding_for_members(zoom, selected_elements.len(), selected_arrow_count)
+    };
+    let corner_handle_outset = selection_corner_handle_outset_for_members(
+        zoom,
+        selected_elements.len(),
+        selected_arrow_count,
+    );
+    let frame = selection_outline_bounds(bounds, zoom, frame_padding);
+    out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+        if selected_item_count > 1 {
+            UiShapeKind::SelectionMultiFrame
+        } else {
+            UiShapeKind::SelectionFrame
+        },
+        frame,
+    )));
+    if selected_item_count == 1
+        && let Some(text_rect) = single_text_rect
+    {
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::TextActualFrame,
+            text_actual_frame(*text_rect, zoom),
+        )));
+    }
+
+    let handle_size = selection_handle_size(zoom);
+    for corner in Corner::ALL {
+        let center =
+            selection_resize_handle_center(bounds, frame_padding, corner_handle_outset, corner);
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionResizeHandle,
+            selection_handle_rect(center, handle_size, bounds.rotation, false, zoom),
+        )));
+    }
+
+    let rotation_center = selection_rotation_handle_center(bounds, zoom, frame_padding);
+    out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+        UiShapeKind::SelectionRotationHandle,
+        selection_handle_rect(rotation_center, handle_size, 0.0, true, zoom),
+    )));
+
+    if let Some(rect) = single_rect.filter(|rect| rect.supports_corner_radius()) {
+        for corner in Corner::ALL {
+            let center = rect_local_to_canvas(
+                rect.center,
+                rect.rotation,
+                corner_radius_handle_local_point(*rect, zoom, corner),
+            );
+            out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+                UiShapeKind::SelectionCornerRadiusHandle,
+                selection_handle_rect(center, handle_size, 0.0, true, zoom),
+            )));
+        }
+    }
+}
+
+fn selection_member_frame_for_rect(
+    element: &SelectionRectState,
+    text_rect_ids: &[ElementId],
+    zoom: f64,
+) -> RectangleData {
+    if text_rect_ids.contains(&element.id) {
+        text_actual_frame(element.rect, zoom)
+    } else {
+        selection_outline_for_rect(element.rect, zoom)
+    }
+}
+
+fn append_selected_arrow_candidate_overlay_items(
+    out: &mut Vec<OverlayDisplayItem>,
+    selected_arrows: &[SelectionArrowState],
+    zoom: f64,
+) {
+    for arrow in selected_arrows {
+        if arrow_is_degenerate(&arrow.arrow) {
+            continue;
+        }
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionCandidateFrame,
+            selection_outline_for_arrow_bounds(arrow_bounds(&arrow.arrow), zoom),
+        )));
+    }
+}
+
+fn append_selected_arrow_overlay_items(
+    out: &mut Vec<OverlayDisplayItem>,
+    selected_arrows: &[SelectionArrowState],
+    zoom: f64,
+) {
+    let mut outlined_arrows = Vec::with_capacity(selected_arrows.len());
+    let mut multi_bounds: Option<DrawRect> = None;
+    for arrow in selected_arrows {
+        if arrow_is_degenerate(&arrow.arrow) {
+            continue;
+        }
+        let bounds = arrow_bounds(&arrow.arrow);
+        outlined_arrows.push(selection_outline_for_arrow_bounds(bounds, zoom));
+        multi_bounds = Some(match multi_bounds {
+            Some(current) => DrawRect::new(
+                current.min_x.min(bounds.min_x),
+                current.min_y.min(bounds.min_y),
+                current.max_x.max(bounds.max_x),
+                current.max_y.max(bounds.max_y),
+            ),
+            None => bounds,
+        });
+    }
+    if outlined_arrows.is_empty() {
+        return;
+    }
+
+    if outlined_arrows.len() == 1 {
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionFrame,
+            outlined_arrows[0],
+        )));
+        return;
+    }
+
+    for rect in &outlined_arrows {
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionCandidateFrame,
+            *rect,
+        )));
+    }
+    if let Some(multi_bounds) = multi_bounds {
+        out.push(OverlayDisplayItem::Rectangle(ui_rect_item(
+            UiShapeKind::SelectionMultiFrame,
+            selection_outline_for_arrow_bounds(multi_bounds, zoom),
+        )));
+    }
+}
+
+fn magnifier_source_outline(
+    value: snow_draw_engine_document::MagnifierData,
+    zoom: f64,
+) -> UiFocusConnectionDisplayItem {
+    use snow_draw_engine_document::HighlightShape;
+    let w = value.width / 2.0;
+    let h = value.height / 2.0;
+    let (sin, cos) = value.rotation.sin_cos();
+    let map = |x: f64, y: f64| {
+        [
+            value.source_center.x + x * cos - y * sin,
+            value.source_center.y + x * sin + y * cos,
+        ]
+    };
+    let commands = match value.shape {
+        HighlightShape::Rectangle => {
+            let radii = value.source_rect().corner_radii;
+            let tl = radii.top_left;
+            let tr = radii.top_right;
+            let br = radii.bottom_right;
+            let bl = radii.bottom_left;
+            let k = 0.5522847498307936;
+            vec![
+                ArrowPathCommand::MoveTo {
+                    point: map(-w + tl, -h),
+                },
+                ArrowPathCommand::LineTo {
+                    point: map(w - tr, -h),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(w - tr + k * tr, -h),
+                    control_2: map(w, -h + tr - k * tr),
+                    end: map(w, -h + tr),
+                },
+                ArrowPathCommand::LineTo {
+                    point: map(w, h - br),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(w, h - br + k * br),
+                    control_2: map(w - br + k * br, h),
+                    end: map(w - br, h),
+                },
+                ArrowPathCommand::LineTo {
+                    point: map(-w + bl, h),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(-w + bl - k * bl, h),
+                    control_2: map(-w, h - bl + k * bl),
+                    end: map(-w, h - bl),
+                },
+                ArrowPathCommand::LineTo {
+                    point: map(-w, -h + tl),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(-w, -h + tl - k * tl),
+                    control_2: map(-w + tl - k * tl, -h),
+                    end: map(-w + tl, -h),
+                },
+            ]
+        }
+        HighlightShape::ThoughtBubble => unreachable!("thought bubbles are not magnifiers"),
+        HighlightShape::Diamond => snow_draw_engine_document::RoundedDiamond::new(
+            value.width,
+            value.height,
+            value.source_rect().corner_radii,
+        )
+        .path_commands(value.source_center, value.rotation),
+        HighlightShape::Ellipse => {
+            let k = 0.5522847498307936;
+            vec![
+                ArrowPathCommand::MoveTo { point: map(w, 0.0) },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(w, k * h),
+                    control_2: map(k * w, h),
+                    end: map(0.0, h),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(-k * w, h),
+                    control_2: map(-w, k * h),
+                    end: map(-w, 0.0),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(-w, -k * h),
+                    control_2: map(-k * w, -h),
+                    end: map(0.0, -h),
+                },
+                ArrowPathCommand::CubicTo {
+                    control_1: map(k * w, -h),
+                    control_2: map(w, -k * h),
+                    end: map(w, 0.0),
+                },
+            ]
+        }
+    };
+    UiFocusConnectionDisplayItem {
+        path_commands: commands,
+        stroke: SELECTION_COLOR,
+        stroke_width: 1.0 / zoom.max(0.0001),
+        stroke_style: StrokeStyle::Dashed,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snow_draw_engine_core::{Camera, SurfaceSize};
+    use snow_draw_engine_document::FreeDrawData;
+    use snow_draw_engine_editor::BindingHighlightPresentation;
+
+    fn element_id(index: u32) -> ElementId {
+        ElementId {
+            index,
+            generation: 1,
+        }
+    }
+
+    fn rect(width: f64, height: f64) -> RectangleData {
+        RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Point::new(0.0, 0.0),
+            width,
+            height,
+            rotation: 0.0,
+            fill: ColorRgba8::default(),
+            fill_style: FillStyle::Solid,
+            stroke: ColorRgba8::default(),
+            stroke_width: 0.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        }
+    }
+
+    #[test]
+    fn magnifier_source_outline_uses_normalized_rounded_corners() {
+        let value = snow_draw_engine_document::MagnifierData {
+            source_center: Point::new(10.0, 20.0),
+            width: 20.0,
+            height: 10.0,
+            ..Default::default()
+        };
+        let outline = magnifier_source_outline(value, 2.0);
+        assert_eq!(outline.path_commands.len(), 9);
+        assert_eq!(
+            outline.path_commands[0],
+            ArrowPathCommand::MoveTo { point: [3.0, 15.0] }
+        );
+        let ArrowPathCommand::CubicTo { end, .. } = outline.path_commands[2] else {
+            panic!("rounded source corners must use curves");
+        };
+        assert_eq!(end, [20.0, 18.0]);
+        assert_eq!(outline.stroke_width, 0.5);
+        assert_eq!(outline.stroke_style, StrokeStyle::Dashed);
+    }
+
+    #[test]
+    fn rounded_diamond_source_outline_uses_arcs_for_each_tip() {
+        let value = snow_draw_engine_document::MagnifierData {
+            width: 100.0,
+            height: 100.0,
+            shape: snow_draw_engine_document::HighlightShape::Diamond,
+            ..Default::default()
+        };
+        let outline = magnifier_source_outline(value, 1.0);
+        assert_eq!(
+            outline
+                .path_commands
+                .iter()
+                .filter(|command| matches!(command, ArrowPathCommand::CubicTo { .. }))
+                .count(),
+            4
+        );
+        let ArrowPathCommand::MoveTo { point } = outline.path_commands[0] else {
+            panic!("start at a tangent");
+        };
+        assert!(point[0] < 0.0 && point[1] > -50.0);
+        let sharp = magnifier_source_outline(
+            snow_draw_engine_document::MagnifierData {
+                corner_radii: CornerRadii::default(),
+                ..value
+            },
+            1.0,
+        );
+        assert_eq!(sharp.path_commands.len(), 5);
+    }
+
+    fn frame_view() -> FrameView {
+        FrameView {
+            surface: SurfaceSize {
+                width: 1000,
+                height: 1000,
+            },
+            camera: Camera {
+                center: Point::new(0.0, 0.0),
+                zoom: 1.0,
+            },
+            clear_color: ColorRgba8::default(),
+        }
+    }
+
+    fn overlay_rect(items: &[OverlayDisplayItem], index: usize) -> UiRectangleDisplayItem {
+        match items[index] {
+            OverlayDisplayItem::Rectangle(item) => item,
+            _ => panic!("expected rectangle overlay item"),
+        }
+    }
+
+    #[test]
+    fn magnifier_creation_hover_and_selection_share_the_source_contour() {
+        use snow_draw_engine_document::{HighlightShape, MagnifierData};
+        use snow_draw_engine_editor::SelectionMagnifierState;
+
+        for shape in [
+            HighlightShape::Rectangle,
+            HighlightShape::Ellipse,
+            HighlightShape::Diamond,
+        ] {
+            for zoom in [0.5, 1.0, 2.0] {
+                let value = MagnifierData {
+                    source_center: Point::new(-100.0, 40.0),
+                    magnified_center: Point::new(150.0, 40.0),
+                    width: 80.0,
+                    height: 60.0,
+                    rotation: 0.4,
+                    shape,
+                    corner_radii: CornerRadii {
+                        top_left: 4.0,
+                        top_right: 8.0,
+                        bottom_right: 12.0,
+                        bottom_left: 0.0,
+                    },
+                    ..Default::default()
+                };
+                let mut view = frame_view();
+                view.camera.zoom = zoom;
+                let mut presentation = EditorPresentationState {
+                    creation_preview: Some(ElementCreationPreview::Magnifier(value)),
+                    ..Default::default()
+                };
+                let creation = compose_overlay_items(SnapConfig::default(), &presentation, view);
+                assert_eq!(creation.len(), 1);
+                let OverlayDisplayItem::FocusConnection(contour) = &creation[0] else {
+                    panic!("magnifier creation must mark its source shape");
+                };
+                assert_eq!(contour.stroke, SELECTION_COLOR);
+                assert_eq!(contour.stroke_width * zoom, 1.0);
+                assert_eq!(contour.stroke_style, StrokeStyle::Dashed);
+                assert!(contour.points.is_empty());
+                assert!(contour.arrowhead_primitives.is_empty());
+
+                presentation.creation_preview = None;
+                presentation.hovered_magnifier = Some(value);
+                let hovered = compose_overlay_items(SnapConfig::default(), &presentation, view);
+                assert_eq!(hovered, creation);
+                presentation.hovered_magnifier = None;
+                presentation
+                    .selected_magnifiers
+                    .push(SelectionMagnifierState {
+                        id: element_id(1),
+                        magnifier: value,
+                    });
+                let selected = compose_overlay_items(SnapConfig::default(), &presentation, view);
+                assert_eq!(selected[0], creation[0]);
+                presentation.selected_magnifiers.clear();
+                assert!(
+                    compose_overlay_items(SnapConfig::default(), &presentation, view).is_empty()
+                );
+
+                presentation.creation_preview = Some(ElementCreationPreview::Magnifier(value));
+                view.camera.center = Point::new(10000.0, 10000.0);
+                assert!(
+                    compose_overlay_items(SnapConfig::default(), &presentation, view).is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn magnifier_selection_uses_the_shape_frame_and_keeps_the_dashed_source_contour() {
+        use snow_draw_engine_document::MagnifierData;
+        use snow_draw_engine_editor::SelectionMagnifierState;
+
+        let value = MagnifierData {
+            width: 80.0,
+            height: 60.0,
+            ..Default::default()
+        };
+        let source = value.source_rect();
+        let mut presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: source.center,
+                width: source.width,
+                height: source.height,
+                rotation: source.rotation,
+            }),
+            selection_elements: vec![SelectionRectState {
+                id: element_id(1),
+                rect: source,
+            }],
+            selected_magnifiers: vec![SelectionMagnifierState {
+                id: element_id(1),
+                magnifier: value,
+            }],
+            ..Default::default()
+        };
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert_eq!(overlay_rect(&items, 0).kind, UiShapeKind::SelectionFrame);
+        assert_eq!(overlay_rect(&items, 0).width, 88.0);
+        assert_eq!(items.iter().filter(|item| matches!(item,
+            OverlayDisplayItem::Rectangle(rect) if rect.kind == UiShapeKind::SelectionResizeHandle
+        )).count(), 4);
+        assert_eq!(
+            items[6],
+            OverlayDisplayItem::FocusConnection(magnifier_source_outline(value, 1.0))
+        );
+        assert_eq!(
+            overlay_rect(&items, 7).kind,
+            UiShapeKind::MagnifierMoveHandle
+        );
+
+        presentation.selected_magnifiers.clear();
+        let shape_items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert_eq!(shape_items, items[..6]);
+        presentation
+            .selected_magnifiers
+            .push(SelectionMagnifierState {
+                id: element_id(1),
+                magnifier: value,
+            });
+        presentation.selection_elements.push(SelectionRectState {
+            id: element_id(2),
+            rect: source,
+        });
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert_eq!(
+            overlay_rect(&items, 2).kind,
+            UiShapeKind::SelectionMultiFrame
+        );
+    }
+
+    #[test]
+    fn marquee_text_candidate_uses_actual_text_rect() {
+        let text_id = element_id(1);
+        let mut text_rect = rect(100.0, 40.0);
+        text_rect.corner_radii = CornerRadii::splat(18.0);
+        let mut presentation = EditorPresentationState {
+            marquee_candidate_elements: vec![SelectionRectState {
+                id: text_id,
+                rect: text_rect,
+            }],
+            text_rect_ids: vec![text_id],
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let frame = overlay_rect(&items, 0);
+
+        assert_eq!(frame.kind, UiShapeKind::SelectionCandidateFrame);
+        assert_eq!(frame.width, 100.0);
+        assert_eq!(frame.height, 40.0);
+        assert_eq!(frame.corner_radii, CornerRadii::default());
+
+        presentation.text_rect_ids.clear();
+        let padded_items =
+            compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let padded_frame = overlay_rect(&padded_items, 0);
+        assert_eq!(padded_frame.width, 108.0);
+        assert_eq!(padded_frame.height, 48.0);
+    }
+
+    #[test]
+    fn marquee_rectangle_preserves_the_selection_visual_style() {
+        let marquee = RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Point::new(20.0, 30.0),
+            width: 100.0,
+            height: 40.0,
+            rotation: 0.0,
+            fill: ColorRgba8 {
+                r: 0x40,
+                g: 0x96,
+                b: 0xff,
+                a: 0x33,
+            },
+            fill_style: FillStyle::Solid,
+            stroke: ColorRgba8 {
+                r: 0x40,
+                g: 0x96,
+                b: 0xff,
+                a: 0xff,
+            },
+            stroke_width: 1.0,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        };
+        let presentation = EditorPresentationState {
+            marquee: Some(marquee),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let item = overlay_rect(&items, 0);
+
+        assert_eq!(item.kind, UiShapeKind::SelectionMarquee);
+        assert_eq!(item.center_x, marquee.center.x);
+        assert_eq!(item.center_y, marquee.center.y);
+        assert_eq!(item.width, marquee.width);
+        assert_eq!(item.height, marquee.height);
+        assert_eq!(item.fill, marquee.fill);
+        assert_eq!(item.fill_style, DisplayFillStyle::Solid);
+        assert_eq!(item.stroke, marquee.stroke);
+        assert_eq!(item.stroke_width, marquee.stroke_width);
+    }
+
+    #[test]
+    fn hovered_text_uses_an_underline_instead_of_a_selection_frame() {
+        let presentation = EditorPresentationState {
+            hovered_text_rect: Some(rect(100.0, 40.0)),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let underline = overlay_rect(&items, 0);
+
+        assert_eq!(underline.kind, UiShapeKind::TextHoverUnderline);
+        assert_eq!(underline.center_x, 0.0);
+        assert_eq!(underline.center_y, 0.0);
+        assert_eq!(underline.width, 100.0);
+        assert_eq!(underline.height, 40.0);
+        assert_eq!(underline.fill, TRANSPARENT);
+        assert_eq!(underline.stroke, SELECTION_COLOR);
+        assert_eq!(underline.stroke_width, 1.5);
+    }
+
+    #[test]
+    fn hovered_arrow_uses_a_selection_colored_path_instead_of_a_frame() {
+        let arrow = ArrowData::from_global_points(
+            &[Point::new(10.0, 20.0), Point::new(110.0, 70.0)],
+            ColorRgba8::default(),
+            4.0,
+            StrokeStyle::Dashed,
+            ArrowType::Straight,
+            None,
+            None,
+        )
+        .expect("two points should create an arrow");
+        let presentation = EditorPresentationState {
+            hovered_arrow: Some(arrow),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let OverlayDisplayItem::FocusConnection(hover) = &items[0] else {
+            panic!("hovered arrows should be represented by an overlay path");
+        };
+
+        assert_eq!(hover.points, vec![[10.0, 20.0], [110.0, 70.0]]);
+        assert_eq!(hover.stroke, SELECTION_COLOR);
+        assert_eq!(hover.stroke_width, 1.0);
+        assert_eq!(hover.stroke_style, StrokeStyle::Solid);
+    }
+
+    #[test]
+    fn hovered_free_draw_uses_a_thin_selection_colored_path() {
+        let free_draw = FreeDrawData::from_global_vertices(
+            &[
+                Point::new(10.0, 20.0),
+                Point::new(60.0, 80.0),
+                Point::new(110.0, 30.0),
+            ],
+            vec![
+                snow_draw_engine_core::PathSegmentMode::Curve,
+                snow_draw_engine_core::PathSegmentMode::Curve,
+            ],
+            false,
+            snow_draw_engine_document::FreeDrawStyle {
+                brush_mode: Default::default(),
+                stroke: ColorRgba8::default(),
+                stroke_width: 12.0,
+                stroke_style: StrokeStyle::Dashed,
+                fill: ColorRgba8::default(),
+                fill_style: FillStyle::Solid,
+                opacity: 1.0,
+            },
+        )
+        .expect("valid points should create a free draw");
+        let expected_commands = free_draw.path_commands();
+        let presentation = EditorPresentationState {
+            hovered_free_draw: Some(free_draw),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert_eq!(items.len(), 1);
+        let OverlayDisplayItem::FocusConnection(hover) = &items[0] else {
+            panic!("hovered free draw should be represented by an overlay path");
+        };
+
+        assert_eq!(
+            hover.points,
+            vec![[10.0, 20.0], [60.0, 80.0], [110.0, 30.0]]
+        );
+        assert_eq!(hover.path_commands, expected_commands);
+        assert_eq!(hover.arrow_type, ArrowType::Curve);
+        assert_eq!(hover.stroke, SELECTION_COLOR);
+        assert_eq!(hover.stroke_width, 1.0);
+        assert_eq!(hover.stroke_style, StrokeStyle::Solid);
+        assert_eq!(hover.start_arrowhead, None);
+        assert_eq!(hover.end_arrowhead, None);
+    }
+
+    #[test]
+    fn hovered_pen_filter_uses_a_selection_colored_contour_instead_of_a_frame() {
+        let pen_filter = snow_draw_engine_document::PenFilterData {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            rotation: 0.0,
+            points: vec![[0.0, 0.0], [0.4, 0.8], [1.0, 0.25]],
+            filter_type: snow_draw_engine_document::CanvasFilterType::Mosaic,
+            strength: 0.5,
+            stroke_width: 30.0,
+            opacity: 1.0,
+        };
+        let presentation = EditorPresentationState {
+            hovered_pen_filter: Some(pen_filter),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let OverlayDisplayItem::PenFilterContour(hover) = &items[0] else {
+            panic!("hovered pen filters should be represented by an overlay contour");
+        };
+
+        assert_eq!(
+            hover.points,
+            vec![[10.0, 20.0], [50.0, 60.0], [110.0, 32.5]]
+        );
+        assert_eq!(hover.stroke, SELECTION_COLOR);
+        assert_eq!(hover.stroke_width, 30.0);
+        assert_eq!(hover.stroke_style, StrokeStyle::Solid);
+        assert_eq!(
+            hover.path_commands,
+            vec![
+                ArrowPathCommand::MoveTo {
+                    point: [10.0, 20.0]
+                },
+                ArrowPathCommand::LineTo {
+                    point: [50.0, 60.0]
+                },
+                ArrowPathCommand::LineTo {
+                    point: [110.0, 32.5]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_pen_filter_keeps_its_selection_box_without_a_hover_contour() {
+        let mut selection_rect = rect(100.0, 50.0);
+        selection_rect.center = Point::new(60.0, 45.0);
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: selection_rect.center,
+                width: selection_rect.width,
+                height: selection_rect.height,
+                rotation: selection_rect.rotation,
+            }),
+            selection_elements: vec![SelectionRectState {
+                id: element_id(1),
+                rect: selection_rect,
+            }],
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, OverlayDisplayItem::PenFilterContour(_)))
+        );
+        assert!(items.iter().any(|item| matches!(
+            item,
+            OverlayDisplayItem::Rectangle(rect)
+                if rect.kind == UiShapeKind::SelectionFrame
+        )));
+    }
+
+    #[test]
+    fn two_point_selected_arrow_hides_selection_box_and_keeps_endpoint_handles() {
+        let arrow = ArrowData::from_global_points(
+            &[Point::new(-40.0, -20.0), Point::new(40.0, 20.0)],
+            ColorRgba8::default(),
+            2.0,
+            StrokeStyle::Solid,
+            ArrowType::Straight,
+            None,
+            None,
+        )
+        .expect("two points should create an arrow");
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: Point::new(0.0, 0.0),
+                width: 80.0,
+                height: 40.0,
+                rotation: 0.0,
+            }),
+            selection_arrows: vec![SelectionArrowState {
+                id: element_id(1),
+                arrow,
+            }],
+            arrow_handles: vec![
+                ArrowHandleState {
+                    kind: ArrowHandleKind::Endpoint,
+                    center: Point::new(-40.0, -20.0),
+                    anchor: None,
+                    fixed_segment: false,
+                },
+                ArrowHandleState {
+                    kind: ArrowHandleKind::Endpoint,
+                    center: Point::new(40.0, 20.0),
+                    anchor: None,
+                    fixed_segment: false,
+                },
+            ],
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert!(!items.iter().any(|item| matches!(
+            item,
+            OverlayDisplayItem::Rectangle(rect)
+                if matches!(
+                    rect.kind,
+                    UiShapeKind::SelectionFrame
+                        | UiShapeKind::SelectionResizeHandle
+                        | UiShapeKind::SelectionRotationHandle
+                )
+        )));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    OverlayDisplayItem::Rectangle(rect)
+                        if rect.kind == UiShapeKind::ArrowEndpointHandle
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn multi_point_selected_arrow_keeps_selection_box() {
+        let arrow = ArrowData::from_global_points(
+            &[
+                Point::new(-40.0, -20.0),
+                Point::new(0.0, 60.0),
+                Point::new(40.0, 20.0),
+            ],
+            ColorRgba8::default(),
+            2.0,
+            StrokeStyle::Solid,
+            ArrowType::Straight,
+            None,
+            None,
+        )
+        .expect("three points should create an arrow");
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: Point::new(0.0, 20.0),
+                width: 80.0,
+                height: 80.0,
+                rotation: 0.0,
+            }),
+            selection_arrows: vec![SelectionArrowState {
+                id: element_id(1),
+                arrow,
+            }],
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert!(items.iter().any(|item| matches!(
+            item,
+            OverlayDisplayItem::Rectangle(rect)
+                if rect.kind == UiShapeKind::SelectionFrame
+        )));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    OverlayDisplayItem::Rectangle(rect)
+                        if rect.kind == UiShapeKind::SelectionResizeHandle
+                ))
+                .count(),
+            4
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    OverlayDisplayItem::Rectangle(rect)
+                        if rect.kind == UiShapeKind::SelectionRotationHandle
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_rectangle_highlight_hides_corner_radius_handles() {
+        let highlight =
+            rect(100.0, 40.0).into_highlight(snow_draw_engine_document::HighlightShape::Rectangle);
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: highlight.center,
+                width: highlight.width,
+                height: highlight.height,
+                rotation: highlight.rotation,
+            }),
+            selection_elements: vec![SelectionRectState {
+                id: element_id(1),
+                rect: highlight,
+            }],
+            selected_single_rect: Some(highlight),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+
+        assert!(!items.iter().any(|item| matches!(
+            item,
+            OverlayDisplayItem::Rectangle(rect)
+                if rect.kind == UiShapeKind::SelectionCornerRadiusHandle
+        )));
+    }
+
+    #[test]
+    fn selected_spotlight_shows_corner_radius_handles() {
+        let spotlight = rect(100.0, 40.0).into_spotlight();
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: spotlight.center,
+                width: spotlight.width,
+                height: spotlight.height,
+                rotation: spotlight.rotation,
+            }),
+            selection_elements: vec![SelectionRectState {
+                id: element_id(1),
+                rect: spotlight,
+            }],
+            selected_single_rect: Some(spotlight),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+
+        assert!(items.iter().any(|item| matches!(
+            item,
+            OverlayDisplayItem::Rectangle(rect)
+                if rect.kind == UiShapeKind::SelectionCornerRadiusHandle
+        )));
+    }
+
+    #[test]
+    fn selected_ellipse_and_diamond_hide_corner_radius_handles() {
+        for shape in [
+            snow_draw_engine_document::HighlightShape::Ellipse,
+            snow_draw_engine_document::HighlightShape::Diamond,
+        ] {
+            let mut selected_rect = rect(100.0, 40.0);
+            selected_rect.highlight_shape = shape;
+            let presentation = EditorPresentationState {
+                selection_bounds: Some(SelectionBounds {
+                    center: selected_rect.center,
+                    width: selected_rect.width,
+                    height: selected_rect.height,
+                    rotation: selected_rect.rotation,
+                }),
+                selection_elements: vec![SelectionRectState {
+                    id: element_id(1),
+                    rect: selected_rect,
+                }],
+                selected_single_rect: Some(selected_rect),
+                ..EditorPresentationState::default()
+            };
+
+            let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+
+            assert!(!items.iter().any(|item| matches!(
+                item,
+                OverlayDisplayItem::Rectangle(rect)
+                    if rect.kind == UiShapeKind::SelectionCornerRadiusHandle
+            )));
+        }
+    }
+
+    #[test]
+    fn multi_selection_text_member_uses_actual_rect() {
+        let text_id = element_id(1);
+        let rect_id = element_id(2);
+        let presentation = EditorPresentationState {
+            selection_bounds: Some(SelectionBounds {
+                center: Point::new(0.0, 0.0),
+                width: 100.0,
+                height: 40.0,
+                rotation: 0.0,
+            }),
+            selection_elements: vec![
+                SelectionRectState {
+                    id: text_id,
+                    rect: rect(100.0, 40.0),
+                },
+                SelectionRectState {
+                    id: rect_id,
+                    rect: rect(80.0, 20.0),
+                },
+            ],
+            text_rect_ids: vec![text_id],
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        let text_frame = overlay_rect(&items, 0);
+        let rect_frame = overlay_rect(&items, 1);
+
+        assert_eq!(text_frame.kind, UiShapeKind::SelectionCandidateFrame);
+        assert_eq!(text_frame.width, 100.0);
+        assert_eq!(text_frame.height, 40.0);
+        assert_eq!(rect_frame.kind, UiShapeKind::SelectionCandidateFrame);
+        assert_eq!(rect_frame.width, 88.0);
+        assert_eq!(rect_frame.height, 28.0);
+    }
+
+    #[test]
+    fn binding_highlight_composes_outline_and_midpoint_dot() {
+        let mut highlighted = rect(100.0, 80.0);
+        highlighted.center = Point::new(10.0, 20.0);
+        highlighted.stroke_width = 2.0;
+        let presentation = EditorPresentationState {
+            binding_highlight: Some(BindingHighlightPresentation {
+                rect: highlighted,
+                stroke_width: 2.0,
+                mid_point: Some(Point::new(60.0, 20.0)),
+                near_mid_points: vec![Point::new(-40.0, 20.0), Point::new(10.0, -20.0)],
+            }),
+            ..EditorPresentationState::default()
+        };
+
+        let items = compose_overlay_items(SnapConfig::default(), &presentation, frame_view());
+        assert_eq!(items.len(), 4);
+
+        let outline = overlay_rect(&items, 0);
+        assert_eq!(outline.kind, UiShapeKind::BindingHighlight);
+        assert_eq!(outline.center_x, 10.0);
+        assert_eq!(outline.center_y, 20.0);
+        assert_eq!(outline.width, 100.0);
+        assert_eq!(outline.height, 80.0);
+        assert_eq!(outline.stroke_width, 2.0);
+
+        let first_near = overlay_rect(&items, 1);
+        assert_eq!(first_near.center_x, -40.0);
+        assert_eq!(first_near.center_y, 20.0);
+        assert_eq!(first_near.fill, BINDING_NEAR_MIDPOINT_COLOR);
+
+        let second_near = overlay_rect(&items, 2);
+        assert_eq!(second_near.center_x, 10.0);
+        assert_eq!(second_near.center_y, -20.0);
+        assert_eq!(second_near.fill, BINDING_NEAR_MIDPOINT_COLOR);
+
+        let dot = overlay_rect(&items, 3);
+        assert_eq!(dot.kind, UiShapeKind::BindingHighlight);
+        assert_eq!(dot.center_x, 60.0);
+        assert_eq!(dot.center_y, 20.0);
+        assert_eq!(dot.width, 8.0);
+        assert_eq!(dot.height, 8.0);
+        assert_eq!(dot.fill, BINDING_HIGHLIGHT_COLOR);
+    }
+}

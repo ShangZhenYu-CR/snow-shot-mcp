@@ -1,0 +1,107 @@
+[workspace]
+members = [
+    "crates/snow-memory",
+    "crates/snow-webcam",
+    "crates/snow-media",
+    "crates/snow-macos",
+    "crates/visual-region-detector",
+    "crates/snow-visual-region-detector-c",
+    "crates/snow-core",
+    "crates/snow-d3d11",
+    "crates/snow-diagnostics",
+    "crates/snow-diagnostics-test",
+    "crates/snow-cursor",
+    "crates/snow-pipeline",
+    "crates/snow-capture",
+    "crates/snow-capture-c",
+    "crates/snow-recording-c",
+    "crates/snow-ui-selector",
+    "crates/snow-ui-selector-c",
+    "crates/snow-selected-text",
+    "crates/snow-selected-text-c",
+    "crates/snow-language-detection-c",
+    "crates/snow-stitch-images",
+    "crates/snow-stitch-images-c",
+    "crates/snow-ocr-process",
+    "crates/snow-audio-recorder",
+    "crates/snow-recording-model",
+    "crates/snow-recording-runtime",
+    "crates/snow-recording-effects",
+    "crates/snow-recording-effects-c",
+    "crates/snow-recording-export",
+    "crates/snow-screen-recorder",
+]
+# Keep the independent OCR submodule on its own nightly toolchain and lockfile.
+exclude = ["crates/simd-paddle-ocr-rs"]
+resolver = "3"
+
+[workspace.package]
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+bincode = "1.3.3"
+crossbeam-channel = "0.5"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
+half = "2.7.1"
+image = { version = "0.25.9", default-features = false, features = ["png"] }
+png = "0.18.1"
+rayon = "1.11.0"
+rustc-hash = "2.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+smallvec = "1"
+tempfile = "3"
+thiserror = "2.0.17"
+uuid = { version = "1.18.1", features = ["v4"] }
+windows = "0.62.2"
+windows-core = "0.62.2"
+num_cpus = "1.17.0"
+whatlang = "0.18.0"
+rstar = "0.12.2"
+zstd = "0.13.3"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+debug = 0
+incremental = false
+overflow-checks = false
+
+# Keep host proc-macro symbol tables intact. LLVM's debug-only Mach-O stripping
+# can produce an unaligned LINKEDIT pool rejected by the macOS 27 loader.
+# These host tools are not part of the shipped static libraries.
+[profile.release.build-override]
+strip = "none"
+
+[profile.dev.package.snow-stitch-images]
+opt-level = 3
+
+[profile.dev.package.snow-capture]
+opt-level = 3
+
+[profile.dev.package.snow-cursor]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.rayon]
+opt-level = 3
+
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 3
+debug = true
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+codegen-units = 16
+lto = "thin"
+incremental = true
+
+[profile.bench]
+debug = true

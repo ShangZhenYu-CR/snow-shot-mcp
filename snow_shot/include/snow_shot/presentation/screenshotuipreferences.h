@@ -1,0 +1,119 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTUIPREFERENCES_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTUIPREFERENCES_H
+
+#include "snow_shot/presentation/screenshotselectiondisplayunit.h"
+#include "snow_shot/selectiontransitionanimation.h"
+
+#include <QColor>
+#include <QString>
+#include <QtGlobal>
+
+#include <algorithm>
+
+enum class ScreenshotColorPickerDisplayMode {
+    HideOutsideSelection,
+    AlwaysShow,
+    AlwaysHide,
+};
+
+struct ScreenshotUiPreferences {
+    ScreenshotSelectionDisplayUnit selectionDisplayUnit = kDefaultScreenshotSelectionDisplayUnit;
+    snow_shot::SelectionTransitionAnimation selectionTransitionAnimation =
+        snow_shot::SelectionTransitionAnimation::Soft;
+    ScreenshotColorPickerDisplayMode colorPickerDisplayMode =
+        ScreenshotColorPickerDisplayMode::HideOutsideSelection;
+    QColor selectionBorderColor = QColor(0x40, 0x96, 0xff);
+    QColor selectionMaskColor = QColor(0, 0, 0, 128);
+    qreal shortcutHintOpacity = 1.0;
+    bool screenshotAreaTypeHintEnabled = true;
+    bool showGuidesByDefault = false;
+    QColor cursorGuideLineColor = QColor(0, 0, 0);
+    QColor selectionCenterGuideLineColor = QColor(0x40, 0x96, 0xff);
+    QColor monitorCenterGuideLineColor = QColor(255, 0, 0);
+    QColor colorPickerCenterGuideLineColor = QColor(0, 0, 0, 0);
+    [[nodiscard]] bool operator==(const ScreenshotUiPreferences&) const = default;
+
+    [[nodiscard]] ScreenshotUiPreferences normalized() const {
+        ScreenshotUiPreferences result = *this;
+        result.selectionTransitionAnimation =
+            snow_shot::normalizedSelectionTransitionAnimation(result.selectionTransitionAnimation);
+        if (!result.selectionBorderColor.isValid()) {
+            result.selectionBorderColor = QColor(0x40, 0x96, 0xff);
+        }
+        if (!result.selectionMaskColor.isValid()) {
+            result.selectionMaskColor = QColor(0, 0, 0, 128);
+        }
+        result.shortcutHintOpacity = std::clamp<qreal>(result.shortcutHintOpacity, 0.0, 1.0);
+        if (!result.cursorGuideLineColor.isValid()) {
+            result.cursorGuideLineColor = QColor(0, 0, 0);
+        }
+        if (!result.selectionCenterGuideLineColor.isValid()) {
+            result.selectionCenterGuideLineColor = QColor(0x40, 0x96, 0xff);
+        }
+        if (!result.monitorCenterGuideLineColor.isValid()) {
+            result.monitorCenterGuideLineColor = QColor(255, 0, 0);
+        }
+        if (!result.colorPickerCenterGuideLineColor.isValid()) {
+            result.colorPickerCenterGuideLineColor = QColor(0, 0, 0, 0);
+        }
+        return result;
+    }
+};
+
+class ScreenshotGuideVisibilityState {
+  public:
+    void beginSession(const ScreenshotUiPreferences& preferences) {
+        m_visible = preferences.showGuidesByDefault;
+    }
+
+    void toggle() {
+        m_visible = !m_visible;
+    }
+
+    [[nodiscard]] bool visible() const {
+        return m_visible;
+    }
+
+  private:
+    bool m_visible = false;
+};
+
+[[nodiscard]] inline ScreenshotColorPickerDisplayMode
+screenshotColorPickerDisplayModeFromString(const QString& value) {
+    if (value == QStringLiteral("always_show")) {
+        return ScreenshotColorPickerDisplayMode::AlwaysShow;
+    }
+    if (value == QStringLiteral("always_hide")) {
+        return ScreenshotColorPickerDisplayMode::AlwaysHide;
+    }
+    return ScreenshotColorPickerDisplayMode::HideOutsideSelection;
+}
+
+struct ScreenshotColorPickerVisibilityState {
+    bool intelligentSelecting = false;
+    bool manualSelecting = false;
+    bool dragging = false;
+    bool hasSelection = false;
+    bool pointInsideSelection = false;
+};
+
+[[nodiscard]] inline bool
+screenshotColorPickerVisible(ScreenshotColorPickerDisplayMode mode,
+                             const ScreenshotColorPickerVisibilityState& state) {
+    if (mode == ScreenshotColorPickerDisplayMode::AlwaysHide) {
+        return false;
+    }
+    if (state.manualSelecting && state.dragging) {
+        return true;
+    }
+    if (!state.hasSelection) {
+        return state.intelligentSelecting || state.manualSelecting;
+    }
+    if (mode == ScreenshotColorPickerDisplayMode::HideOutsideSelection &&
+        !state.intelligentSelecting && !state.pointInsideSelection) {
+        return false;
+    }
+    return true;
+}
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTUIPREFERENCES_H

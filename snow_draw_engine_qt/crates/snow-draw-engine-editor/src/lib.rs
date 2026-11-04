@@ -1,0 +1,771 @@
+mod active_text;
+mod api;
+mod arrow_ops;
+mod arrow_text;
+mod auto_filter_workflow;
+pub use arrow_text::ArrowTextLayoutRequest;
+mod creation_workflow;
+pub use creation_workflow::SerialNumberLabelLayoutRequest;
+mod speech_bubble;
+pub use speech_bubble::*;
+mod shape_text;
+pub use shape_text::ShapeBoundTextPreview;
+mod magnifier;
+pub use magnifier::*;
+mod angle;
+mod bracket;
+pub use bracket::*;
+mod defaults;
+pub use angle::*;
+mod distance;
+pub use distance::*;
+mod document_ops;
+mod draw_template;
+mod edit_workflow;
+mod eraser_workflow;
+mod free_draw_pressure;
+mod free_draw_workflow;
+mod geometry;
+mod input;
+mod pen_filter_workflow;
+mod polyline_simplification;
+mod presentation;
+mod selection;
+mod session;
+mod snapping;
+mod state;
+mod style;
+mod text;
+
+pub use api::{
+    ActiveTextDraftPresentation, ActiveTextDraftTarget, ActiveTool, ArrowHandleKind,
+    ArrowHandleState, ArrowStyle, BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH,
+    BindingHighlightPresentation, BrushEraserStyle, EditorPresentationState, EditorViewState,
+    EditorViewportState, ElementCreationPreview, FILTER_STYLE_MIXED_CONTAINS_BOTH_FILTERS,
+    FILTER_STYLE_PROPERTY_ALL, FILTER_STYLE_PROPERTY_OPACITY, FILTER_STYLE_PROPERTY_STRENGTH,
+    FILTER_STYLE_PROPERTY_STROKE_WIDTH, FILTER_STYLE_PROPERTY_TYPE, FilterStyle, FreeDrawPreview,
+    HistoryState, MIN_BINDING_HIGHLIGHT_ZOOM, PenFilterPreview, RectangleShapeStyle,
+    SERIAL_NUMBER_STYLE_MIXED_COLOR, SERIAL_NUMBER_STYLE_MIXED_FILL,
+    SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE, SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY,
+    SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE, SERIAL_NUMBER_STYLE_MIXED_NUMBER,
+    SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE, SERIAL_NUMBER_STYLE_MIXED_OPACITY,
+    SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE, SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE,
+    SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH, SERIAL_NUMBER_STYLE_MIXED_TYPE,
+    SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR, SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH,
+    SHAPE_STYLE_MIXED_ARROW_RATIO, SHAPE_STYLE_MIXED_ARROW_SHAFT_TYPE,
+    SHAPE_STYLE_MIXED_ARROW_TYPE, SHAPE_STYLE_MIXED_CORNER_RADII, SHAPE_STYLE_MIXED_END_ARROWHEAD,
+    SHAPE_STYLE_MIXED_FILL, SHAPE_STYLE_MIXED_FILL_STYLE, SHAPE_STYLE_MIXED_HIGHLIGHT_SHAPE,
+    SHAPE_STYLE_MIXED_OPACITY, SHAPE_STYLE_MIXED_SHAPE, SHAPE_STYLE_MIXED_START_ARROWHEAD,
+    SHAPE_STYLE_MIXED_STROKE, SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE,
+    SHAPE_STYLE_MIXED_STROKE_STYLE, SHAPE_STYLE_MIXED_STROKE_WIDTH, SHAPE_STYLE_PROPERTY_ALL,
+    SHAPE_STYLE_PROPERTY_ARROW, SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR,
+    SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH, SHAPE_STYLE_PROPERTY_ARROW_RATIO,
+    SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE, SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+    SHAPE_STYLE_PROPERTY_CORNER_RADII, SHAPE_STYLE_PROPERTY_END_ARROWHEAD,
+    SHAPE_STYLE_PROPERTY_FILL, SHAPE_STYLE_PROPERTY_FILL_STYLE, SHAPE_STYLE_PROPERTY_FREE_DRAW,
+    SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE, SHAPE_STYLE_PROPERTY_LINE, SHAPE_STYLE_PROPERTY_OPACITY,
+    SHAPE_STYLE_PROPERTY_RECTANGLE, SHAPE_STYLE_PROPERTY_SHAPE,
+    SHAPE_STYLE_PROPERTY_START_ARROWHEAD, SHAPE_STYLE_PROPERTY_STROKE,
+    SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE, SHAPE_STYLE_PROPERTY_STROKE_STYLE,
+    SHAPE_STYLE_PROPERTY_STROKE_WIDTH, SelectionArrowState, SelectionBounds, SelectionRectState,
+    SerialNumberToolbarState, ShapeKind, ShapeStyle, ShapeStylePatch, SnapGuideTargets,
+    StyleToolbarSource, StyleToolbarState, TEXT_STYLE_ALL_PROPERTIES, TEXT_STYLE_MIXED_BOLD,
+    TEXT_STYLE_MIXED_COLOR, TEXT_STYLE_MIXED_CORNER_RADII, TEXT_STYLE_MIXED_FILL,
+    TEXT_STYLE_MIXED_FILL_STYLE, TEXT_STYLE_MIXED_FONT_FAMILY, TEXT_STYLE_MIXED_FONT_SIZE,
+    TEXT_STYLE_MIXED_HORIZONTAL_ALIGN, TEXT_STYLE_MIXED_ITALIC, TEXT_STYLE_MIXED_OPACITY,
+    TEXT_STYLE_MIXED_STROKE, TEXT_STYLE_MIXED_STROKE_WIDTH, TEXT_STYLE_MIXED_VERTICAL_ALIGN,
+    selection_box_visible_for_members,
+};
+pub use api::{SHAPE_STYLE_MIXED_BRUSH_MODE, SHAPE_STYLE_PROPERTY_BRUSH_MODE};
+pub use defaults::{EditorStyleDefaults, editor_style_defaults};
+pub use draw_template::{DRAW_TEMPLATE_SCHEMA_VERSION, DrawTemplate};
+pub use session::{
+    EditorSession, EditorSessionSnapshot, PersistedEditorSession, validate_editor_style_defaults,
+};
+pub use state::DocumentSyncSnapshot;
+pub use text::{
+    SerialNumberStyle, TextCommitTarget, TextDraftCommit, TextLayoutOverride, TextPreviewPaint,
+    TextResizeMeasurementRequest, TextStyle,
+};
+
+pub(crate) use arrow_ops::*;
+use document_ops::*;
+pub(crate) use geometry::*;
+use snow_draw_engine_core::{
+    Camera, DrawRect, EngineConfig, ErrorCode, GRID_SNAP_SERVICE, GridConfig, OBJECT_SNAP_SERVICE,
+    ObjectSnapRectRequest, ObjectSnapResult, Point, SnapAxisAnchor, SnapConfig, SnapGuide,
+    SnapGuideAxis, SnappingMode, SurfaceSize, ZoomFocus, normalize_rotation,
+    resolve_effective_snapping_mode, validate_camera, validate_config, view_to_canvas,
+};
+use snow_draw_engine_document::{
+    ArrowData, DEFAULT_ARROW_MAX_COORDINATE, ElementId, ElementKind, PenFilterData, RectangleData,
+    RectangleElementKind, SerialNumberData, TextData, Transaction, arrow_bounds,
+    arrow_length as document_arrow_length, validate_arrow, validate_filter, validate_rectangle,
+    validate_serial_number, validate_text, validate_text_layout_size,
+};
+use snow_draw_engine_interaction::{
+    CursorCommand, CursorStyle, InputEvent, InteractionOutput, KeyCode, KeyEvent, KeyEventType,
+    Modifiers, PointerButton, PointerCaptureCommand, PointerEvent, PointerEventType,
+    WheelDeltaKind, WheelEvent,
+};
+use snow_draw_engine_model::{BindableElementState, DocumentModel};
+use state::*;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SerialNumberTextOperation {
+    pub command: Option<EditorCommand>,
+    pub single_text_id: Option<ElementId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApplyTransactionCommand {
+    pub transaction: Transaction,
+    pub history_undo_snapshot: Option<DocumentSyncSnapshot>,
+    pub created_selection_target: Option<ElementId>,
+}
+
+impl ApplyTransactionCommand {
+    fn new(transaction: Transaction) -> Self {
+        Self {
+            transaction,
+            history_undo_snapshot: None,
+            created_selection_target: None,
+        }
+    }
+
+    fn selecting_created(mut self, id: ElementId) -> Self {
+        self.created_selection_target = Some(id);
+        self
+    }
+
+    fn with_history_undo_snapshot(
+        transaction: Transaction,
+        history_undo_snapshot: DocumentSyncSnapshot,
+    ) -> Self {
+        Self {
+            transaction,
+            history_undo_snapshot: Some(history_undo_snapshot),
+            created_selection_target: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditorCommand {
+    ApplyTransaction(ApplyTransactionCommand),
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorUpdate {
+    pub interaction: InteractionOutput,
+    pub command: Option<EditorCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Editor {
+    arrow_text_cache: std::cell::RefCell<arrow_text::ArrowTextCache>,
+    state: EditorState,
+    view: std::cell::Cell<EditorViewportState>,
+    config: EngineConfig,
+    quick_selection_disabled_tools: u64,
+    automatically_select_newly_created_elements: bool,
+    automatic_selection_excluded_tools: u64,
+    scene_state_revision: u64,
+    overlay_state_revision: u64,
+    pending_command: Option<EditorCommand>,
+    magnifier_wheel: Option<magnifier::MagnifierWheelAccumulator>,
+    speech_bubble_tail_drag: Option<speech_bubble::SpeechBubbleTailDrag>,
+    speech_bubble_text_cache: std::cell::RefCell<speech_bubble::SpeechBubbleTextCache>,
+    speech_bubble_layouts:
+        std::collections::HashMap<ElementId, speech_bubble::SpeechBubbleTextMeasurement>,
+    speech_bubble_draft_geometry: Option<(ElementId, snow_draw_engine_document::SpeechBubbleData)>,
+    captured_pointer: Option<u32>,
+    pending_capture_release: bool,
+}
+
+impl Editor {
+    pub fn new(config: EngineConfig) -> Result<Self, ErrorCode> {
+        validate_config(&config)?;
+        Ok(Self {
+            arrow_text_cache: Default::default(),
+            state: EditorState {
+                active_tool: ActiveTool::Shape,
+                ..EditorState::default()
+            },
+            view: Default::default(),
+            config,
+            quick_selection_disabled_tools: 0,
+            automatically_select_newly_created_elements: false,
+            automatic_selection_excluded_tools: ActiveTool::FreeDraw.policy_bit()
+                | ActiveTool::PenFilter.policy_bit()
+                | ActiveTool::Text.policy_bit()
+                | ActiveTool::SpeechBubble.policy_bit(),
+            scene_state_revision: 0,
+            overlay_state_revision: 0,
+            pending_command: None,
+            magnifier_wheel: None,
+            speech_bubble_tail_drag: None,
+            speech_bubble_text_cache: Default::default(),
+            speech_bubble_layouts: Default::default(),
+            speech_bubble_draft_geometry: None,
+            captured_pointer: None,
+            pending_capture_release: false,
+        })
+    }
+
+    fn queue_command(&mut self, command: EditorCommand) {
+        self.pending_command = Some(command);
+    }
+
+    pub fn snap_config(&self) -> SnapConfig {
+        self.config.snap
+    }
+
+    pub fn set_snap_config(&mut self, snap: SnapConfig) -> Result<(), ErrorCode> {
+        let mut next = self.config;
+        next.snap = snap;
+        validate_config(&next)?;
+        if self.config.snap == snap {
+            return Ok(());
+        }
+
+        self.config = next;
+        if !self.config.snap.show_guides && !self.state.ui.snap_guides.is_empty() {
+            self.state.ui.snap_guides.clear();
+        }
+        self.bump_overlay_state_revision();
+        Ok(())
+    }
+
+    pub fn grid_config(&self) -> GridConfig {
+        self.config.grid
+    }
+
+    pub fn set_grid_config(&mut self, grid: GridConfig) -> Result<(), ErrorCode> {
+        let mut next = self.config;
+        next.grid = grid;
+        validate_config(&next)?;
+        if self.config.grid == grid {
+            return Ok(());
+        }
+
+        self.config = next;
+        self.bump_overlay_state_revision();
+        Ok(())
+    }
+
+    pub fn surface_size(&self) -> SurfaceSize {
+        self.view.get().surface
+    }
+
+    pub fn camera(&self) -> Camera {
+        self.view.get().camera
+    }
+
+    fn with_view<T>(&self, view: &EditorViewportState, query: impl FnOnce(&Self) -> T) -> T {
+        struct RestoreView<'a> {
+            cell: &'a std::cell::Cell<EditorViewportState>,
+            previous: EditorViewportState,
+        }
+        impl Drop for RestoreView<'_> {
+            fn drop(&mut self) {
+                self.cell.set(self.previous);
+            }
+        }
+        let _restore = RestoreView {
+            cell: &self.view,
+            previous: self.view.replace(*view),
+        };
+        query(self)
+    }
+
+    pub fn active_tool(&self) -> ActiveTool {
+        self.state.active_tool
+    }
+
+    pub fn automatically_select_newly_created_elements(&self) -> bool {
+        self.automatically_select_newly_created_elements
+    }
+
+    pub fn set_automatically_select_newly_created_elements(&mut self, enabled: bool) {
+        self.automatically_select_newly_created_elements = enabled;
+    }
+
+    pub fn automatic_selection_excluded_tools(&self) -> u64 {
+        self.automatic_selection_excluded_tools
+    }
+
+    pub fn set_automatic_selection_excluded_tools(&mut self, tools: u64) {
+        self.automatic_selection_excluded_tools = tools;
+    }
+
+    pub(crate) fn select_created_element(&mut self, document: &DocumentModel, id: ElementId) {
+        if !self.automatically_select_newly_created_elements()
+            || (self.automatic_selection_excluded_tools & self.active_tool().policy_bit()) != 0
+        {
+            return;
+        }
+        let Ok(element) = document.element(id) else {
+            return;
+        };
+        if element.data.is_background_restore()
+            || element.data.kind() == snow_draw_engine_document::ElementKind::AutoFilter
+        {
+            return;
+        }
+        self.set_selection_state_with_document(Some(document), vec![id], Some(id));
+    }
+
+    pub fn quick_selection_disabled_tools(&self) -> u64 {
+        self.quick_selection_disabled_tools
+    }
+
+    pub fn set_quick_selection_disabled_tools(&mut self, tools: u64) {
+        self.quick_selection_disabled_tools = tools;
+    }
+
+    pub fn set_active_tool(&mut self, active_tool: ActiveTool) -> Result<(), ErrorCode> {
+        if self.state.active_tool == active_tool {
+            return Ok(());
+        }
+
+        let previous_tool = self.state.active_tool;
+        self.cancel_interaction();
+        self.clear_eraser_state();
+        self.clear_stroke_cursor_state();
+        self.state.active_tool = active_tool;
+        self.set_hovered_element(None);
+        if Self::tool_policy_for(active_tool).clear_selection_on_activate
+            || previous_tool == ActiveTool::Text
+        {
+            self.clear_selection();
+        } else {
+            self.bump_overlay_state_revision();
+        }
+        Ok(())
+    }
+
+    pub fn reset_editing_state(&mut self) {
+        self.cancel_interaction();
+        self.clear_eraser_state();
+        self.clear_stroke_cursor_state();
+        self.clear_active_text_draft_presentation();
+        self.set_hovered_element(None);
+        self.clear_selection();
+        if self.state.active_tool != ActiveTool::Select {
+            self.state.active_tool = ActiveTool::Select;
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    pub fn capture_document_sync_snapshot(&self, document: &DocumentModel) -> DocumentSyncSnapshot {
+        let _ = document;
+        DocumentSyncSnapshot {
+            selection: self.state.selection.clone(),
+        }
+    }
+
+    pub fn sync_after_document_change(
+        &mut self,
+        document: &DocumentModel,
+        snapshot: &DocumentSyncSnapshot,
+    ) {
+        if self
+            .state
+            .active_distance_value_owner
+            .is_some_and(|owner| self.distance_value_target(document, owner).is_err())
+        {
+            self.clear_active_text_draft_presentation();
+        }
+        self.invalidate_auto_filter_gesture(document);
+        self.sync_selection_after_document_change(document, &snapshot.selection);
+        self.sync_magnifier_interaction_styles(document);
+        self.bump_scene_state_revision();
+        self.bump_overlay_state_revision();
+    }
+
+    pub fn set_surface_size(&mut self, width: u32, height: u32) -> Result<(), ErrorCode> {
+        let next = SurfaceSize { width, height };
+        if self.view.get().surface != next {
+            self.view.get_mut().surface = next;
+            self.bump_scene_state_revision();
+            self.bump_overlay_state_revision();
+        }
+        Ok(())
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) -> Result<(), ErrorCode> {
+        validate_camera(&camera)?;
+        if self.view.get().camera != camera {
+            self.view.get_mut().camera = camera;
+            self.bump_scene_state_revision();
+            self.bump_overlay_state_revision();
+        }
+        Ok(())
+    }
+
+    fn cancel_interaction(&mut self) {
+        // Direct document mutations cannot return an input output. Drop ownership for native
+        // reconciliation immediately, and retain a release command for the next input output.
+        self.pending_capture_release |= self.captured_pointer.take().is_some();
+        self.magnifier_wheel = None;
+        if self.speech_bubble_tail_drag.take().is_some() {
+            self.bump_scene_state_revision();
+        }
+        if self.state.shape_text_drag.take().is_some() {
+            self.bump_scene_state_revision();
+        }
+        self.state.ui.free_draw_hover_position = None;
+        self.state.pending_text_edit = None;
+        self.state.pending_distance_value_edit = None;
+        self.state.pending_new_text_draft = false;
+        self.state.auto_filter = Default::default();
+        self.bump_overlay_state_revision();
+        let had_selection_edit = matches!(
+            &self.state.interaction,
+            InteractionState::PendingSelectionMove(_)
+                | InteractionState::EditingSelection(_)
+                | InteractionState::EditingArrow(_)
+                | InteractionState::EditingMagnifier(_)
+                | InteractionState::CreatingSerialNumber(_)
+                | InteractionState::CreatingFreeDraw(_)
+        );
+        self.state.interaction = InteractionState::Idle;
+        if had_selection_edit {
+            self.bump_scene_state_revision();
+            self.bump_overlay_state_revision();
+        }
+        self.clear_transient_visuals();
+    }
+
+    fn set_creation_preview(
+        &mut self,
+        preview: Option<ElementCreationPreview>,
+        snap_guides: Vec<SnapGuide>,
+    ) {
+        if self.state.creation_preview != preview {
+            self.state.creation_preview = preview;
+            self.bump_scene_state_revision();
+        }
+        if self.state.ui.marquee.take().is_some() || self.state.ui.snap_guides != snap_guides {
+            self.state.ui.snap_guides = snap_guides;
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    fn set_marquee(&mut self, marquee: Option<RectangleData>) {
+        if self.state.creation_preview.take().is_some() {
+            self.bump_scene_state_revision();
+        }
+        if self.state.ui.marquee != marquee || !self.state.ui.snap_guides.is_empty() {
+            self.state.ui.marquee = marquee;
+            self.state.ui.snap_guides.clear();
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    fn set_snap_guides(&mut self, snap_guides: Vec<SnapGuide>) {
+        if self.state.creation_preview.take().is_some() {
+            self.bump_scene_state_revision();
+        }
+        if self.state.ui.marquee.take().is_some() || self.state.ui.snap_guides != snap_guides {
+            self.state.ui.snap_guides = snap_guides;
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    fn clear_transient_visuals(&mut self) {
+        if self.state.creation_preview.take().is_some() {
+            self.bump_scene_state_revision();
+        }
+        if self.state.ui.marquee.take().is_some() || !self.state.ui.snap_guides.is_empty() {
+            self.state.ui.snap_guides.clear();
+            self.bump_overlay_state_revision();
+        }
+    }
+
+    fn bump_scene_state_revision(&mut self) {
+        self.scene_state_revision = self.scene_state_revision.wrapping_add(1);
+    }
+
+    fn bump_overlay_state_revision(&mut self) {
+        self.overlay_state_revision = self.overlay_state_revision.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snow_draw_engine_document::TextLayoutSize;
+
+    fn selected_editor(active_tool: ActiveTool) -> Editor {
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        let id = ElementId {
+            index: 1,
+            generation: 0,
+        };
+        editor.state.active_tool = active_tool;
+        editor.set_selection_state(vec![id], Some(id));
+        editor
+    }
+
+    fn test_rect() -> RectangleData {
+        RectangleData {
+            text_element_id: None,
+            stroke_rendering_style: Default::default(),
+            stroke_rendering_seed: 0,
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: Point::new(10.0, 20.0),
+            width: 80.0,
+            height: 60.0,
+            rotation: 0.0,
+            fill: snow_draw_engine_core::ColorRgba8::default(),
+            fill_style: snow_draw_engine_document::FillStyle::Solid,
+            stroke: snow_draw_engine_core::ColorRgba8::default(),
+            stroke_width: 2.0,
+            stroke_style: snow_draw_engine_document::StrokeStyle::Solid,
+            corner_radii: snow_draw_engine_core::CornerRadii::default(),
+            opacity: 1.0,
+        }
+    }
+
+    #[test]
+    fn creation_preview_only_bumps_scene_revision() {
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        let scene_revision = editor.scene_input_revision();
+        let overlay_revision = editor.overlay_input_revision();
+
+        editor.set_creation_preview(
+            Some(ElementCreationPreview::Rectangle(test_rect())),
+            Vec::new(),
+        );
+
+        assert!(editor.scene_input_revision() > scene_revision);
+        assert_eq!(editor.overlay_input_revision(), overlay_revision);
+    }
+
+    #[test]
+    fn object_snap_plan_excludes_filter_overlays() {
+        use crate::snapping::ObjectSnapActor;
+        use snow_draw_engine_document::{ElementMeta, FilterData};
+
+        assert!(!ObjectSnapActor::Creation(ActiveTool::RectangleFilter).participates());
+        assert!(!ObjectSnapActor::Creation(ActiveTool::PenFilter).participates());
+        assert!(!ObjectSnapActor::Creation(ActiveTool::AutoFilter).participates());
+        assert!(ObjectSnapActor::Creation(ActiveTool::Shape).participates());
+        assert!(ObjectSnapActor::Creation(ActiveTool::Spotlight).participates());
+
+        let mut document = DocumentModel::new();
+        let rect_id = document.peek_next_element_id();
+        let mut rect_transaction = Transaction::new("insert rectangle");
+        rect_transaction.insert_rectangle(rect_id, ElementMeta::default(), test_rect());
+        document.apply_transaction(rect_transaction).unwrap();
+        let filter_id = document.peek_next_element_id();
+        let mut filter_transaction = Transaction::new("insert filter");
+        filter_transaction.insert_filter(
+            filter_id,
+            ElementMeta::default(),
+            FilterData {
+                center: Point::new(140.0, 490.0),
+                width: 80.0,
+                height: 80.0,
+                ..FilterData::default()
+            },
+        );
+        document.apply_transaction(filter_transaction).unwrap();
+        let pen_filter_id = document.peek_next_element_id();
+        let mut pen_filter_transaction = Transaction::new("insert pen filter");
+        pen_filter_transaction.insert_pen_filter(
+            pen_filter_id,
+            ElementMeta::default(),
+            PenFilterData::default(),
+        );
+        document.apply_transaction(pen_filter_transaction).unwrap();
+
+        let rect_state = SelectionRectState {
+            id: rect_id,
+            rect: test_rect(),
+        };
+        let filter_state = SelectionRectState {
+            id: filter_id,
+            rect: test_rect(),
+        };
+        let pen_filter_state = SelectionRectState {
+            id: pen_filter_id,
+            rect: test_rect(),
+        };
+        let arrow_state = SelectionArrowState {
+            id: rect_id,
+            arrow: ArrowData::from_global_points(
+                &[Point::new(0.0, 0.0), Point::new(40.0, 0.0)],
+                snow_draw_engine_core::ColorRgba8::default(),
+                2.0,
+                snow_draw_engine_document::StrokeStyle::Solid,
+                snow_draw_engine_core::arrow::ArrowType::default(),
+                None,
+                None,
+            )
+            .unwrap(),
+        };
+
+        assert!(ObjectSnapActor::selection(&document, &[], &[]).participates());
+        assert!(!ObjectSnapActor::selection(&document, &[filter_state], &[]).participates());
+        assert!(!ObjectSnapActor::selection(&document, &[pen_filter_state], &[]).participates());
+        assert!(
+            !ObjectSnapActor::selection(&document, &[filter_state, pen_filter_state], &[])
+                .participates()
+        );
+        assert!(
+            ObjectSnapActor::selection(&document, &[filter_state, rect_state], &[]).participates()
+        );
+        assert!(
+            ObjectSnapActor::selection(&document, &[filter_state], &[arrow_state]).participates()
+        );
+        assert!(ObjectSnapActor::selection(&document, &[rect_state], &[]).participates());
+
+        let mut config = EngineConfig::default();
+        config.snap.enabled = true;
+        let mut editor = Editor::new(config).unwrap();
+        assert!(
+            editor
+                .object_snap_plan(
+                    &document,
+                    ObjectSnapActor::Creation(ActiveTool::RectangleFilter),
+                    &[],
+                    Modifiers::default(),
+                )
+                .is_none()
+        );
+        assert!(
+            editor
+                .object_snap_plan(
+                    &document,
+                    ObjectSnapActor::Creation(ActiveTool::PenFilter),
+                    &[],
+                    Modifiers::default(),
+                )
+                .is_none()
+        );
+        assert!(
+            editor
+                .object_snap_plan(
+                    &document,
+                    ObjectSnapActor::selection(&document, &[filter_state], &[]),
+                    &[],
+                    Modifiers::default(),
+                )
+                .is_none()
+        );
+
+        let plan = editor
+            .object_snap_plan(
+                &document,
+                ObjectSnapActor::Creation(ActiveTool::Shape),
+                &[],
+                Modifiers::default(),
+            )
+            .expect("layout creation should object-snap");
+        assert_eq!(plan.references.len(), 1);
+
+        let plan = editor
+            .object_snap_plan(
+                &document,
+                ObjectSnapActor::selection(&document, &[rect_state], &[]),
+                &[rect_id],
+                Modifiers::default(),
+            )
+            .expect("layout selection should object-snap");
+        assert!(plan.references.is_empty());
+
+        editor.config.grid.enabled = true;
+        assert!(
+            editor
+                .object_snap_plan(
+                    &document,
+                    ObjectSnapActor::Creation(ActiveTool::Shape),
+                    &[],
+                    Modifiers::default(),
+                )
+                .is_none()
+        );
+        editor.config.grid.enabled = false;
+        assert!(
+            editor
+                .object_snap_plan(
+                    &document,
+                    ObjectSnapActor::selection(&document, &[filter_state, rect_state], &[]),
+                    &[],
+                    Modifiers::default(),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn marquee_only_bumps_overlay_revision() {
+        let mut editor = Editor::new(EngineConfig::default()).unwrap();
+        let scene_revision = editor.scene_input_revision();
+        let overlay_revision = editor.overlay_input_revision();
+
+        editor.set_marquee(Some(test_rect()));
+
+        assert_eq!(editor.scene_input_revision(), scene_revision);
+        assert!(editor.overlay_input_revision() > overlay_revision);
+    }
+
+    #[test]
+    fn switching_from_text_tool_to_select_clears_selection() {
+        let mut editor = selected_editor(ActiveTool::Text);
+
+        editor.set_active_tool(ActiveTool::Select).unwrap();
+
+        assert!(editor.state.selection.is_empty());
+    }
+
+    #[test]
+    fn switching_from_shape_tool_to_select_preserves_selection() {
+        let mut editor = selected_editor(ActiveTool::Shape);
+
+        editor.set_active_tool(ActiveTool::Select).unwrap();
+
+        assert!(!editor.state.selection.is_empty());
+    }
+
+    #[test]
+    fn resetting_editing_state_clears_selection_and_restores_select_tool() {
+        let mut editor = selected_editor(ActiveTool::Shape);
+
+        editor.reset_editing_state();
+
+        assert!(editor.state.selection.is_empty());
+        assert_eq!(editor.active_tool(), ActiveTool::Select);
+    }
+
+    #[test]
+    fn updating_text_with_same_content_clears_selection() {
+        let mut document = DocumentModel::new();
+        let id = document.peek_next_element_id();
+        let mut text = TextData {
+            text: "unchanged".to_owned(),
+            ..TextData::default()
+        };
+        text.layout = TextLayoutSize::new(120.0, 30.0);
+
+        let mut transaction = Transaction::new("insert text");
+        transaction.insert_text(id, snow_draw_engine_document::ElementMeta::default(), text);
+        document.apply_transaction(transaction).unwrap();
+
+        let mut editor = selected_editor(ActiveTool::Text);
+        editor.select_element(&document, id).unwrap();
+
+        let command = editor
+            .update_text_element(&document, id, "unchanged", TextLayoutSize::new(120.0, 30.0))
+            .unwrap();
+
+        assert!(command.is_none());
+        assert!(editor.state.selection.is_empty());
+    }
+}

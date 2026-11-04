@@ -1,0 +1,512 @@
+#include "snow_shot/app/edition.h"
+#include "snow_shot/presentation/windowcloseshortcut.h"
+#include "snow_shot/presentation/mainwindow.h"
+#include "snow_shot/presentation/mainwindowskinwidget.h"
+
+#include "snow_shot/platform/windows/windowchrome.h"
+#ifdef Q_OS_MACOS
+#include "snow_shot/platform/macos/applicationactivation.h"
+#endif
+#include "snow_shot/presentation/components/contentcardwidget.h"
+#include "snow_shot/presentation/components/maincontentheaderwidget.h"
+#include "snow_shot/presentation/components/sidebarwidget.h"
+#include "snow_shot/presentation/components/titlebarwidget.h"
+#include "snow_shot/presentation/settings/settingsregistry.h"
+#include "snow_shot/presentation/settings/settingsruntimesession.h"
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/presentation/styles/themecolorscheme.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "theme/theme_manager.h"
+#include "widgets/message.h"
+
+#include <QCloseEvent>
+#include <QEvent>
+#include <QFont>
+#include <QHBoxLayout>
+#include <QLinearGradient>
+#include <QMenuBar>
+#include <QPainter>
+#include <QPalette>
+#include <QPoint>
+#include <QPointer>
+#include <QResizeEvent>
+#include <QScopedValueRollback>
+#include <QStatusBar>
+#include <QAbstractButton>
+#include <QVBoxLayout>
+#include <QWidget>
+
+#include <utility>
+
+namespace {
+constexpr int MAIN_WINDOW_WIDTH = 900;
+constexpr int MAIN_WINDOW_HEIGHT = 640;
+constexpr int MAIN_WINDOW_MIN_WIDTH = 512;
+constexpr int MAIN_WINDOW_MIN_HEIGHT = 316;
+constexpr int TITLE_BAR_BOTTOM_SHADOW_HEIGHT = 6;
+constexpr int TITLE_BAR_BOTTOM_SHADOW_ALPHA = 10;
+
+class TitleBarBottomShadowWidget final : public QWidget {
+  public:
+    explicit TitleBarBottomShadowWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setFocusPolicy(Qt::NoFocus);
+    }
+
+  protected:
+    void paintEvent(QPaintEvent* event) override {
+        (void)event;
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+
+        QLinearGradient shadowGradient(QPointF(0.0, 0.0), QPointF(0.0, height()));
+        shadowGradient.setColorAt(0.0, QColor(0, 0, 0, TITLE_BAR_BOTTOM_SHADOW_ALPHA));
+        shadowGradient.setColorAt(1.0, QColor(0, 0, 0, 0));
+
+        painter.fillRect(rect(), Qt::transparent);
+        painter.fillRect(rect(), shadowGradient);
+    }
+};
+} // namespace
+
+MainWindow::MainWindow(const snow_shot::presentation::settings::SettingsRegistry& registry,
+                       snow_shot::presentation::settings::SettingsRuntimeSession& runtimeSession,
+                       QWidget* parent, SnowShotApiClient* translationClient)
+    : QMainWindow(parent), m_translationClient(translationClient), m_settingsRegistry(registry),
+      m_runtimeSession(runtimeSession), m_geometryMemory(this) {
+#ifdef Q_OS_MACOS
+    setWindowFlags(windowFlags() | Qt::ExpandedClientAreaHint | Qt::NoTitleBarBackgroundHint);
+    setAttribute(Qt::WA_LayoutOnEntireRect);
+#endif
+    setObjectName(QStringLiteral("snowShotMainWindow"));
+    setAccessibleName(snow_shot::app::edition::isMini ? snow_shot::app::edition::productName()
+                                                      : QStringLiteral("SnowShot"));
+    setWindowTitle(snow_shot::app::edition::isMini ? snow_shot::app::edition::productName()
+                                                   : QStringLiteral("SnowShot"));
+    resize(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT);
+    setMinimumSize(MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT);
+    setMouseTracking(true);
+    setAttribute(Qt::WA_DeleteOnClose);
+    m_geometryMemory.restoreMainWindow(QSize(MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT));
+
+    // DirectWrite's default hinting can retain grid fitting even at fractional DPI.
+    // Let all main-interface labels inherit smooth outlines before setting their sizes.
+    QFont interfaceFont = font();
+    interfaceFont.setHintingPreference(QFont::PreferNoHinting);
+    setFont(interfaceFont);
+
+    snow_shot::presentation::installWindowCloseShortcut(this, [this] { close(); });
+
+    menuBar()->hide();
+    statusBar()->hide();
+
+    buildUi();
+    const auto& themeManager = snow_shot::presentation::styles::ThemeManager::instance();
+    connect(&themeManager, &snow_shot::presentation::styles::ThemeManager::themeChanged, this,
+            [this](const snow_shot::presentation::styles::ThemeColorScheme& scheme) {
+                applyTheme(scheme);
+            });
+    applyTheme(themeManager.themeColorScheme());
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    QMainWindow::closeEvent(event);
+    if (event->isAccepted()) {
+        m_geometryMemory.captureAcceptedClose();
+    }
+}
+
+bool MainWindow::event(QEvent* event) {
+    const bool handled = QMainWindow::event(event);
+
+#ifdef Q_OS_WIN
+    if (event->type() == QEvent::WindowStateChange && m_titleBar != nullptr) {
+        m_titleBar->setMaximized(isMaximized());
+    }
+
+    // The DWM frame extension belongs to the HWND, which Qt recreates after close().
+    if (event->type() == QEvent::WinIdChange && internalWinId() != 0) {
+        setupDwmShadow();
+    }
+#elif defined(Q_OS_MACOS)
+    if (event->type() == QEvent::WinIdChange || event->type() == QEvent::Show ||
+        event->type() == QEvent::WindowStateChange) {
+        setupNativeTitleBar();
+    }
+#endif
+
+    return handled;
+}
+
+void MainWindow::changeEvent(QEvent* event) {
+    QMainWindow::changeEvent(event);
+
+    if (event->type() == QEvent::PaletteChange ||
+        event->type() == QEvent::ApplicationPaletteChange) {
+        applyTheme(snow_shot::presentation::styles::ThemeManager::instance().themeColorScheme());
+    }
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    syncTitleBarBottomShadowGeometry();
+#ifdef Q_OS_MACOS
+    setupNativeTitleBar();
+#endif
+}
+
+void MainWindow::setupDwmShadow() {
+#ifdef Q_OS_WIN
+    snow_shot::platform::windows::setupDwmShadow(this);
+#endif
+}
+
+#ifdef Q_OS_MACOS
+void MainWindow::setupNativeTitleBar() {
+    if (m_titleBar != nullptr) {
+        snow_shot::platform::macos::configureMainWindowTitleBar(this, m_titleBar->height());
+    }
+}
+#endif
+
+#ifdef Q_OS_WIN
+bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+    if (snow_shot::platform::windows::handleNativeWindowEvent(m_titleBar, message, result)) {
+        return true;
+    }
+    return QMainWindow::nativeEvent(eventType, message, result);
+}
+#endif
+
+void MainWindow::buildUi() {
+    const auto metric =
+        snow_shot::presentation::styles::ThemeManager::instance().themeColorScheme().metricAlias;
+
+    // Keep Qt's original opaque widget path when no skin is configured. The
+    // optional background owns all skin paint and viewport hooks while enabled.
+    auto* root = new QWidget(this);
+    root->setAutoFillBackground(true);
+    setCentralWidget(root);
+
+    auto* rootLayout = new QVBoxLayout(root);
+    rootLayout->setContentsMargins(0, 0, 0, 0);
+    rootLayout->setSpacing(0);
+
+    m_titleBarBottomShadow = new TitleBarBottomShadowWidget(root);
+    m_titleBarBottomShadow->setObjectName(QStringLiteral("titleBarBottomShadow"));
+    m_titleBarBottomShadow->hide();
+
+    auto* titleBar = new TitleBarWidget(metric, root);
+    rootLayout->addWidget(titleBar, 0);
+
+#ifndef Q_OS_MACOS
+    connect(titleBar->minimizeButton(), &QAbstractButton::clicked, this, &QWidget::showMinimized);
+    connect(titleBar->maximizeButton(), &QAbstractButton::clicked, this, [this]() {
+        if (isMaximized()) {
+            showNormal();
+        } else {
+            showMaximized();
+        }
+    });
+    connect(titleBar->closeButton(), &QAbstractButton::clicked, this, &QWidget::close);
+#endif
+    m_titleBar = titleBar;
+
+    auto* body = new QWidget(root);
+    m_body = body;
+    body->setAutoFillBackground(true);
+    auto* bodyLayout = new QHBoxLayout(body);
+    bodyLayout->setContentsMargins(0, 0, 0, 0);
+    bodyLayout->setSpacing(0);
+
+    auto* sidebar = new SidebarWidget(m_settingsRegistry, body);
+    bodyLayout->addWidget(sidebar, 0);
+    m_sidebar = sidebar;
+
+    auto* contentShell = new QWidget(body);
+    m_contentShell = contentShell;
+    contentShell->setAutoFillBackground(true);
+    auto* contentShellLayout = new QVBoxLayout(contentShell);
+    contentShellLayout->setContentsMargins(0, 0, 0, 0);
+    contentShellLayout->setSpacing(0);
+
+    auto* contentHeader = new MainContentHeaderWidget(metric, contentShell);
+    contentShellLayout->addWidget(contentHeader, 0);
+    m_contentHeader = contentHeader;
+
+    auto* contentArea = new QWidget(contentShell);
+    m_contentArea = contentArea;
+    contentArea->setAutoFillBackground(true);
+    auto* contentAreaLayout = new QVBoxLayout(contentArea);
+    contentAreaLayout->setContentsMargins(metric.padding, metric.padding, metric.padding,
+                                          metric.padding);
+    contentAreaLayout->setSpacing(0);
+    auto* contentCard = new ContentCardWidget(m_settingsRegistry, m_runtimeSession, contentArea,
+                                              m_translationClient);
+    contentAreaLayout->addWidget(contentCard, 1);
+    m_contentCard = contentCard;
+    contentShellLayout->addWidget(contentArea, 1);
+    bodyLayout->addWidget(contentShell, 1);
+    rootLayout->addWidget(body, 1);
+    sidebar->raise();
+    syncTitleBarBottomShadowGeometry();
+
+    connect(m_sidebar, &SidebarWidget::routeSelected, m_contentCard,
+            &ContentCardWidget::setCurrentRoute);
+    connect(m_contentHeader, &MainContentHeaderWidget::sectionRequested, m_contentCard,
+            &ContentCardWidget::activateSection);
+    connect(m_sidebar, &SidebarWidget::locationRequested, m_contentCard,
+            &ContentCardWidget::navigateTo);
+    connect(m_contentCard, &ContentCardWidget::routeChanged, m_sidebar,
+            &SidebarWidget::setCurrentRoute);
+    connect(m_contentCard, &ContentCardWidget::sectionListChanged, this, [this]() {
+        if (m_contentHeader != nullptr && m_contentCard != nullptr) {
+            m_contentHeader->setSections(m_contentCard->currentSections());
+        }
+    });
+    connect(m_contentCard, &ContentCardWidget::locationChanged, this,
+            [this](const snow_shot::presentation::settings::SettingsLocation& location) {
+                if (m_contentHeader != nullptr) {
+                    m_contentHeader->setCurrentSection(location.sectionId);
+                }
+            });
+    connect(m_contentCard, &ContentCardWidget::screenshotRequested, this,
+            &MainWindow::screenshotRequested);
+    connect(m_contentCard, &ContentCardWidget::closeWindowRequested, this, &QWidget::close);
+    connect(m_contentCard, &ContentCardWidget::quickActionRequested, this,
+            &MainWindow::quickActionRequested);
+    connect(m_contentCard, &ContentCardWidget::globalMouseDragRequested, this,
+            &MainWindow::globalMouseDragRequested);
+    connect(m_contentCard, &ContentCardWidget::screenshotHistoryEditRequested, this,
+            &MainWindow::screenshotHistoryEditRequested);
+    connect(m_contentCard, &ContentCardWidget::screenshotHistoryPinRequested, this,
+            &MainWindow::screenshotHistoryPinRequested);
+    connect(m_contentCard, &ContentCardWidget::screenshotHistoryCollageRequested, this,
+            &MainWindow::screenshotHistoryCollageRequested);
+    connect(m_contentCard, &ContentCardWidget::screenshotHistorySplitRequested, this,
+            &MainWindow::screenshotHistorySplitRequested);
+    connect(m_contentCard, &ContentCardWidget::screenshotHistoryImageEditingRequested, this,
+            &MainWindow::screenshotHistoryImageEditingRequested);
+    connect(m_contentCard, &ContentCardWidget::pinnedWindowCollageRequested, this,
+            &MainWindow::pinnedWindowCollageRequested);
+    connect(m_contentCard, &ContentCardWidget::pinnedWindowSplitRequested, this,
+            &MainWindow::pinnedWindowSplitRequested);
+    connect(m_contentCard, &ContentCardWidget::pinnedWindowImageEditingRequested, this,
+            &MainWindow::pinnedWindowImageEditingRequested);
+    m_contentCard->setCurrentRoute(m_sidebar->currentRoute());
+    m_contentHeader->setSections(m_contentCard->currentSections());
+    m_contentHeader->setCurrentSection(m_contentCard->currentLocation().sectionId);
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    connect(&configuration, &snow_shot::storage::ConfigurationStore::valueChanged, this,
+            [this](const QString& key) {
+                if (key == QStringLiteral("interface/skin_path") ||
+                    key == QStringLiteral("interface/skin_opacity")) {
+                    syncSkinBackground();
+                }
+            });
+    syncSkinBackground();
+}
+
+void MainWindow::syncSkinBackground() {
+    const auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    const bool configured =
+        configuration.value(QStringLiteral("interface/skin_opacity")).toInt(100) > 0 &&
+        !configuration.value(QStringLiteral("interface/skin_path")).toString().isEmpty();
+    if (!configured) {
+        if (m_skinBackground != nullptr) {
+            const QPointer<MainWindow> lifetime(this);
+            delete std::exchange(m_skinBackground, nullptr);
+            if (lifetime) {
+                applySkinAppearance();
+            }
+        }
+        return;
+    }
+    if (m_skinBackground == nullptr) {
+        m_skinBackground = new snow_shot::presentation::MainWindowSkinWidget(centralWidget());
+        m_skinBackground->setBaseColor(snow_shot::presentation::styles::ThemeManager::instance()
+                                           .themeColorScheme()
+                                           .map.colorBgLayout);
+        connect(m_skinBackground,
+                &snow_shot::presentation::MainWindowSkinWidget::skinAppearanceChanged, this,
+                &MainWindow::applySkinAppearance);
+        m_skinBackground->setGeometry(centralWidget()->rect());
+        m_skinBackground->lower();
+        m_skinBackground->show();
+        applySkinAppearance();
+    }
+}
+
+void MainWindow::applySkinAppearance() {
+    const bool skinActive = m_skinBackground != nullptr && m_skinBackground->skinActive();
+    const qreal maskOpacity = skinActive ? m_skinBackground->maskOpacity() : 1.0;
+    auto& controlTheme = adqt::theme::ThemeManager::instance();
+    auto overrideValue = controlTheme.scopeOverride(centralWidget());
+    if (maskOpacity < 1.0) {
+        overrideValue.backgroundOpacity = maskOpacity;
+    } else {
+        overrideValue.backgroundOpacity.reset();
+    }
+    controlTheme.setScopeOverride(centralWidget(), overrideValue);
+    centralWidget()->setAutoFillBackground(!skinActive);
+    for (QWidget* surface : {m_body, m_contentShell, m_contentArea}) {
+        if (surface != nullptr) {
+            surface->setAutoFillBackground(!skinActive);
+            surface->update();
+        }
+    }
+    if (m_titleBar != nullptr) {
+        m_titleBar->setSkinMaskOpacity(maskOpacity);
+    }
+    if (m_sidebar != nullptr) {
+        m_sidebar->setSkinMaskOpacity(maskOpacity, skinActive);
+    }
+    if (m_contentHeader != nullptr) {
+        m_contentHeader->setSkinMaskOpacity(maskOpacity);
+    }
+    if (m_contentCard != nullptr) {
+        m_contentCard->setSkinMaskOpacity(maskOpacity);
+    }
+}
+
+void MainWindow::showAppPermissions(const QString& permissionId) {
+#ifdef Q_OS_MACOS
+    if (m_contentCard)
+        m_contentCard->navigateTo(
+            {QStringLiteral("app-permissions"), QStringLiteral("permissions"), permissionId});
+#else
+    Q_UNUSED(permissionId);
+#endif
+    showAndActivate();
+#ifdef Q_OS_MACOS
+    adqt::widgets::AdMessage::Request request;
+    request.key = QStringLiteral("main-app-permission-required");
+    request.content = tr("Grant the required permission to continue");
+    adqt::widgets::AdMessageService::warning(std::move(request), this);
+#endif
+}
+
+void MainWindow::showScreenshotSettings() {
+    if (m_contentCard != nullptr) {
+        m_contentCard->showScreenshotSettings();
+    }
+    showAndActivate();
+}
+
+void MainWindow::showSettingsLocation(const QString& pageId, const QString& sectionId) {
+    if (m_contentCard)
+        m_contentCard->navigateTo({pageId, sectionId, {}});
+    showAndActivate();
+}
+
+void MainWindow::showGeneralSettings() {
+    if (m_contentCard != nullptr) {
+        m_contentCard->showGeneralSettings();
+    }
+
+    showAndActivate();
+}
+
+void MainWindow::showAbout() {
+    showAndActivate();
+    if (m_contentCard != nullptr) {
+        m_contentCard->navigateTo({QStringLiteral("about"), {}, {}});
+    }
+}
+
+void MainWindow::showTranslation(const QString& text) {
+    if (m_contentCard != nullptr) {
+        m_contentCard->showTranslation(text);
+    }
+    showAndActivate();
+    if (text.trimmed().isEmpty()) {
+        adqt::widgets::AdMessage::Request request;
+        request.key = QStringLiteral("main-translation-empty-selection");
+        request.content = tr("Failed to retrieve selected text");
+        adqt::widgets::AdMessageService::warning(std::move(request), this);
+    }
+}
+
+void MainWindow::showScreenshotHistory() {
+    showAndActivate();
+    if (m_contentCard != nullptr) {
+        m_contentCard->navigateTo({QStringLiteral("screenshot-history"), {}, {}});
+    }
+}
+
+void MainWindow::showPinToScreenManagement() {
+    showAndActivate();
+    if (m_contentCard != nullptr) {
+        m_contentCard->navigateTo({QStringLiteral("pin-to-screen-management"), {}, {}});
+    }
+}
+
+void MainWindow::showAndActivate() {
+    if (isMinimized()) {
+        showNormal();
+    } else {
+        show();
+    }
+    raise();
+    activateWindow();
+#ifdef Q_OS_WIN
+    snow_shot::platform::windows::bringWindowToForeground(this);
+#elif defined(Q_OS_MACOS)
+    snow_shot::platform::macos::activateWindow(this);
+    setupNativeTitleBar();
+#endif
+}
+
+void MainWindow::syncTitleBarBottomShadowGeometry() {
+    if (m_titleBar == nullptr || m_titleBarBottomShadow == nullptr) {
+        return;
+    }
+
+    QWidget* root = centralWidget();
+    if (root == nullptr) {
+        return;
+    }
+
+    const QPoint titleBarTopLeft = m_titleBar->mapTo(root, QPoint(0, 0));
+    m_titleBarBottomShadow->setGeometry(0, titleBarTopLeft.y() + m_titleBar->height(),
+                                        root->width(), TITLE_BAR_BOTTOM_SHADOW_HEIGHT);
+    m_titleBarBottomShadow->show();
+    m_titleBarBottomShadow->raise();
+}
+
+void MainWindow::applyTheme(const snow_shot::presentation::styles::ThemeColorScheme& scheme) {
+    if (m_isApplyingTheme) {
+        return;
+    }
+
+    const QScopedValueRollback<bool> applyingThemeGuard(m_isApplyingTheme, true);
+
+    QPalette palette = this->palette();
+    palette.setColor(QPalette::Window, scheme.map.colorBgLayout);
+    palette.setColor(QPalette::Base, scheme.map.colorBgContainer);
+    palette.setColor(QPalette::Button, scheme.map.colorBgContainer);
+    palette.setColor(QPalette::ButtonText, scheme.map.colorText);
+    palette.setColor(QPalette::WindowText, scheme.map.colorText);
+    setPalette(palette);
+
+    if (m_skinBackground != nullptr) {
+        m_skinBackground->setBaseColor(scheme.map.colorBgLayout);
+    }
+
+    if (m_titleBar != nullptr) {
+        m_titleBar->applyTheme(scheme);
+    }
+
+    if (m_contentCard != nullptr) {
+        m_contentCard->applyTheme(scheme);
+    }
+
+    if (m_contentHeader != nullptr) {
+        m_contentHeader->applyTheme(scheme);
+    }
+
+    update();
+}

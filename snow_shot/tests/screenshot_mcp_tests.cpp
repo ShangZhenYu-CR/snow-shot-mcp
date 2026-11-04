@@ -1,0 +1,1595 @@
+#include "snow_shot/app/mcp/screenshotmcpserver.h"
+#include "snow_shot/app/mcp/screenshotmcpsession.h"
+#include "snow_shot/app/mcp/screenshotmcpselection.h"
+#include "snow_shot/app/mcp/mcpstylepatch.h"
+#include "../src/app/mcp/mcpreplayregistry_p.h"
+#include "snow_shot/runtime/runtimeactivitytracker.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snowimageqtcodec.h"
+#include <QApplication>
+#include <QClipboard>
+#include <QMimeData>
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+#include <QElapsedTimer>
+#include <QCryptographicHash>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QLocalSocket>
+#include <QTemporaryDir>
+#include <QThread>
+#include <QScopeGuard>
+#include <QtEndian>
+#include <cstdlib>
+#include <atomic>
+#include <iostream>
+#include <utility>
+#include <source_location>
+using namespace snow_shot::app::mcp;
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << std::endl;
+        std::exit(1);
+    }
+}
+void replaySubscriptions() {
+    for (const auto options :
+         {McpReplayRegistry::Options{}, McpReplayRegistry::Options{8 * 1024 * 1024, false, 0}}) {
+        auto owner = std::make_unique<QObject>();
+        McpReplayRegistry registry(*owner, options);
+        ScreenshotMcpRequest original;
+        original.connectionId = 1;
+        original.requestId = QStringLiteral("original");
+        original.idempotencyKey = QStringLiteral("shared");
+        original.method = QStringLiteral("mutation");
+        int originalCalls = 0;
+        auto operation = registry.begin(original, [&](auto response) {
+            require(response.ok, "the original shared operation succeeds");
+            ++originalCalls;
+        });
+        require(static_cast<bool>(operation), "the original starts one operation");
+        for (int index = 0; index < 12; ++index) {
+            auto alias = original;
+            alias.requestId = QString::number(index);
+            int calls = 0;
+            require(!registry.begin(alias,
+                                    [&](auto response) {
+                                        require(response.errorCode == QStringLiteral("canceled") &&
+                                                    response.requestId == alias.requestId,
+                                                "alias cancellation has its own response identity");
+                                        ++calls;
+                                    }),
+                    "duplicates subscribe without executing again");
+            require(registry.cancelAlias(1, alias.requestId) && calls == 1 && originalCalls == 0,
+                    "canceling aliases frees subscription slots and preserves the original");
+        }
+        ScreenshotMcpResponse success;
+        success.ok = true;
+        operation.complete(success);
+        require(originalCalls == 1 && !operation.current(), "the original completes exactly once");
+        operation.complete(success);
+        require(originalCalls == 1, "late duplicate completions are discarded");
+
+        auto next = original;
+        next.idempotencyKey = QStringLiteral("generation");
+        next.requestId = QStringLiteral("generation-original");
+        auto alias = next;
+        alias.requestId = QStringLiteral("reused");
+        auto replacement = alias;
+        replacement.idempotencyKey = QStringLiteral("replacement");
+        McpReplayRegistry::Operation fresh;
+        int replaced = 0;
+        auto generation = registry.begin(next, [&](auto) {
+            require(registry.cancelAlias(1, alias.requestId), "cancel an alias during fanout");
+        });
+        registry.begin(alias, [&](auto response) {
+            require(response.errorCode == QStringLiteral("canceled"), "retire the old alias once");
+            fresh = registry.begin(replacement, [&](auto) { ++replaced; });
+        });
+        generation.complete(success);
+        require(fresh.current() && replaced == 0, "old fanout cannot complete a reused request ID");
+        fresh.complete(success);
+        require(replaced == 1, "a replacement completes only with its own result");
+
+        next.requestId = QStringLiteral("disconnected-original");
+        next.idempotencyKey = QStringLiteral("disconnect");
+        int disconnected = 0;
+        auto payload = std::make_shared<int>(1);
+        const std::weak_ptr<int> retained = payload;
+        auto old = registry.begin(next, [&, payload](auto) {
+            Q_UNUSED(payload);
+            ++disconnected;
+        });
+        payload.reset();
+        registry.disconnected(1);
+        require(retained.expired(),
+                "disconnect releases callbacks while source work is still pending");
+        auto reconnected = registry.begin(next, [&](auto) { ++disconnected; });
+        require(reconnected.current(), "disconnect releases pending replay keys");
+        old.complete(success);
+        require(disconnected == 0 && reconnected.current(),
+                "a retired operation cannot complete a new operation with the same key");
+        reconnected.complete(success);
+        require(disconnected == 1, "only the new operation delivers after disconnect");
+
+        for (int index = 0; index < 129; ++index) {
+            next.requestId = next.idempotencyKey = QStringLiteral("bounded-%1").arg(index);
+            auto bounded = registry.begin(next, [](auto response) {
+                require(response.ok, "completed responses do not prevent new work admission");
+            });
+            require(static_cast<bool>(bounded), "each new key executes once");
+            bounded.complete(success);
+        }
+        next.requestId = QStringLiteral("oldest-retry");
+        next.idempotencyKey = QStringLiteral("bounded-0");
+        auto evicted = registry.begin(next, [](auto) {});
+        require(static_cast<bool>(evicted), "completed replay history evicts its oldest entry");
+        evicted.complete(success);
+
+        next.requestId = next.idempotencyKey = QStringLiteral("destroy-owner");
+        int callbacksAfterDestruction = 0;
+        auto dying = registry.begin(next, [&](auto) { owner.reset(); });
+        alias = next;
+        alias.requestId = QStringLiteral("destroyed-alias");
+        registry.begin(alias, [&](auto) { ++callbacksAfterDestruction; });
+        dying.complete(success);
+        require(callbacksAfterDestruction == 0, "owner destruction suppresses remaining fanout");
+    }
+    QObject owner;
+    McpReplayRegistry registry(owner, {});
+    QList<McpReplayRegistry::Operation> pending;
+    ScreenshotMcpRequest request;
+    request.connectionId = 1;
+    request.method = QStringLiteral("mutation");
+    for (int index = 0; index < 32; ++index) {
+        request.requestId = request.idempotencyKey = QString::number(index);
+        pending.append(registry.begin(request, [](auto) {}));
+        require(static_cast<bool>(pending.last()), "pending replay work is admitted within quota");
+    }
+    request.requestId = request.idempotencyKey = QStringLiteral("overflow");
+    int rejected = 0;
+    require(!registry.begin(request,
+                            [&](auto response) {
+                                require(response.errorCode == QStringLiteral("queue_full"),
+                                        "pending work has a hard quota");
+                                ++rejected;
+                            }) &&
+                rejected == 1,
+            "overload rejects exactly once");
+    registry.shutdown();
+    for (const auto& operation : pending)
+        operation.complete({});
+}
+
+void sessionCompletionReentry() {
+    for (int variant = 0; variant < 4; ++variant) {
+        const bool cancel = variant != 0;
+        const bool restart = variant == 2;
+        QJsonObject editor{{QStringLiteral("capture_phase"), QStringLiteral("idle")}};
+        ScreenshotMcpSession::Ports ports;
+        ports.state = [&] { return editor; };
+        ports.begin = [](const QJsonObject&, QString*) { return true; };
+        ports.cancel = [&] {
+            editor.insert(QStringLiteral("capture_phase"), QStringLiteral("idle"));
+        };
+        std::unique_ptr<ScreenshotMcpSession> session;
+        int staleStateReads = 0;
+        ports.state = [&] {
+            if (!session)
+                ++staleStateReads;
+            return editor;
+        };
+        session = std::make_unique<ScreenshotMcpSession>(ports);
+        ScreenshotMcpRequest begin;
+        begin.connectionId = 1;
+        begin.requestId = begin.idempotencyKey = QStringLiteral("begin");
+        begin.method = QStringLiteral("snow_shot_screenshot_begin");
+        int completions = 0;
+        session->request(begin, [&](auto response) {
+            ++completions;
+            require(cancel ? !response.ok : response.ok, "capture settles with its own outcome");
+            if (restart) {
+                auto fresh = begin;
+                fresh.requestId = fresh.idempotencyKey = QStringLiteral("fresh-begin");
+                session->request(fresh, [](auto response) {
+                    require(response.ok, "a new capture survives the previous cancellation");
+                });
+            } else
+                session.reset();
+        });
+        if (variant == 3)
+            session->shutdown();
+        else if (cancel)
+            require(session->cancelRequest(1, begin.requestId), "cancel a pending capture");
+        else
+            session->capturePresented();
+        require(completions == 1 && staleStateReads == 0,
+                "completion callbacks may destroy a session without subsequent state access");
+        if (restart) {
+            require(session->state().value(QStringLiteral("active")).toBool(),
+                    "old cleanup cannot release a capture started by the callback");
+            session->capturePresented();
+            session->shutdown();
+        }
+    }
+}
+template <class F>
+void await(F predicate, const std::source_location location = std::source_location::current()) {
+    QElapsedTimer timer;
+    timer.start();
+    while (!predicate() && timer.elapsed() < 5000) {
+        QCoreApplication::processEvents();
+        QThread::msleep(1);
+    }
+    if (!predicate()) {
+        std::cerr << "asynchronous operation timed out at " << location.file_name() << ':'
+                  << location.line() << '\n';
+        std::exit(1);
+    }
+}
+QByteArray frame(const QJsonObject& object) {
+    const auto json = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    QByteArray result(8, Qt::Uninitialized);
+    qToBigEndian(static_cast<quint32>(json.size() + 4), result.data());
+    qToBigEndian(static_cast<quint32>(json.size()), result.data() + 4);
+    return result + json;
+}
+QJsonObject receive(QLocalSocket& socket) {
+    await([&] { return socket.bytesAvailable() >= 8; });
+    const auto header = socket.peek(8);
+    const auto size = qFromBigEndian<quint32>(header.constData());
+    await([&] { return socket.bytesAvailable() >= size + 4; });
+    const auto bytes = socket.read(size + 4);
+    return QJsonDocument::fromJson(bytes.mid(8, qFromBigEndian<quint32>(bytes.constData() + 4)))
+        .object();
+}
+QJsonObject request(const QString& id, const QString& method, const QJsonObject& params = {}) {
+    return {{QStringLiteral("protocol"), QStringLiteral("snow-shot-mcp/1")},
+            {QStringLiteral("request_id"), id},
+            {QStringLiteral("method"), method},
+            {QStringLiteral("params"), params}};
+}
+void transport() {
+    // A standalone invocation can arrive while initialization still writes the
+    // default configuration. Establish a quiet baseline before starting the server.
+    require(snow_shot::storage::ApplicationStorage::instance().flushNow().success,
+            "persist fixture defaults before measuring transport activity");
+    await([] {
+        return snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount == 0;
+    });
+    const auto baseline =
+        snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount;
+    QTemporaryDir directory;
+    require(directory.isValid(), "temporary runtime directory");
+    ScreenshotMcpServer server(nullptr, directory.path());
+    ScreenshotMcpServer::Completion pending;
+    int requests = 0;
+    int flushed = 0;
+    quint64 owner = 0;
+    server.setRequestHandler([&](const ScreenshotMcpRequest& r, auto completion) {
+        require(snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount > 0,
+                "socket request handoff retains activity through GUI dispatch");
+        require(QThread::currentThread() == QCoreApplication::instance()->thread(),
+                "GUI thread dispatch");
+        ++requests;
+        owner = r.connectionId;
+        if (r.method == QStringLiteral("pending") ||
+            r.method == QStringLiteral("snow_shot_document_render")) {
+            pending = std::move(completion);
+            return;
+        }
+        if (r.method == QStringLiteral("snow_shot_document_sample_color")) {
+            ScreenshotMcpResponse response;
+            response.ok = true;
+            completion(response);
+            return;
+        }
+        if (pending) {
+            ScreenshotMcpResponse canceled;
+            canceled.errorCode = QStringLiteral("canceled");
+            pending(canceled);
+            pending = {};
+        }
+        ScreenshotMcpResponse response;
+        response.ok = true;
+        if (r.method == QStringLiteral("after_send"))
+            response.afterSend = [&] {
+                require(
+                    snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount > 0,
+                    "post-response action retains activity through delivery");
+                require(QThread::currentThread() == QCoreApplication::instance()->thread(),
+                        "post-response action runs on application thread");
+                ++flushed;
+            };
+        completion(response);
+    });
+    server.setRequestCancellationHandler([&](quint64 connection, const QString& id) {
+        if (connection != owner || id != QStringLiteral("active") || !pending)
+            return false;
+        auto complete = std::exchange(pending, {});
+        ScreenshotMcpResponse canceled;
+        canceled.errorCode = QStringLiteral("canceled");
+        complete(canceled);
+        return true;
+    });
+    QString error;
+    require(server.start(&error), qPrintable(error));
+    await([&] {
+        return snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount ==
+               baseline;
+    });
+    QFile descriptor(server.descriptorPath());
+    require(descriptor.open(QIODevice::ReadOnly), "published descriptor");
+    auto data = QJsonDocument::fromJson(descriptor.readAll()).object();
+    descriptor.close();
+    require(data.value(QStringLiteral("token")).toString().size() == 64, "256-bit token");
+    ScreenshotMcpServer competing(nullptr, directory.path());
+    require(!competing.start(), "exclusive endpoint owner");
+    QLocalSocket invalid;
+    invalid.connectToServer(server.socketName());
+    require(invalid.waitForConnected(2000), "invalid peer connects");
+    invalid.write(frame(request(QStringLiteral("bad"), QStringLiteral("handshake"),
+                                {{QStringLiteral("token"), QStringLiteral("bad")}})));
+    require(!receive(invalid).value(QStringLiteral("ok")).toBool(), "invalid token rejected");
+    QLocalSocket client;
+    client.connectToServer(server.socketName());
+    require(client.waitForConnected(2000), "peer connects");
+    auto hello =
+        frame(request(QStringLiteral("hello"), QStringLiteral("handshake"),
+                      {{QStringLiteral("token"), data.value(QStringLiteral("token"))},
+                       {QStringLiteral("client_protocol"), QStringLiteral("snow-shot-mcp/1")}}));
+    for (char byte : hello) {
+        client.write(&byte, 1);
+        client.flush();
+        QCoreApplication::processEvents();
+    }
+    require(receive(client).value(QStringLiteral("ok")).toBool(), "fragmented handshake accepted");
+    client.write(frame(request(QStringLiteral("one"), QStringLiteral("pending"))));
+    await([&] { return bool(pending); });
+    client.write(
+        frame(request(QStringLiteral("cancel"), QStringLiteral("snow_shot_screenshot_cancel"))));
+    require(receive(client).value(QStringLiteral("request_id")).toString() == QStringLiteral("one"),
+            "pending request ID preserved");
+    require(receive(client).value(QStringLiteral("request_id")).toString() ==
+                QStringLiteral("cancel"),
+            "bypass cancellation response preserved");
+    require(requests == 2, "authenticated dispatch count");
+    client.write(frame(
+        request(QStringLiteral("background-render"), QStringLiteral("snow_shot_document_render"))));
+    await([&] { return bool(pending); });
+    client.write(frame(request(QStringLiteral("other-document"),
+                               QStringLiteral("snow_shot_document_sample_color"))));
+    require(receive(client).value(QStringLiteral("request_id")) ==
+                    QStringLiteral("other-document") &&
+                bool(pending),
+            "same-client background document operations dispatch independently");
+    client.write(frame(request(QStringLiteral("cancel-background"),
+                               QStringLiteral("snow_shot_screenshot_cancel"))));
+    require(receive(client).value(QStringLiteral("request_id")) ==
+                    QStringLiteral("background-render") &&
+                receive(client).value(QStringLiteral("request_id")) ==
+                    QStringLiteral("cancel-background"),
+            "reserved cancellation remains responsive with background work active");
+    for (const auto& method :
+         {QStringLiteral("snow_shot_app_status"), QStringLiteral("snow_shot_recording_state"),
+          QStringLiteral("snow_shot_recording_control"), QStringLiteral("snow_shot_app_actions"),
+          QStringLiteral("snow_shot_screenshot_request"),
+          QStringLiteral("snow_shot_screenshot_begin"),
+          QStringLiteral("snow_shot_screenshot_direct_capture")}) {
+        client.write(frame(request(QStringLiteral("blocking"), QStringLiteral("pending"))));
+        await([&] { return bool(pending); });
+        client.write(frame(request(QStringLiteral("priority"), method)));
+        require(receive(client).value(QStringLiteral("request_id")) == QStringLiteral("blocking") &&
+                    receive(client).value(QStringLiteral("request_id")) ==
+                        QStringLiteral("priority"),
+                "discovery, capture acquisition and controls bypass an active request");
+    }
+    client.write(frame(request(QStringLiteral("ack"), QStringLiteral("after_send"))));
+    require(receive(client).value(QStringLiteral("request_id")).toString() == QStringLiteral("ack"),
+            "lifecycle acknowledgement is transmitted");
+    await([&] { return flushed == 1; });
+    QLocalSocket subscribed;
+    subscribed.connectToServer(server.socketName());
+    require(subscribed.waitForConnected(2000), "subscribed peer connects");
+    subscribed.write(
+        frame(request(QStringLiteral("hello-events"), QStringLiteral("handshake"),
+                      {{QStringLiteral("token"), data.value(QStringLiteral("token"))},
+                       {QStringLiteral("client_protocol"), QStringLiteral("snow-shot-mcp/1")}})));
+    require(receive(subscribed).value(QStringLiteral("ok")).toBool(),
+            "authenticated peer supports events and request cancellation");
+    subscribed.write(frame(request(QStringLiteral("active"), QStringLiteral("pending"))));
+    await([&] { return bool(pending); });
+    server.publishEvent(owner,
+                        {{QStringLiteral("event"), QStringLiteral("resource_changed")},
+                         {QStringLiteral("uri"), QStringLiteral("snow-shot://jobs/private")}});
+    const auto event = receive(subscribed);
+    require(event.value(QStringLiteral("kind")) == QStringLiteral("event") &&
+                !event.contains(QStringLiteral("request_id")),
+            "events remain separate from response correlation");
+    require(client.bytesAvailable() == 0, "resource events do not reach other clients");
+    subscribed.write(
+        frame(request(QStringLiteral("cancel-active"), QStringLiteral("snow_shot_request_cancel"),
+                      {{QStringLiteral("request_id"), QStringLiteral("active")}})));
+    const auto canceled = receive(subscribed);
+    const auto cancelAck = receive(subscribed);
+    require(canceled.value(QStringLiteral("request_id")) == QStringLiteral("active") &&
+                canceled.value(QStringLiteral("error")).toObject().value(QStringLiteral("code")) ==
+                    QStringLiteral("canceled") &&
+                cancelAck.value(QStringLiteral("result"))
+                    .toObject()
+                    .value(QStringLiteral("canceled"))
+                    .toBool(),
+            "generic cancellation settles active request and acknowledges once");
+    subscribed.write(frame(request(QStringLiteral("draining"), QStringLiteral("pending"))));
+    await([&] { return bool(pending); });
+    bool drained = false;
+    server.drainAndStop([&] { drained = true; });
+    ScreenshotMcpResponse final;
+    final.ok = true;
+    std::exchange(pending, {})(final);
+    require(receive(subscribed).value(QStringLiteral("request_id")) == QStringLiteral("draining"),
+            "drain preserves final in-flight acknowledgement");
+    await([&] { return drained; });
+    server.stop();
+    require(!QFile::exists(server.descriptorPath()), "descriptor removed on disable");
+    await([&] { return client.state() == QLocalSocket::UnconnectedState; });
+    require(server.start(), "runtime re-enable");
+    server.stop();
+    require(snow_shot::runtime::RuntimeActivityTracker::shared().snapshot().activeCount == baseline,
+            "completed socket work and shutdown release activity leases");
+}
+void descriptorOverride() {
+    QTemporaryDir directory;
+    require(directory.isValid(), "temporary descriptor directory");
+    const QByteArray previous = qgetenv("SNOW_SHOT_MCP_DESCRIPTOR");
+    const bool wasSet = qEnvironmentVariableIsSet("SNOW_SHOT_MCP_DESCRIPTOR");
+    const QString descriptor = directory.filePath(QStringLiteral("custom/descriptor.json"));
+    qputenv("SNOW_SHOT_MCP_DESCRIPTOR", descriptor.toUtf8());
+    ScreenshotMcpServer server;
+    require(server.descriptorPath() == descriptor, "descriptor override path");
+    QString error;
+    require(server.start(&error), qPrintable(error));
+    require(QFile::exists(descriptor), "override descriptor published");
+    server.stop();
+    require(!QFile::exists(descriptor), "override descriptor removed");
+#ifdef Q_OS_MACOS
+    const QString longDescriptor =
+        directory.filePath(QString(120, u'x') + QStringLiteral("/descriptor.json"));
+    qputenv("SNOW_SHOT_MCP_DESCRIPTOR", longDescriptor.toUtf8());
+    ScreenshotMcpServer longPathServer;
+    require(longPathServer.start(&error), qPrintable(error));
+    require(QFile::exists(longDescriptor), "long macOS descriptor published");
+    require(longPathServer.socketName().toUtf8().size() < 104,
+            "macOS Unix socket stays within sun_path limit");
+    const QString firstSocket = longPathServer.socketName();
+    const QString firstDirectory = QFileInfo(firstSocket).absolutePath();
+    require(QFileInfo(firstDirectory).permissions() ==
+                (QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
+                 QFileDevice::ReadUser | QFileDevice::WriteUser | QFileDevice::ExeUser),
+            "socket directory is private from creation");
+    ScreenshotMcpServer independent(nullptr, directory.filePath(QStringLiteral("independent")));
+    require(independent.start(&error), qPrintable(error));
+    const QString independentDirectory = QFileInfo(independent.socketName()).absolutePath();
+    require(independentDirectory != firstDirectory,
+            "simultaneous endpoints in one process own distinct directories");
+    longPathServer.stop();
+    require(!QFileInfo::exists(firstDirectory), "stop removes the owned socket directory");
+    require(QFileInfo::exists(independent.socketName()), "stop preserves the other endpoint");
+    independent.stop();
+    require(!QFileInfo::exists(independentDirectory), "other endpoint releases its own directory");
+    require(longPathServer.start(&error), qPrintable(error));
+    require(longPathServer.socketName() != firstSocket, "restart owns a new socket directory");
+    const QString secondDirectory = QFileInfo(longPathServer.socketName()).absolutePath();
+    longPathServer.stop();
+    require(!QFileInfo::exists(secondDirectory), "restart directory is removed on stop");
+    QString scopedDirectory;
+    {
+        ScreenshotMcpServer scoped;
+        require(scoped.start(&error), qPrintable(error));
+        scopedDirectory = QFileInfo(scoped.socketName()).absolutePath();
+    }
+    require(!QFileInfo::exists(scopedDirectory), "destruction releases the socket directory");
+    // An existing directory cannot be replaced by the descriptor's atomic file publication.
+    const QString unpublishable = directory.filePath(QStringLiteral("failed/descriptor.json"));
+    require(QDir().mkpath(unpublishable), "create unpublishable descriptor destination");
+    qputenv("SNOW_SHOT_MCP_DESCRIPTOR", unpublishable.toUtf8());
+    ScreenshotMcpServer failedPublication;
+    require(!failedPublication.start(&error), "descriptor publication failure is reported");
+    const QString failedDirectory = QFileInfo(failedPublication.socketName()).absolutePath();
+    require(!failedPublication.socketName().isEmpty() && !QFileInfo::exists(failedDirectory),
+            "failed publication releases the listening socket and its directory");
+#endif
+    qputenv("SNOW_SHOT_MCP_DESCRIPTOR", QByteArrayLiteral("relative/descriptor.json"));
+    ScreenshotMcpServer relativeOverride;
+    require(!relativeOverride.start(), "relative override rejected");
+    if (wasSet)
+        qputenv("SNOW_SHOT_MCP_DESCRIPTOR", previous);
+    else
+        qunsetenv("SNOW_SHOT_MCP_DESCRIPTOR");
+}
+void selection() {
+    ScreenshotSelectionModel model;
+    const QRectF canvas(0, 0, 800, 600);
+    QString field;
+    require(model.setAspectRatioPreset(ScreenshotSelectionAspectRatioPreset::Landscape16x9, canvas,
+                                       1.0),
+            "a remembered ratio can be armed before an explicit MCP selection");
+    require(applySelection(model, canvas,
+                           {{QStringLiteral("bounds"), QJsonArray{10, 20, 100, 100}}}, &field),
+            "rectangle selection");
+    require(model.pixelSelection() == QRect(10, 20, 100, 100) &&
+                model.aspectRatioPreset() == ScreenshotSelectionAspectRatioPreset::Free &&
+                model.aspectRatioLocked(),
+            "MCP replacement preserves exact bounds and uses a custom session lock");
+    static_cast<void>(model.finalizeAspectRatio(canvas, 1.0));
+    require(model.pixelSelection() == QRect(10, 20, 100, 100),
+            "later confirmation must not reshape an explicit MCP replacement");
+    const auto original = model.selectionRegion().toJson();
+    require(!applySelection(model, canvas, {{QStringLiteral("bounds"), QJsonArray{-1, 0, 20, 20}}},
+                            &field),
+            "outside canvas rejected");
+    require(model.selectionRegion().toJson() == original, "invalid selection is atomic");
+    for (const auto* type : {"polygon", "polyline", "freehand"}) {
+        require(applySelection(
+                    model, canvas,
+                    {{QStringLiteral("type"), QLatin1String(type)},
+                     {QStringLiteral("points"),
+                      QJsonArray{QJsonArray{0, 0}, QJsonArray{100, 0}, QJsonArray{100, 100}}}},
+                    &field),
+                "path selection");
+    }
+}
+void selectionStyle() {
+    ScreenshotSelectionModel model;
+    model.setSelectionRect(QRect(10, 20, 100, 80));
+    QString field;
+    require(applySelectionStyle(model,
+                                {{QStringLiteral("border_type"), QStringLiteral("border")},
+                                 {QStringLiteral("border_width"), 48},
+                                 {QStringLiteral("border_color"), QJsonArray{20, 80, 180, 50}},
+                                 {QStringLiteral("shadow_width"), 12}},
+                                &field),
+            "MCP can configure independent active border and inactive shadow settings");
+    const auto saved = model.params(QRect(0, 0, 800, 600));
+    const auto state = selectionStyleState(model);
+    require(model.effectWidth() == 48 && model.shadowWidth() == 12 &&
+                state.value(QStringLiteral("border_type")) == QStringLiteral("border") &&
+                state.value(QStringLiteral("border_color")) == QJsonArray{20, 80, 180, 255},
+            "MCP reports the actual normalized border appearance");
+    for (const auto& invalid :
+         {QJsonObject{{QStringLiteral("border_type"), QStringLiteral("outline")}},
+          QJsonObject{{QStringLiteral("border_width"), -1}},
+          QJsonObject{{QStringLiteral("border_width"), 1.5}},
+          QJsonObject{{QStringLiteral("border_color"), QJsonArray{0, 0, 256, 255}}},
+          QJsonObject{{QStringLiteral("border_color"), QJsonArray{0, 0, 0}}}}) {
+        auto patch = invalid;
+        patch.insert(QStringLiteral("shadow_width"), 3);
+        require(!applySelectionStyle(model, patch, &field) && !field.isEmpty() &&
+                    model.params(QRect(0, 0, 800, 600)) == saved,
+                "invalid style patches must leave all model settings unchanged");
+    }
+    require(applySelectionStyle(model,
+                                {{QStringLiteral("border_type"), QStringLiteral("shadow")},
+                                 {QStringLiteral("border_width"), 1000}},
+                                &field) &&
+                model.effectWidth() == 12 && model.borderWidth() == 64,
+            "style switching preserves inactive settings and editor limits remain in canvas units");
+}
+
+void session() {
+    QJsonObject editor{{QStringLiteral("capture_phase"), QStringLiteral("idle")}};
+    int canceled = 0, artifacts = 0, mutations = 0;
+    std::atomic_int pngEncodes = 0;
+    bool deferImage = false;
+    std::function<void(QImage)> deliverImage;
+    ScreenshotMcpSession::Ports ports;
+    ports.state = [&] { return editor; };
+    ports.begin = [&](const QJsonObject&, QString*) {
+        editor.insert(QStringLiteral("capture_phase"), QStringLiteral("capturing"));
+        return true;
+    };
+    ports.cancel = [&] {
+        ++canceled;
+        editor.insert(QStringLiteral("capture_phase"), QStringLiteral("idle"));
+    };
+    ports.selection = [&](const QJsonObject&, QString*) {
+        editor.insert(QStringLiteral("selection_version"), ++mutations);
+        return true;
+    };
+    ports.tool = [](const QString&, QString*) { return true; };
+    ports.annotations = [](const QByteArray&, QJsonObject*, QString*) { return true; };
+    ports.history = [&](bool) { editor.insert(QStringLiteral("document_revision"), ++mutations); };
+    ports.artifact = [&](qreal) {
+        ++artifacts;
+        if (deferImage)
+            return std::make_shared<ScreenshotExportArtifact>(
+                ScreenshotExportSource::fromImageLoader(
+                    [&](QObject*, std::function<void(QImage)> done) {
+                        deliverImage = std::move(done);
+                        return true;
+                    }));
+        QImage image(32, 20, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::red);
+        ScreenshotExportArtifact::PngCachePolicy policy;
+        policy.encodingStarted = [&] { ++pngEncodes; };
+        return std::make_shared<ScreenshotExportArtifact>(
+            ScreenshotExportSource::fromImage(image), ScreenshotCompressionLevel::Medium, policy);
+    };
+    ports.copy = [](auto, auto done) {
+        done(true);
+        return true;
+    };
+    ports.pin = [](auto, auto done) {
+        done(true);
+        return true;
+    };
+    ports.direct = [](const QJsonObject&, auto done) {
+        QImage image(24, 12, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::blue);
+        done(image, {}, {});
+        return true;
+    };
+    ScreenshotMcpSession session(std::move(ports));
+    quint64 sequence = 0;
+    const auto call = [&](QString method, QJsonObject params = {}, quint64 owner = 1,
+                          std::optional<quint64> revision = std::nullopt) {
+        ScreenshotMcpRequest r;
+        r.connectionId = owner;
+        r.requestId = QString::number(++sequence);
+        r.idempotencyKey = r.requestId;
+        r.method = method;
+        r.params = params;
+        r.sessionId = session.state().value(QStringLiteral("session_id")).toString();
+        r.expectedRevision =
+            revision ? revision
+                     : std::optional<quint64>(static_cast<quint64>(
+                           session.state().value(QStringLiteral("revision")).toInteger()));
+        std::optional<ScreenshotMcpResponse> response;
+        session.request(r, [&](auto value) { response = std::move(value); });
+        if (method == QStringLiteral("snow_shot_screenshot_begin") && !response) {
+            editor.insert(QStringLiteral("capture_phase"), QStringLiteral("editing"));
+            session.capturePresented();
+        }
+        await([&] { return response.has_value(); });
+        return *response;
+    };
+    require(call(QStringLiteral("snow_shot_screenshot_begin")).ok,
+            "begin completes on capture presented");
+    require(call(QStringLiteral("snow_shot_screenshot_begin"), {}, 2).errorCode ==
+                QStringLiteral("busy"),
+            "one session globally");
+    const auto intruderState = call(QStringLiteral("snow_shot_screenshot_state"), {}, 2);
+    require(intruderState.errorCode == QStringLiteral("session_not_found") &&
+                intruderState.sessionId.isEmpty() && !intruderState.revision &&
+                !intruderState.errorDetails.contains(QStringLiteral("state")),
+            "another client cannot read document state through an error");
+    const auto intruderBegin = call(QStringLiteral("snow_shot_screenshot_begin"), {}, 2);
+    require(intruderBegin.sessionId.isEmpty() && !intruderBegin.revision &&
+                intruderBegin.errorDetails.isEmpty(),
+            "busy response does not disclose the current owner");
+    const auto oldRevision =
+        static_cast<quint64>(session.state().value(QStringLiteral("revision")).toInteger());
+    editor.insert(QStringLiteral("user_edit"), true);
+    session.observe();
+    require(
+        call(QStringLiteral("snow_shot_screenshot_set_selection"), {}, 1, oldRevision).errorCode ==
+            QStringLiteral("stale_revision"),
+        "user edit conflicts");
+    require(mutations == 0, "stale mutation not applied");
+    require(call(QStringLiteral("snow_shot_screenshot_set_selection")).ok,
+            "current revision applies");
+    QTemporaryDir coldOutput(QDir(QDir::tempPath()).canonicalPath() +
+                             QStringLiteral("/mcp-save-XXXXXX"));
+    for (const auto* format : {"jpeg", "pdf"}) {
+        const QString coldPath = coldOutput.filePath(QString::fromLatin1(format) + u'.' + format);
+        const auto saved = call(QStringLiteral("snow_shot_screenshot_save"),
+                                {{QStringLiteral("path"), coldPath},
+                                 {QStringLiteral("format"), QLatin1String(format)}});
+        const QString savedPath = saved.result.value(QStringLiteral("path")).toString();
+        QFile file(savedPath);
+        require(saved.ok &&
+                    savedPath == ScreenshotImageFileService::normalizedPath(
+                                     coldPath, ScreenshotImageFileService::formatForKey(
+                                                   QLatin1String(format))) &&
+                    file.open(QIODevice::ReadOnly),
+                "cold non-PNG save succeeds at its format-normalized path");
+        const auto bytes = file.readAll();
+        require(pngEncodes == 0 && saved.result.value(QStringLiteral("width")) == 32 &&
+                    saved.result.value(QStringLiteral("height")) == 20 &&
+                    saved.result.value(QStringLiteral("format")).toString() ==
+                        QLatin1String(format) &&
+                    saved.result.value(QStringLiteral("byte_count")).toInteger() == bytes.size() &&
+                    saved.result.value(QStringLiteral("sha256")).toString() ==
+                        QString::fromLatin1(
+                            QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()),
+                "non-PNG saves report their actual bytes without a canonical PNG encode");
+    }
+    const QString customPngPath = coldOutput.filePath(QStringLiteral("custom-compression.png"));
+    for (int index = 0; index < 2; ++index) {
+        const auto saved = call(QStringLiteral("snow_shot_screenshot_save"),
+                                {{QStringLiteral("path"), customPngPath},
+                                 {QStringLiteral("format"), QStringLiteral("png")},
+                                 {QStringLiteral("compression_level"), QStringLiteral("high")}});
+        QFile file(customPngPath);
+        require(saved.ok && file.open(QIODevice::ReadOnly), "custom-compression PNG save succeeds");
+        const auto bytes = file.readAll();
+        require(pngEncodes == 1 && saved.result.value(QStringLiteral("width")) == 32 &&
+                    saved.result.value(QStringLiteral("height")) == 20 &&
+                    saved.result.value(QStringLiteral("format")) == QStringLiteral("png") &&
+                    saved.result.value(QStringLiteral("byte_count")).toInteger() == bytes.size() &&
+                    saved.result.value(QStringLiteral("sha256")).toString() ==
+                        QString::fromLatin1(
+                            QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()) &&
+                    snow_shot::image_codec::decode(bytes, snow::image::Format::png, "saved.png")
+                            .size() == QSize(32, 20),
+                "PNG saves encode only their requested compression and reuse committed bytes");
+    }
+    auto rendered = call(QStringLiteral("snow_shot_screenshot_render"));
+    require(rendered.ok && !rendered.attachment.isEmpty() && pngEncodes == 2,
+            "render prepares canonical PNG metadata after saves with different compression");
+    require(call(QStringLiteral("snow_shot_screenshot_render")).ok && artifacts == 1,
+            "render cache reused across output revisions");
+    require(call(QStringLiteral("snow_shot_screenshot_undo")).ok, "history mutation");
+    require(call(QStringLiteral("snow_shot_screenshot_render")).ok && artifacts == 2,
+            "history invalidates render cache");
+    QTemporaryDir output;
+    const QString path = output.filePath(QStringLiteral("test.png"));
+    require(!ScreenshotMcpSession::validateOutputPath(QStringLiteral("relative.png"), nullptr),
+            "relative save rejected");
+    require(!ScreenshotMcpSession::validateOutputPath(QStringLiteral("https://example.com/a.png"),
+                                                      nullptr),
+            "URL save rejected");
+    require(
+        call(QStringLiteral("snow_shot_screenshot_save"), {{QStringLiteral("path"), path}}).ok &&
+            QFile::exists(path),
+        "explicit atomic save");
+    require(call(QStringLiteral("snow_shot_screenshot_copy")).ok,
+            "canonical clipboard publication");
+    require(call(QStringLiteral("snow_shot_screenshot_pin")).ok, "pin completion");
+    ScreenshotMcpRequest idempotent;
+    idempotent.connectionId = 1;
+    idempotent.sessionId = session.state().value(QStringLiteral("session_id")).toString();
+    idempotent.method = QStringLiteral("snow_shot_screenshot_set_selection");
+    idempotent.idempotencyKey = QStringLiteral("same-edit");
+    idempotent.expectedRevision =
+        static_cast<quint64>(session.state().value(QStringLiteral("revision")).toInteger());
+    ScreenshotMcpResponse first, second;
+    session.request(idempotent, [&](auto response) { first = response; });
+    const int applied = mutations;
+    session.request(idempotent, [&](auto response) { second = response; });
+    require(first.ok && second.ok && first.revision == second.revision && mutations == applied,
+            "duplicate mutation returns original result without replay");
+    idempotent.params.insert(QStringLiteral("different"), true);
+    session.request(idempotent, [&](auto response) { second = response; });
+    require(second.errorCode == QStringLiteral("idempotency_conflict"),
+            "idempotency key cannot change payload");
+    deferImage = true;
+    call(QStringLiteral("snow_shot_screenshot_undo"));
+    ScreenshotMcpRequest pending;
+    pending.connectionId = 1;
+    pending.requestId = QStringLiteral("deferred-render");
+    pending.method = QStringLiteral("snow_shot_screenshot_render");
+    pending.sessionId = session.state().value(QStringLiteral("session_id")).toString();
+    pending.expectedRevision =
+        static_cast<quint64>(session.state().value(QStringLiteral("revision")).toInteger());
+    std::optional<ScreenshotMcpResponse> deferredResponse;
+    session.request(pending, [&](auto response) { deferredResponse = response; });
+    await([&] { return bool(deliverImage); });
+    require(call(QStringLiteral("snow_shot_screenshot_state"))
+                    .result.value(QStringLiteral("pending_operation"))
+                    .toString() == pending.method,
+            "state reports pending output");
+    require(call(QStringLiteral("snow_shot_screenshot_cancel"),
+                 {{QStringLiteral("request_id"), pending.requestId}})
+                .ok,
+            "cancel a pending output");
+    require(deferredResponse && deferredResponse->errorCode == QStringLiteral("canceled") &&
+                session.state().value(QStringLiteral("active")).toBool(),
+            "request cancellation keeps the editor session");
+    deliverImage(QImage(2, 2, QImage::Format_ARGB32));
+    deliverImage = {};
+    deferImage = false;
+    require(call(QStringLiteral("snow_shot_screenshot_render")).ok,
+            "render recovers after output cancellation");
+    session.disconnected(1);
+    require(canceled == 0 && !session.state().value(QStringLiteral("active")).toBool(),
+            "visible disconnect preserves work");
+    editor.insert(QStringLiteral("capture_phase"), QStringLiteral("idle"));
+    require(call(QStringLiteral("snow_shot_screenshot_begin"),
+                 {{QStringLiteral("presentation"), QStringLiteral("silent")}})
+                .ok,
+            "silent begin");
+    session.disconnected(1);
+    require(canceled == 1, "silent disconnect cancels capture");
+    auto direct = call(QStringLiteral("snow_shot_screenshot_direct_capture"));
+    require(direct.ok && !direct.attachment.isEmpty() &&
+                !session.state().value(QStringLiteral("active")).toBool(),
+            "direct output finishes session");
+    session.shutdown();
+}
+void beginControlModes() {
+    for (const QString mode : {QStringLiteral("client"), QStringLiteral("user")}) {
+        QJsonObject editor{{QStringLiteral("capture_phase"), QStringLiteral("idle")}};
+        int starts = 0;
+        int cancellations = 0;
+        int detachments = 0;
+        ScreenshotMcpSession::Ports ports;
+        ports.state = [&] { return editor; };
+        ports.begin = [&](const QJsonObject&, QString*) {
+            ++starts;
+            editor.insert(QStringLiteral("capture_phase"), QStringLiteral("capturing"));
+            return true;
+        };
+        ports.cancel = [&] { ++cancellations; };
+        ports.detached = [&] { ++detachments; };
+        ScreenshotMcpSession session(std::move(ports));
+        ScreenshotMcpRequest begin;
+        begin.connectionId = 1;
+        begin.requestId = QStringLiteral("control");
+        begin.idempotencyKey = QStringLiteral("control-key");
+        begin.method = QStringLiteral("snow_shot_screenshot_begin");
+        begin.params = {{QStringLiteral("control_mode"), mode}};
+        auto invalid = begin;
+        invalid.params.insert(QStringLiteral("control_mode"), QStringLiteral("unknown"));
+        session.request(invalid, [&](auto response) {
+            require(response.errorCode == QStringLiteral("invalid_parameters"),
+                    "unknown ownership must not silently become client control");
+        });
+        invalid.idempotencyKey = QStringLiteral("invalid-silent");
+        invalid.params = {{QStringLiteral("control_mode"), QStringLiteral("user")},
+                          {QStringLiteral("presentation"), QStringLiteral("silent")}};
+        session.request(invalid, [&](auto response) {
+            require(response.errorCode == QStringLiteral("invalid_parameters"),
+                    "user handoff requires a visible surface");
+        });
+        require(starts == 0, "invalid ownership never starts capture");
+        std::optional<ScreenshotMcpResponse> result;
+        // Give the valid operation a separate identity from rejected inputs.
+        begin.idempotencyKey = QStringLiteral("valid-control");
+        session.request(begin, [&](auto response) { result = response; });
+        require(!result && starts == 1, "both modes wait for actual capture presentation");
+        editor.insert(QStringLiteral("capture_phase"), QStringLiteral("selecting"));
+        session.capturePresented();
+        const bool user = mode == QStringLiteral("user");
+        require(result && result->ok && result->sessionId.isEmpty() == user &&
+                    result->result.value(QStringLiteral("handed_off")).toBool() == user &&
+                    session.state().value(QStringLiteral("active")).toBool() == !user &&
+                    detachments == (user ? 1 : 0) && cancellations == 0,
+                "handoff releases protocol ownership without canceling the native editor");
+        auto retry = begin;
+        retry.requestId = QStringLiteral("control-retry");
+        session.request(retry, [&](auto response) {
+            require(response.ok && response.sessionId == result->sessionId &&
+                        response.result.value(QStringLiteral("handed_off")).toBool() == user,
+                    "a retry preserves the original ownership result");
+        });
+        require(starts == 1, "replaying a handoff does not open another editor");
+        auto competing = begin;
+        competing.connectionId = 2;
+        competing.idempotencyKey = QStringLiteral("competing");
+        session.request(competing, [&](auto response) {
+            require(response.errorCode == QStringLiteral("busy"),
+                    "an active native editor stays reserved after handoff");
+        });
+        auto cancel = begin;
+        cancel.method = QStringLiteral("snow_shot_screenshot_cancel");
+        cancel.idempotencyKey.clear();
+        cancel.sessionId = result->sessionId;
+        session.request(cancel, [&](auto response) {
+            require(response.ok &&
+                        response.result.value(QStringLiteral("canceled")).toBool() == !user,
+                    "only client-controlled work is canceled by the caller");
+        });
+        require(cancellations == (user ? 0 : 1), "handed-off work survives later caller cancel");
+        session.disconnected(1);
+        require(cancellations == (user ? 0 : 1), "handoff survives connection teardown");
+    }
+}
+void beginRequestLookup() {
+    QJsonObject editor{{QStringLiteral("capture_phase"), QStringLiteral("idle")}};
+    int starts = 0;
+    ScreenshotMcpSession::Ports ports;
+    ports.state = [&] { return editor; };
+    ports.begin = [&](const QJsonObject&, QString*) {
+        ++starts;
+        editor.insert(QStringLiteral("capture_phase"), QStringLiteral("capturing"));
+        return true;
+    };
+    ports.cancel = [&] { editor.insert(QStringLiteral("capture_phase"), QStringLiteral("idle")); };
+    ScreenshotMcpSession session(std::move(ports));
+    ScreenshotMcpRequest begin;
+    begin.connectionId = 1;
+    begin.requestId = QStringLiteral("first");
+    begin.idempotencyKey = QStringLiteral("stable-key");
+    begin.method = QStringLiteral("snow_shot_screenshot_begin");
+    std::optional<ScreenshotMcpResponse> original;
+    session.request(begin, [&](auto response) { original = response; });
+    require(!original && starts == 1, "first begin independently starts acquisition");
+    const auto call = [&](const ScreenshotMcpRequest& request) {
+        std::optional<ScreenshotMcpResponse> result;
+        session.request(request, [&](auto response) { result = response; });
+        require(result.has_value(), "lookup and duplicates return without waiting for capture");
+        return *result;
+    };
+    auto duplicate = begin;
+    duplicate.requestId = QStringLiteral("retry");
+    auto replay = call(duplicate);
+    require(replay.ok &&
+                replay.result.value(QStringLiteral("request_status")) ==
+                    QStringLiteral("running") &&
+                starts == 1,
+            "retry identifies in-flight request without starting another capture");
+    duplicate.params.insert(QStringLiteral("selection_mode"), QStringLiteral("interactive"));
+    require(call(duplicate).errorCode == QStringLiteral("idempotency_conflict"),
+            "in-flight key cannot change semantics");
+    auto lookup = begin;
+    lookup.method = QStringLiteral("snow_shot_screenshot_request");
+    lookup.params = {{QStringLiteral("idempotency_key"), begin.idempotencyKey}};
+    require(call(lookup).result.value(QStringLiteral("request_status")) ==
+                QStringLiteral("running"),
+            "request can be found before its session ID is returned");
+    lookup.connectionId = 2;
+    const auto foreign = call(lookup);
+    require(foreign.errorCode == QStringLiteral("request_not_found") &&
+                foreign.errorDetails.isEmpty(),
+            "other clients cannot discover request identifiers or session state");
+    lookup.connectionId = 1;
+    editor.insert(QStringLiteral("capture_phase"), QStringLiteral("selecting"));
+    editor.insert(QStringLiteral("selection"), QJsonObject{{QStringLiteral("confirmed"), false}});
+    session.capturePresented();
+    require(original && original->ok && starts == 1,
+            "original request completes on readiness without a second begin");
+    require(call(lookup).result.value(QStringLiteral("request_status")) ==
+                QStringLiteral("completed"),
+            "completed begin is retained for response recovery");
+    auto output = begin;
+    output.method = QStringLiteral("snow_shot_screenshot_copy");
+    output.idempotencyKey = QStringLiteral("copy");
+    output.sessionId = original->sessionId;
+    output.expectedRevision = original->revision;
+    require(call(output).errorCode == QStringLiteral("selection_required"),
+            "readiness never authorizes exporting an unconfirmed candidate");
+    auto cancel = output;
+    cancel.method = QStringLiteral("snow_shot_screenshot_cancel");
+    require(call(cancel).ok, "unconfirmed sessions remain cancelable");
+    session.disconnected(1);
+    require(call(lookup).errorCode == QStringLiteral("request_not_found"),
+            "connection teardown retires replay history");
+}
+
+void workflowOperations() {
+    QJsonObject editor{{QStringLiteral("capture_phase"), QStringLiteral("idle")}};
+    ScreenshotMcpSession::Ports ports;
+    ports.state = [&] { return editor; };
+    ports.begin = [&](const QJsonObject&, QString*) {
+        editor.insert(QStringLiteral("capture_phase"), QStringLiteral("editing"));
+        return true;
+    };
+    ports.cancel = [&] { editor.insert(QStringLiteral("capture_phase"), QStringLiteral("idle")); };
+    ports.selection = [&](const QJsonObject&, QString*) { return true; };
+    int commands = 0, canceled = 0, detached = 0;
+    bool completeOnCancel = false;
+    ScreenshotMcpSession::Ports::CommandCompletion deliver;
+    ports.command = [&](const QString& method, const QJsonObject& params, auto completion) {
+        ++commands;
+        if (method == QStringLiteral("snow_shot_screenshot_scroll_once")) {
+            completion({{QStringLiteral("direction"), params.value(QStringLiteral("direction"))},
+                        {QStringLiteral("dispatch_status"), QStringLiteral("posted")}},
+                       {});
+            return;
+        }
+        deliver = std::move(completion);
+    };
+    ports.cancelCommand = [&] {
+        ++canceled;
+        if (completeOnCancel && deliver) {
+            auto callback = std::exchange(deliver, {});
+            callback({}, QStringLiteral("canceled"));
+        }
+    };
+    ports.detached = [&] { ++detached; };
+    ScreenshotMcpSession session(std::move(ports));
+    int counter = 0;
+    const auto makeRequest = [&](const QString& method) {
+        ScreenshotMcpRequest r;
+        r.connectionId = 1;
+        r.method = method;
+        r.requestId = QString::number(++counter);
+        r.idempotencyKey = r.requestId;
+        r.sessionId = session.state().value(QStringLiteral("session_id")).toString();
+        r.expectedRevision =
+            static_cast<quint64>(session.state().value(QStringLiteral("revision")).toInteger());
+        return r;
+    };
+    std::optional<ScreenshotMcpResponse> response;
+    const auto call = [&](const ScreenshotMcpRequest& r) {
+        response.reset();
+        session.request(r, [&](auto value) { response = value; });
+    };
+    call(makeRequest(QStringLiteral("snow_shot_screenshot_begin")));
+    session.capturePresented();
+    require(response && response->ok, "workflow begin completes");
+    auto start = makeRequest(QStringLiteral("snow_shot_screenshot_recognize"));
+    start.params.insert(QStringLiteral("kind"), QStringLiteral("text"));
+    call(start);
+    require(response && response->ok && commands == 1, "recognition returns promptly");
+    const auto operation = response->result.value(QStringLiteral("operation_id")).toString();
+    require(!operation.isEmpty() &&
+                response->result.value(QStringLiteral("status")) == QStringLiteral("running"),
+            "running operation has ID");
+    call(start);
+    require(response && response->ok && commands == 1,
+            "idempotent start never repeats provider work");
+    auto expiredCancel = makeRequest(QStringLiteral("snow_shot_screenshot_cancel"));
+    expiredCancel.params.insert(QStringLiteral("request_id"), start.requestId);
+    call(expiredCancel);
+    require(response && response->errorCode == QStringLiteral("request_not_found") && canceled == 0,
+            "canceling a completed request cannot stop a running background operation");
+    auto query = makeRequest(QStringLiteral("snow_shot_screenshot_operation"));
+    query.params.insert(QStringLiteral("operation_id"), operation);
+    query.expectedRevision.reset();
+    query.idempotencyKey.clear();
+    call(query);
+    require(response && response->ok, "result query needs no revision or mutation key");
+    auto intruder = query;
+    intruder.connectionId = 2;
+    call(intruder);
+    require(response && response->errorCode == QStringLiteral("session_not_found"),
+            "results remain private to owner");
+    call(makeRequest(QStringLiteral("snow_shot_screenshot_set_tool_style")));
+    require(response && response->errorCode == QStringLiteral("busy"),
+            "conflicting edit rejected while recognition runs");
+    deliver({{QStringLiteral("text"), QStringLiteral("recognized")}}, {});
+    call(query);
+    require(response &&
+                response->result.value(QStringLiteral("status")) == QStringLiteral("completed") &&
+                response->result.value(QStringLiteral("result"))
+                        .toObject()
+                        .value(QStringLiteral("text")) == QStringLiteral("recognized"),
+            "typed operation result retained");
+    auto translationRequest = makeRequest(QStringLiteral("snow_shot_screenshot_translate"));
+    call(translationRequest);
+    const auto second = response->result.value(QStringLiteral("operation_id")).toString();
+    auto late = deliver;
+    auto cancel = makeRequest(QStringLiteral("snow_shot_screenshot_cancel"));
+    cancel.params.insert(QStringLiteral("operation_id"), second);
+    call(cancel);
+    require(response && response->ok && canceled > 0, "operation cancellation reaches provider");
+    late({{QStringLiteral("text"), QStringLiteral("late")}}, {});
+    query.params.insert(QStringLiteral("operation_id"), second);
+    call(query);
+    require(response &&
+                response->result.value(QStringLiteral("status")) == QStringLiteral("canceled"),
+            "late completion cannot resurrect canceled operation");
+    auto step = makeRequest(QStringLiteral("snow_shot_screenshot_scroll_once"));
+    step.params.insert(QStringLiteral("direction"), QStringLiteral("down"));
+    call(step);
+    require(response && response->ok &&
+                response->result.value(QStringLiteral("dispatch_status")) ==
+                    QStringLiteral("posted") &&
+                response->result.value(QStringLiteral("direction")) == QStringLiteral("down") &&
+                !response->result.contains(QStringLiteral("changed")) &&
+                !response->result.contains(QStringLiteral("processed_frame_sequence")),
+            "scroll immediately acknowledges dispatch without claiming capture completion");
+    const int before = commands;
+    call(step);
+    require(response && response->ok && commands == before,
+            "scroll replay cannot dispatch another notch");
+    auto scrollingStart = makeRequest(QStringLiteral("snow_shot_screenshot_scrolling"));
+    scrollingStart.params.insert(QStringLiteral("action"), QStringLiteral("start"));
+    std::optional<ScreenshotMcpResponse> startResponse;
+    int startCompletions = 0;
+    session.request(scrollingStart, [&](auto value) {
+        ++startCompletions;
+        startResponse = std::move(value);
+    });
+    auto lateStart = deliver;
+    const int cancellationsBefore = canceled;
+    call(expiredCancel);
+    require(response && response->errorCode == QStringLiteral("request_not_found") &&
+                canceled == cancellationsBefore && !startResponse,
+            "a mismatched cancellation leaves the pending scrolling start running");
+    cancel = makeRequest(QStringLiteral("snow_shot_screenshot_cancel"));
+    cancel.params.insert(QStringLiteral("request_id"), scrollingStart.requestId);
+    completeOnCancel = true;
+    call(cancel);
+    completeOnCancel = false;
+    require(response && response->ok && startResponse &&
+                startResponse->errorCode == QStringLiteral("canceled") && startCompletions == 1 &&
+                session.state().value(QStringLiteral("active")).toBool(),
+            "synchronous controller cancellation completes once and preserves the session");
+    lateStart({}, {});
+    require(startCompletions == 1, "late scrolling start completion cannot overwrite cancellation");
+    session.disconnected(1);
+    require(detached == 1 &&
+                editor.value(QStringLiteral("capture_phase")) == QStringLiteral("editing"),
+            "disconnect stops automation while preserving visible work");
+}
+void annotationRuntime() {
+    SnowCanvasRuntime runtime;
+    SnowCanvasWidget canvas(runtime);
+    canvas.resize(300, 200);
+    canvas.show();
+    QCoreApplication::processEvents();
+    int changes = 0;
+    runtime.setDocumentChangedHandler([&] { ++changes; });
+    const auto result = runtime.applyAnnotationTransaction(
+        R"({"version":1,"operations":[{"type":"rectangle","bounds":[10,10,50,60]}]})");
+    require(!result.isEmpty() && changes == 1 && canvas.canvasHistoryState().canUndo,
+            "typed transaction refreshes registered visible viewport");
+    require(runtime.selectedElementIds() == QJsonDocument::fromJson(result)
+                                                .object()
+                                                .value(QStringLiteral("selected_element_ids"))
+                                                .toArray(),
+            "lightweight selected ID query matches the transaction without serializing templates");
+    require(runtime.undo() && canvas.canvasHistoryState().canRedo && changes == 2,
+            "undo refreshes viewport history");
+    require(runtime.redo() && canvas.canvasHistoryState().canUndo && changes == 3,
+            "redo refreshes viewport history");
+    const auto revision = runtime.documentRevision();
+    require(runtime.applyAnnotationTransaction(
+                       R"({"version":1,"operations":[{"type":"rectangle","bounds":[0,0,-5,8]}]})")
+                    .isEmpty() &&
+                runtime.documentRevision() == revision,
+            "invalid typed input is atomic through Qt runtime");
+    runtime.setDocumentChangedHandler({});
+    require(runtime.undo() && runtime.documentRevision() != revision && changes == 3,
+            "detaching observation preserves editing and revisions without notifications");
+    runtime.setDocumentChangedHandler([&] { ++changes; });
+    require(changes == 3, "reattaching must not replay changes from the detached interval");
+    require(runtime.redo() && changes == 4,
+            "reattached observer receives the next edit exactly once");
+    runtime.setDocumentChangedHandler({});
+    require(runtime.undo() && changes == 4, "observation can be repeatedly detached");
+}
+void serialNumberPatchesPreserveMixedSelectionProperties(bool useWidget) {
+    SnowCanvasRuntime runtime;
+    const auto created =
+        QJsonDocument::fromJson(
+            runtime.applyAnnotationTransaction(
+                R"({"version":1,"operations":[{"type":"serial_number","center":[0,0],"number":1}]})"))
+            .object()
+            .value(QStringLiteral("created_element_ids"))
+            .toArray();
+    require(created.size() == 1, "create the serial-number patch fixture");
+    SnowCanvasRuntimeEditor editor(runtime);
+    SnowCanvasWidget canvas(runtime);
+    const auto id = created.first().toObject();
+    require(editor.select(static_cast<quint32>(id.value(QStringLiteral("index")).toInt()),
+                          static_cast<quint32>(id.value(QStringLiteral("generation")).toInt())),
+            "select the serial-number patch fixture");
+    auto drawTemplate = QJsonDocument::fromJson(runtime.serializeSelectedDrawTemplate()).object();
+    const auto first = drawTemplate.value(QStringLiteral("elements")).toArray().first().toObject();
+    auto second = first;
+    auto secondId = id;
+    secondId.insert(QStringLiteral("index"), id.value(QStringLiteral("index")).toInt() + 1);
+    second.insert(QStringLiteral("id"), secondId);
+    auto secondData = second.value(QStringLiteral("data")).toObject();
+    auto secondSerial = secondData.value(QStringLiteral("SerialNumber")).toObject();
+    secondSerial.insert(QStringLiteral("numeric_type"), QStringLiteral("Roman"));
+    secondSerial.insert(QStringLiteral("type"), QStringLiteral("SolidSquare"));
+    secondSerial.insert(QStringLiteral("number"), 27);
+    secondSerial.insert(QStringLiteral("font_size"), 42);
+    secondData.insert(QStringLiteral("SerialNumber"), secondSerial);
+    second.insert(QStringLiteral("data"), secondData);
+    drawTemplate.insert(QStringLiteral("elements"), QJsonArray{first, second});
+    // The last selected ID is primary: request values already present on that item.
+    drawTemplate.insert(QStringLiteral("selectedIds"), QJsonArray{secondId, id});
+    const auto payload = QJsonDocument(drawTemplate).toJson();
+    require(useWidget ? canvas.insertDrawTemplate(payload, QPointF(200, 0))
+                      : editor.insertDrawTemplate(payload, QPointF(200, 0)),
+            "insert and select serial numbers with mixed shapes, formats, values and sizes");
+    const auto apply = [&](const QJsonObject& patch) {
+        const QJsonObject params{{QStringLiteral("target"), QStringLiteral("serial_number")},
+                                 {QStringLiteral("style"), patch}};
+        return useWidget ? mcpStylePatch(editor, canvas, params)
+                         : mcpStylePatch(editor, editor, params);
+    };
+    const auto state =
+        useWidget ? canvas.canvasStyleToolbarState() : editor.canvasStyleToolbarState();
+    require(state.serialNumberStyle.numericType == SnowCanvasSerialNumberNumericType::Arabic &&
+                state.serialNumberStyle.type == SnowCanvasSerialNumberType::OutlinedCircle &&
+                (state.serialNumberStyleMixed & SnowCanvasSerialNumberStyleMixedNumericType) &&
+                (state.serialNumberStyleMixed & SnowCanvasSerialNumberStyleMixedType),
+            "the primary serial number represents both mixed properties");
+    const auto selectedElements = [&] {
+        return QJsonDocument::fromJson(runtime.serializeSelectedDrawTemplate())
+            .object()
+            .value(QStringLiteral("elements"))
+            .toArray();
+    };
+    const auto before = selectedElements();
+    const auto revision = runtime.documentRevision();
+    require(apply({{QStringLiteral("opacity"), 1}}) && selectedElements() == before &&
+                runtime.documentRevision() == revision,
+            "a no-op patch does not resolve unrelated mixed properties or create history");
+    const auto verifyPatch = [&](const QJsonObject& patch, const QJsonObject& expectedChanges) {
+        require(apply(patch), "apply an explicit serial-number MCP patch");
+        const auto after = selectedElements();
+        require(after.size() == before.size(), "style patches preserve the selection");
+        for (qsizetype i = 0; i < before.size(); ++i) {
+            auto expected = before[i]
+                                .toObject()
+                                .value(QStringLiteral("data"))
+                                .toObject()
+                                .value(QStringLiteral("SerialNumber"))
+                                .toObject();
+            auto actual = after[i]
+                              .toObject()
+                              .value(QStringLiteral("data"))
+                              .toObject()
+                              .value(QStringLiteral("SerialNumber"))
+                              .toObject();
+            for (auto it = expectedChanges.begin(); it != expectedChanges.end(); ++it)
+                expected.insert(it.key(), it.value());
+            // Label changes legitimately recompute the badge diameter.
+            expected.remove(QStringLiteral("diameter"));
+            actual.remove(QStringLiteral("diameter"));
+            if (actual != expected) {
+                std::cerr << "Patch: "
+                          << QJsonDocument(patch).toJson(QJsonDocument::Compact).constData()
+                          << "\nExpected: "
+                          << QJsonDocument(expected).toJson(QJsonDocument::Compact).constData()
+                          << "\nActual: "
+                          << QJsonDocument(actual).toJson(QJsonDocument::Compact).constData()
+                          << '\n';
+            }
+            require(actual == expected, "MCP patches change only explicitly requested properties");
+        }
+        require(runtime.undo() && selectedElements() == before,
+                "undo restores the complete mixed selection");
+        require(runtime.redo() && selectedElements() == after, "redo restores the explicit patch");
+        require(runtime.undo() && selectedElements() == before,
+                "restore the fixture for the next patch");
+    };
+    verifyPatch({{QStringLiteral("numeric_type"), QStringLiteral("arabic")}},
+                {{QStringLiteral("numeric_type"), QStringLiteral("Arabic")}});
+    verifyPatch({{QStringLiteral("serial_type"), QStringLiteral("outlined_circle")}},
+                {{QStringLiteral("type"), QStringLiteral("OutlinedCircle")}});
+    verifyPatch({{QStringLiteral("numeric_type"), QStringLiteral("chinese")},
+                 {QStringLiteral("opacity"), 0.5}},
+                {{QStringLiteral("numeric_type"), QStringLiteral("Chinese")},
+                 {QStringLiteral("opacity"), 0.5}});
+    verifyPatch({{QStringLiteral("stroke_width"), 4},
+                 {QStringLiteral("stroke_style"), QStringLiteral("dashed")}},
+                {{QStringLiteral("stroke_width"), 4},
+                 {QStringLiteral("stroke_style"), QStringLiteral("dashed")}});
+}
+
+void completeToolStyleContract() {
+    struct Styles {
+        SnowCanvasStyleToolbarState state;
+        quint32 properties = 0;
+        int updates = 0;
+        SnowCanvasStyleToolbarState canvasStyleToolbarState() const {
+            return state;
+        }
+        SnowCanvasWatermarkConfig canvasWatermarkConfig() const {
+            return {};
+        }
+        SnowCanvasSpotlightConfig canvasSpotlightConfig() const {
+            return {};
+        }
+        void setShapeStyleFromToolbar(const SnowCanvasShapeStyle& value, quint32 flags,
+                                      SnowCanvasShapeKind) {
+            state.shapeStyle = value;
+            properties = flags;
+            ++updates;
+        }
+        void setTextStyleFromToolbar(const SnowCanvasTextStyle& value, quint32 flags) {
+            state.textStyle = value;
+            properties = flags;
+            ++updates;
+        }
+        void setSerialNumberStyleFromToolbar(const SnowCanvasSerialNumberStyle& value,
+                                             quint32 flags) {
+            state.serialNumberStyle = value;
+            properties = flags;
+            ++updates;
+        }
+        bool setAngleStyleFromToolbar(const SnowCanvasAngleStyle& value, quint32 flags) {
+            state.angleStyle = value;
+            properties = flags;
+            ++updates;
+            return true;
+        }
+        bool setMagnifierStyleFromToolbar(const SnowCanvasMagnifierStyle& value, quint32 flags,
+                                          bool) {
+            state.magnifierStyle = value;
+            properties = flags;
+            ++updates;
+            return true;
+        }
+        bool setDistanceStyleFromToolbar(const SnowCanvasDistanceStyle& value, quint32 flags) {
+            state.distanceStyle = value;
+            properties = flags;
+            ++updates;
+            return true;
+        }
+        bool setBracketStyleFromToolbar(const SnowCanvasBracketStyle& value, quint32 flags) {
+            state.bracketStyle = value;
+            properties = flags;
+            ++updates;
+            return true;
+        }
+        void setWatermarkConfigFromToolbar(const SnowCanvasWatermarkConfig&) {
+            ++updates;
+        }
+        void setSpotlightConfigFromToolbar(const SnowCanvasSpotlightConfig&) {
+            ++updates;
+        }
+        void setFilterStyleFromToolbar(const SnowCanvasFilterStyle&, quint32) {
+            ++updates;
+        }
+        bool setBrushEraserCreationStyle(const SnowCanvasBrushEraserStyle& value) {
+            state.brushEraserStyle = value;
+            ++updates;
+            return true;
+        }
+    } styles;
+    const auto apply = [&](const QString& target, const QJsonObject& patch) {
+        return mcpStylePatch(
+            styles, styles, {{QStringLiteral("target"), target}, {QStringLiteral("style"), patch}});
+    };
+    for (const auto& target : {QStringLiteral("rectangle"), QStringLiteral("speech_bubble"),
+                               QStringLiteral("arrow"), QStringLiteral("line")}) {
+        const QStringList values{QStringLiteral("architect"), QStringLiteral("artist"),
+                                 QStringLiteral("cartoonist")};
+        for (int index = 0; index < values.size(); ++index) {
+            require(apply(target, {{QStringLiteral("stroke_rendering_style"), values.at(index)}}) &&
+                        styles.state.shapeStyle.strokeRenderingStyle ==
+                            static_cast<SnowCanvasStrokeRenderingStyle>(index) &&
+                        styles.properties == SnowCanvasShapeStylePropertyStrokeRenderingStyle,
+                    "rendering MCP styles should map names to exact rendering property patches");
+        }
+    }
+    for (const auto& value :
+         {QStringLiteral("architect"), QStringLiteral("artist"), QStringLiteral("cartoonist")}) {
+        const auto number = styles.state.serialNumberStyle.number;
+        require(apply(QStringLiteral("serial_number"),
+                      {{QStringLiteral("stroke_rendering_style"), value}}) &&
+                    styles.properties == SnowCanvasSerialNumberStyleMixedStrokeRenderingStyle &&
+                    styles.state.serialNumberStyle.number == number &&
+                    styles.state.serialNumberStyle.strokeRenderingStyle ==
+                        (value == QStringLiteral("artist") ? SnowCanvasStrokeRenderingStyle::Artist
+                         : value == QStringLiteral("cartoonist")
+                             ? SnowCanvasStrokeRenderingStyle::Cartoonist
+                             : SnowCanvasStrokeRenderingStyle::Architect),
+                "sequence MCP stroke types must dispatch only the stroke rendering property");
+    }
+    const int renderingUpdates = styles.updates;
+    for (const auto& target : {QStringLiteral("freehand"), QStringLiteral("text"),
+                               QStringLiteral("rectangle_highlight")}) {
+        require(
+            !apply(target, {{QStringLiteral("stroke_rendering_style"), QStringLiteral("artist")}}),
+            "rendering MCP styles should reject unsupported tool targets");
+    }
+    require(!apply(QStringLiteral("rectangle"),
+                   {{QStringLiteral("stroke_rendering_style"), QStringLiteral("rough")}}) &&
+                !apply(QStringLiteral("arrow"), {{QStringLiteral("stroke_rendering_style"), 1}}) &&
+                styles.updates == renderingUpdates,
+            "invalid rendering MCP patches should reject atomically before command dispatch");
+    require(apply(QStringLiteral("arrow"),
+                  {{QStringLiteral("arrow_shaft_type"), QStringLiteral("tapered")},
+                   {QStringLiteral("arrow_ratio"), 2.5}}) &&
+                styles.state.shapeStyle.arrowShaftType == SnowCanvasArrowShaftType::Tapered &&
+                styles.state.shapeStyle.arrowRatio == 2.5 &&
+                (styles.properties & SnowCanvasShapeStylePropertyArrowRatio) &&
+                (styles.properties & SnowCanvasShapeStylePropertyArrowShaftType),
+            "arrow shaft and ratio must reach the command sink with exact property flags");
+    require(apply(QStringLiteral("arrow"),
+                  {{QStringLiteral("arrow_outline_width"), 8.0},
+                   {QStringLiteral("arrow_outline_color"), QJsonArray{255, 204, 0, 128}}}) &&
+                styles.state.shapeStyle.arrowOutlineWidth == 8.0 &&
+                styles.state.shapeStyle.arrowOutlineColor == QColor(255, 204, 0, 128) &&
+                styles.properties == (SnowCanvasShapeStylePropertyArrowOutlineColor |
+                                      SnowCanvasShapeStylePropertyArrowOutlineWidth),
+            "MCP arrow outlines preserve alpha and exact property flags");
+    const auto outlineState = styles.state;
+    const auto outlineProperties = styles.properties;
+    const int outlineUpdates = styles.updates;
+    for (const auto& invalidColor :
+         {QJsonValue(QStringLiteral("#80ffcc00")), QJsonValue(QJsonArray{255, 204, 0}),
+          QJsonValue(QJsonArray{255, 204, 0, 128, 255}), QJsonValue(QJsonArray{-1, 204, 0, 128}),
+          QJsonValue(QJsonArray{256, 204, 0, 128}), QJsonValue(QJsonArray{255, 204, 0, 128.5}),
+          QJsonValue(QJsonArray{255, 204, 0, QStringLiteral("128")})}) {
+        require(!apply(QStringLiteral("arrow"),
+                       {{QStringLiteral("arrow_outline_width"), 4.0},
+                        {QStringLiteral("arrow_outline_color"), invalidColor}}) &&
+                    styles.state.shapeStyle == outlineState.shapeStyle &&
+                    styles.properties == outlineProperties && styles.updates == outlineUpdates,
+                "malformed MCP outline colors reject the entire patch before dispatch");
+    }
+    require(!apply(QStringLiteral("line"), {{QStringLiteral("arrow_outline_width"), 2.0}}) &&
+                !apply(QStringLiteral("arrow"), {{QStringLiteral("arrow_outline_width"), 73.0}}),
+            "MCP rejects outlines for other tools and invalid outline widths");
+    require(apply(QStringLiteral("arrow"), {{QStringLiteral("arrow_ratio"), 0.5}}) &&
+                styles.state.shapeStyle.arrowRatio == 0.5 &&
+                styles.properties == SnowCanvasShapeStylePropertyArrowRatio,
+            "the minimum arrow ratio must reach the command sink unchanged");
+    require(apply(QStringLiteral("text"),
+                  {{QStringLiteral("horizontal_align"), QStringLiteral("right")},
+                   {QStringLiteral("vertical_align"), QStringLiteral("bottom")},
+                   {QStringLiteral("corner_radii"), QJsonArray{1, 2, 3, 4}}}) &&
+                styles.state.textStyle.horizontalAlign == SnowCanvasTextHorizontalAlign::Right &&
+                styles.state.textStyle.verticalAlign == SnowCanvasTextVerticalAlign::Bottom &&
+                styles.state.textStyle.cornerRadii == SnowCanvasCornerRadii{1, 2, 3, 4} &&
+                styles.properties ==
+                    (SnowCanvasTextStyleMixedHorizontalAlign |
+                     SnowCanvasTextStyleMixedVerticalAlign | SnowCanvasTextStyleMixedCornerRadii),
+            "text alignment and independent corner radii must preserve their ordering");
+    require(apply(QStringLiteral("serial_number"),
+                  {{QStringLiteral("number"), 42},
+                   {QStringLiteral("serial_type"), QStringLiteral("solid_square")},
+                   {QStringLiteral("numeric_type"), QStringLiteral("roman")}}) &&
+                styles.state.serialNumberStyle.number == 42 &&
+                styles.state.serialNumberStyle.type == SnowCanvasSerialNumberType::SolidSquare &&
+                styles.state.serialNumberStyle.numericType ==
+                    SnowCanvasSerialNumberNumericType::Roman &&
+                styles.properties ==
+                    (SnowCanvasSerialNumberStyleMixedNumber | SnowCanvasSerialNumberStyleMixedType |
+                     SnowCanvasSerialNumberStyleMixedNumericType),
+            "serial-number patches must carry exactly the requested property flags");
+    for (const auto& target : {QStringLiteral("rectangle"), QStringLiteral("line"),
+                               QStringLiteral("freehand"), QStringLiteral("text"),
+                               QStringLiteral("serial_number"), QStringLiteral("speech_bubble")}) {
+        require(apply(target, {{QStringLiteral("fill_style"), QStringLiteral("border")}}),
+                "MCP accepts Border for configurable fills");
+        const auto mode = target == QStringLiteral("text") ? styles.state.textStyle.fillStyle
+                          : target == QStringLiteral("serial_number")
+                              ? styles.state.serialNumberStyle.fillStyle
+                              : styles.state.shapeStyle.fillStyle;
+        require(mode == SnowCanvasFillStyle::Border, "Border reaches the style command sink");
+    }
+    for (int connection = 0; connection < 3; ++connection) {
+        const QString types[] = {QStringLiteral("none"), QStringLiteral("leader_line"),
+                                 QStringLiteral("gradient")};
+        for (bool outline : {false, true}) {
+            require(apply(QStringLiteral("magnifier"),
+                          {{QStringLiteral("connection_type"), types[connection]},
+                           {QStringLiteral("source_outline"), outline}}) &&
+                        styles.state.magnifierStyle.connectionType ==
+                            static_cast<SnowCanvasMagnifierConnectionType>(connection) &&
+                        styles.state.magnifierStyle.sourceOutline == outline &&
+                        styles.properties == (SnowCanvasMagnifierStylePropertyConnectionType |
+                                              SnowCanvasMagnifierStylePropertySourceOutline),
+                    "MCP preserves all six connection/source-outline combinations and exact masks");
+        }
+    }
+    require(apply(QStringLiteral("magnifier"),
+                  {{QStringLiteral("connection_type"), QStringLiteral("leader_line")}}) &&
+                styles.state.magnifierStyle.connectionType ==
+                    SnowCanvasMagnifierConnectionType::LeaderLine &&
+                styles.state.magnifierStyle.sourceOutline &&
+                styles.properties == SnowCanvasMagnifierStylePropertyConnectionType,
+            "MCP connection edits preserve the independent source outline");
+    require(apply(QStringLiteral("magnifier"), {{QStringLiteral("source_outline"), false}}) &&
+                !styles.state.magnifierStyle.sourceOutline &&
+                styles.state.magnifierStyle.connectionType ==
+                    SnowCanvasMagnifierConnectionType::LeaderLine &&
+                styles.properties == SnowCanvasMagnifierStylePropertySourceOutline,
+            "MCP source-outline edits preserve the independent connection type");
+    const int previous = styles.updates;
+    require(
+        apply(QStringLiteral("magnifier"),
+              {{QStringLiteral("shape"), QStringLiteral("diamond")},
+               {QStringLiteral("factor"), 10.0},
+               {QStringLiteral("connection_type"), QStringLiteral("none")},
+               {QStringLiteral("source_outline"), false},
+               {QStringLiteral("leader_arrowhead"), QStringLiteral("crowfoot_one_or_many")},
+               {QStringLiteral("arrow_ratio"), 2.3},
+               {QStringLiteral("corner_radii"), QJsonArray{3, 6, 9, 12}}}) &&
+            styles.state.magnifierStyle.shape == SnowCanvasRectangleShape::Diamond &&
+            styles.state.magnifierStyle.factor == 10.0 &&
+            styles.state.magnifierStyle.connectionType == SnowCanvasMagnifierConnectionType::None &&
+            !styles.state.magnifierStyle.sourceOutline &&
+            styles.state.magnifierStyle.leaderArrowhead == SnowCanvasArrowhead::CrowfootOneOrMany &&
+            styles.state.magnifierStyle.arrowRatio == 2.3 &&
+            styles.state.magnifierStyle.cornerRadii == SnowCanvasCornerRadii{3, 6, 9, 12} &&
+            styles.properties ==
+                (SnowCanvasMagnifierStylePropertyShape | SnowCanvasMagnifierStylePropertyFactor |
+                 SnowCanvasMagnifierStylePropertyConnectionType |
+                 SnowCanvasMagnifierStylePropertySourceOutline |
+                 SnowCanvasMagnifierStylePropertyLeaderArrowhead |
+                 SnowCanvasMagnifierStylePropertyArrowRatio |
+                 SnowCanvasMagnifierStylePropertyCornerRadius),
+        "magnifier automation retains complete styles and exact property masks");
+    require(!apply(QStringLiteral("magnifier"), {{QStringLiteral("factor"), 0.9}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("arrow_ratio"), 0.4}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("arrow_ratio"), 3.1}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("factor"), 10.1}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("show_leader"), true}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("source_outline"), 1}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("connection_type"), 2}}) &&
+                !apply(QStringLiteral("magnifier"),
+                       {{QStringLiteral("connection_type"), QStringLiteral("unsupported")}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("stroke_width"), 73}}) &&
+                !apply(QStringLiteral("magnifier"), {{QStringLiteral("corner_radius"), -1}}) &&
+                !apply(QStringLiteral("magnifier"),
+                       {{QStringLiteral("corner_radius"), 2},
+                        {QStringLiteral("corner_radii"), QJsonArray{1, 2, 3, 4}}}) &&
+                !apply(QStringLiteral("magnifier"),
+                       {{QStringLiteral("fill"), QJsonArray{0, 0, 0, 255}}}) &&
+                styles.updates == previous + 1,
+            "invalid magnifier automation patches reject before dispatch");
+    require(
+        !apply(QStringLiteral("text"),
+               {{QStringLiteral("corner_radius"), 2},
+                {QStringLiteral("corner_radii"), QJsonArray{1, 2, 3, 4}}}) &&
+            !apply(QStringLiteral("arrow"), {{QStringLiteral("arrow_ratio"), 4}}) &&
+            !apply(QStringLiteral("arrow"), {{QStringLiteral("arrow_ratio"), 0.4}}) &&
+            !apply(QStringLiteral("serial_number"), {{QStringLiteral("number"), 1.5}}) &&
+            !apply(QStringLiteral("serial_number"),
+                   {{QStringLiteral("numeric_type"), QStringLiteral("invalid")}}) &&
+            !apply(QStringLiteral("rectangle"), {{QStringLiteral("opacity"), 0.5}}) &&
+            !apply(QStringLiteral("arrow"), {{QStringLiteral("fill"), QJsonArray{0, 0, 0, 255}}}) &&
+            !apply(QStringLiteral("rectangle_highlight"),
+                   {{QStringLiteral("shape"), QStringLiteral("ellipse")}}) &&
+            !apply(QStringLiteral("pen_highlight"), {{QStringLiteral("corner_radius"), 3}}) &&
+            styles.updates == previous + 1,
+        "ambiguous or unsupported styles must reject atomically before command dispatch");
+    require(apply(QStringLiteral("magnifier"), {{QStringLiteral("corner_radius"), 6}}) &&
+                styles.state.magnifierStyle.cornerRadii == SnowCanvasCornerRadii{6, 6, 6, 6} &&
+                styles.properties == SnowCanvasMagnifierStylePropertyCornerRadius &&
+                styles.state.magnifierStyle.factor == 10,
+            "uniform magnifier corner patches preserve unrelated properties");
+}
+} // namespace
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    QTemporaryDir temporary;
+    auto& storage = snow_shot::storage::ApplicationStorage::instance();
+    require(temporary.isValid() &&
+                storage.initialize({temporary.filePath(QStringLiteral("bin")), temporary.path(), 0})
+                    .success,
+            "isolated MCP test storage");
+    const auto cleanup = qScopeGuard([&] {
+        ScreenshotExportCoordinator::shared().shutdown();
+        storage.shutdown();
+    });
+    if (app.arguments().contains(QStringLiteral("--selection-style-only"))) {
+        selectionStyle();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--session-completion-reentry-only"))) {
+        sessionCompletionReentry();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--begin-request-only"))) {
+        beginControlModes();
+        beginRequestLookup();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--transport-only"))) {
+        transport();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--replay-lifecycle-only"))) {
+        replaySubscriptions();
+        sessionCompletionReentry();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--magnifier-only")) ||
+        app.arguments().contains(QStringLiteral("--stroke-rendering-only")) ||
+        app.arguments().contains(QStringLiteral("--border-fill-only"))) {
+        completeToolStyleContract();
+        return 0;
+    }
+    replaySubscriptions();
+    beginControlModes();
+    beginRequestLookup();
+    sessionCompletionReentry();
+    serialNumberPatchesPreserveMixedSelectionProperties(false);
+    serialNumberPatchesPreserveMixedSelectionProperties(true);
+    completeToolStyleContract();
+    workflowOperations();
+    annotationRuntime();
+    transport();
+    descriptorOverride();
+    selection();
+    selectionStyle();
+    session();
+    return 0;
+}

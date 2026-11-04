@@ -1,0 +1,236 @@
+#include "snow_shot/presentation/screenshotselectorworkflow.h"
+
+#include "../capture/screenshotcaptureperfinstrumentation.h"
+#include "screenshotselectordisplaygeometry.h"
+#include "snow_shot/presentation/screenshotcapturestate.h"
+#include "snow_shot/presentation/screenshotdisplaysession.h"
+#include "snow_shot/presentation/screenshotgeometry.h"
+#include "snow_shot/presentation/screenshotintelligentselectionmodel.h"
+#include "snow_shot/presentation/screenshotinteractionstate.h"
+#include "snow_shot/presentation/screenshotselectionmodel.h"
+#include "snow_shot/presentation/screenshotselectionlimits.h"
+
+#include <utility>
+
+ScreenshotSelectorWorkflow::ScreenshotSelectorWorkflow(ScreenshotSelectorWorkflowContext context)
+    : m_context(std::move(context)) {}
+
+void ScreenshotSelectorWorkflow::updateSmartSelectionMode(snow_shot::SmartSelectionMode mode) {
+    if (!m_context.intelligentSelection.updateSmartSelectionMode(mode) ||
+        m_context.interaction.inactive())
+        return;
+    const bool hoverSelection =
+        m_context.interaction.intelligentSelecting() ||
+        (m_context.interaction.manualSelecting() && !m_context.interaction.dragging() &&
+         !m_context.selection.hasPixelSelection());
+    if (hoverSelection && m_context.selection.regionType() == ScreenshotRegionType::Rectangle) {
+        const bool enabled = m_context.intelligentSelection.smartSelectionEnabled();
+        m_context.interaction.returnToSelectionMode(enabled);
+        m_context.selection.setSelectionRect(m_context.intelligentSelection.currentSelection());
+        if (enabled) {
+            if (!m_context.selectorService.ready() && !m_context.selectorService.refreshInFlight())
+                startRefresh();
+            static_cast<void>(updateSelectionAt(m_context.geometry.physicalPositionForLogicalPoint(
+                m_context.displaySession, m_context.displaySession.logicalCursorPosition())));
+        } else if (m_context.presentation.smartSelectionResultReady) {
+            m_context.presentation.smartSelectionResultReady(m_context.captureState.sessionId);
+        }
+    }
+    if (m_context.presentation.updateOverlayState)
+        m_context.presentation.updateOverlayState();
+}
+
+void ScreenshotSelectorWorkflow::startRefresh() {
+    if (!m_context.intelligentSelection.smartSelectionEnabled() ||
+        m_context.selection.regionType() != ScreenshotRegionType::Rectangle)
+        return;
+    if (m_context.interaction.inactive() || !m_context.displaySession.hasActiveDisplays()) {
+        return;
+    }
+
+    QVector<CapturedDisplayModel> displays;
+    m_context.displaySession.forEachActiveDisplay([&](qsizetype, const CapturedDisplayModel& d) {
+        displays.push_back(screenshotSelectorDisplayGeometry(d));
+    });
+    if (!m_context.selectorService.startRefreshWithDisplays(excludedHwnds(), displays)) {
+        return;
+    }
+}
+
+void ScreenshotSelectorWorkflow::handleRefreshFinished(bool ok) {
+    if (!m_context.intelligentSelection.smartSelectionEnabled() ||
+        m_context.selection.regionType() != ScreenshotRegionType::Rectangle)
+        return;
+    if (m_context.interaction.inactive()) {
+        return;
+    }
+
+    if (!ok) {
+        if (m_context.interaction.intelligentSelecting() && !m_context.interaction.dragging()) {
+            m_context.interaction.returnToSelectionMode(false);
+            m_context.intelligentSelection.clearTransientState();
+            if (m_context.presentation.updateOverlayState)
+                m_context.presentation.updateOverlayState();
+            if (m_context.presentation.smartSelectionResultReady &&
+                m_initialNotifiedSession != m_context.captureState.sessionId) {
+                m_initialNotifiedSession = m_context.captureState.sessionId;
+                m_context.presentation.smartSelectionResultReady(m_context.captureState.sessionId);
+            }
+        }
+        return;
+    }
+
+    if (m_context.interaction.manualSelecting() && !m_context.interaction.dragging() &&
+        m_context.selection.pixelSelection().isEmpty()) {
+        m_context.interaction.returnToSelectionMode(true);
+        static_cast<void>(updateSelectionAt(m_context.geometry.physicalPositionForLogicalPoint(
+            m_context.displaySession, m_context.displaySession.logicalCursorPosition())));
+        if (m_context.presentation.updateColorPicker) {
+            m_context.presentation.updateColorPicker();
+        }
+    }
+}
+
+QVector<std::uintptr_t> ScreenshotSelectorWorkflow::excludedHwnds() const {
+    return m_context.overlayExclusions.excludedHwnds(m_context.displaySession);
+}
+
+bool ScreenshotSelectorWorkflow::updateSelectionAt(const QPoint& physicalPoint) {
+    if (!m_context.interaction.intelligentSelecting()) {
+        return false;
+    }
+
+    return requestHitTest(physicalPoint);
+}
+
+bool ScreenshotSelectorWorkflow::requestHitTest(const QPoint& physicalPoint, quint32 displayId) {
+    if (!m_context.intelligentSelection.smartSelectionEnabled() ||
+        m_context.selection.regionType() != ScreenshotRegionType::Rectangle ||
+        !m_context.interaction.intelligentSelecting() ||
+        (!m_context.selectorService.ready() && !m_context.selectorService.refreshInFlight())) {
+        return false;
+    }
+
+    const ScreenshotSelectorHitTestMode hitTestMode =
+        m_context.intelligentSelection.selectionTarget() ==
+                ScreenshotIntelligentSelectionTarget::Window
+            ? ScreenshotSelectorHitTestMode::Window
+            : ScreenshotSelectorHitTestMode::WindowSubElement;
+    const ScreenshotStartupContext* startup = m_context.displaySession.startup.get();
+    if (startup && startup->anchored()) {
+        displayId = startup->nativeDisplayId;
+        return m_context.selectorService.requestHitTestOnDisplay(startup->physicalPosition,
+                                                                 hitTestMode, displayId);
+    }
+    if (displayId == 0) {
+        if (const auto* display =
+                m_context.geometry.displayForPhysicalPoint(m_context.displaySession, physicalPoint))
+            displayId = display->nativeDisplayId;
+    }
+    return m_context.selectorService.requestHitTestOnDisplay(physicalPoint, hitTestMode, displayId);
+}
+
+void ScreenshotSelectorWorkflow::handleInitialResult(bool ok, const QVector<QRectF>& hitRects,
+                                                     quint32 displayId) {
+    if (m_context.interaction.inactive()) {
+        return;
+    }
+
+    if (m_context.intelligentSelection.smartSelectionEnabled() &&
+        m_context.selection.regionType() == ScreenshotRegionType::Rectangle &&
+        m_context.interaction.intelligentSelecting()) {
+        bool selectionChanged = false;
+        if (ok) {
+            SNOW_SHOT_CAPTURE_PERF_SCOPE("selector.chain_apply_hit_path");
+            selectionChanged = applyHitPath(hitRects, displayId);
+        }
+        if (selectionChanged && m_context.presentation.updateOverlayState) {
+            SNOW_SHOT_CAPTURE_PERF_SCOPE("selector.chain_update_overlay_state");
+            m_context.presentation.updateOverlayState();
+        }
+        if (m_context.presentation.smartSelectionResultReady &&
+            m_initialNotifiedSession != m_context.captureState.sessionId) {
+            m_initialNotifiedSession = m_context.captureState.sessionId;
+            SNOW_SHOT_CAPTURE_PERF_SCOPE("selector.chain_initial_resolved");
+            m_context.presentation.smartSelectionResultReady(m_context.captureState.sessionId);
+        }
+    }
+}
+
+bool ScreenshotSelectorWorkflow::applyHitPath(const QVector<QRectF>& hitRects, quint32 displayId) {
+    if (m_context.selection.regionType() != ScreenshotRegionType::Rectangle)
+        return false;
+    const QVector<QRectF> canvasHitRects = m_context.geometry.canvasRectsForPhysicalRects(
+        m_context.displaySession, hitRects,
+        displayId ? QStringLiteral("display:%1").arg(displayId) : QString());
+
+    if (!m_context.intelligentSelection.applyCanvasHitPath(
+            canvasHitRects, m_context.geometry.canvasBounds(),
+            snow_shot::presentation::kScreenshotSelectionMinimumSize)) {
+        return m_context.selection.setSelectionRect({});
+    }
+
+    const QRectF currentSelection = m_context.intelligentSelection.currentSelection();
+    return m_context.selection.setSelectionRect(currentSelection);
+}
+
+void ScreenshotSelectorWorkflow::clearSelection() {
+    m_context.intelligentSelection.clearTransientState();
+    m_context.selection.clearSelection();
+}
+
+bool ScreenshotSelectorWorkflow::returnToSelection(const QPoint& physicalPoint) {
+    m_context.intelligentSelection.clearPress();
+    if (m_context.presentation.hideToolbar) {
+        m_context.presentation.hideToolbar();
+    }
+    m_context.intelligentSelection.clearTransientState();
+    m_context.selection.setSelectionRect({});
+
+    const bool selectorReady =
+        m_context.intelligentSelection.smartSelectionEnabled() &&
+        m_context.selection.regionType() == ScreenshotRegionType::Rectangle &&
+        m_context.selectorService.ready();
+    m_context.interaction.returnToSelectionMode(selectorReady);
+    if (!selectorReady) {
+        if (m_context.presentation.updateOverlayState) {
+            m_context.presentation.updateOverlayState();
+        }
+        startRefresh();
+        return false;
+    }
+
+    if (m_context.presentation.updateOverlayCursors) {
+        m_context.presentation.updateOverlayCursors();
+    }
+    static_cast<void>(updateSelectionAt(physicalPoint));
+    return true;
+}
+
+void ScreenshotSelectorWorkflow::handleTargetChanged() {
+    m_context.intelligentSelection.resetTargetPreference();
+}
+
+void ScreenshotSelectorWorkflow::handleRefinement(const QVector<QRectF>& hitRects,
+                                                  quint32 displayId, bool replacePath) {
+    if (!m_context.intelligentSelection.smartSelectionEnabled() ||
+        m_context.selection.regionType() != ScreenshotRegionType::Rectangle ||
+        !m_context.interaction.intelligentSelecting() ||
+        m_context.intelligentSelection.pressActive())
+        return;
+    if (replacePath) {
+        if (applyHitPath(hitRects, displayId) && m_context.presentation.updateOverlayState)
+            m_context.presentation.updateOverlayState();
+        return;
+    }
+    const QVector<QRectF> canvasRects = m_context.geometry.canvasRectsForPhysicalRects(
+        m_context.displaySession, hitRects,
+        displayId ? QStringLiteral("display:%1").arg(displayId) : QString());
+    if (!m_context.intelligentSelection.applyCanvasRefinementPath(
+            canvasRects, m_context.geometry.canvasBounds(),
+            snow_shot::presentation::kScreenshotSelectionMinimumSize))
+        return;
+    if (m_context.selection.setSelectionRect(m_context.intelligentSelection.currentSelection()) &&
+        m_context.presentation.updateOverlayState)
+        m_context.presentation.updateOverlayState();
+}

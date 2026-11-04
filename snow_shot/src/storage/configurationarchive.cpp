@@ -1,0 +1,434 @@
+#include "snow_shot/storage/configurationarchive.h"
+#include "snow_shot/app/edition.h"
+#include "snow_shot/storage/configurationschema.h"
+#include "snow_shot/platform/minizippath.h"
+
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonParseError>
+#include <QUuid>
+
+#include <mz.h>
+#include <mz_strm.h>
+#include <mz_zip.h>
+#include <mz_zip_rw.h>
+
+#include <utility>
+
+namespace snow_shot::storage {
+namespace {
+
+constexpr int kConfigArchiveFormatVersion = 1;
+constexpr int kConfigArchiveMaxEntries = 16;
+constexpr qint64 kConfigArchiveMaxManifestBytes = 64 * 1024;
+constexpr qint64 kConfigArchiveMaxConfigurationBytes = 8 * 1024 * 1024;
+
+const QStringList& configArchiveLocalDirectoryKeys() {
+    static const QStringList keys{QStringLiteral("screenshot/image_save_directory"),
+                                  QStringLiteral("screen_recording/video_save_directory"),
+                                  QStringLiteral("screenshot/last_manual_save_directory")};
+    return keys;
+}
+
+QString configArchiveTranslate(const char* source) {
+    return QCoreApplication::translate("snow_shot::storage::ConfigurationArchive", source);
+}
+
+QByteArray configArchiveEntryBytes(void* reader, qint64 declaredSize, qint64 limit, bool* ok) {
+    QByteArray payload;
+    if (ok != nullptr) {
+        *ok = false;
+    }
+    if (declaredSize < 0 || declaredSize > limit || mz_zip_reader_entry_open(reader) != MZ_OK) {
+        return payload;
+    }
+    char buffer[65536];
+    qint64 total = 0;
+    for (;;) {
+        const int32_t count = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
+        if (count < 0) {
+            break;
+        }
+        if (count == 0) {
+            break;
+        }
+        total += count;
+        if (total > limit) {
+            break;
+        }
+        payload.append(buffer, count);
+    }
+    const bool intact = total == declaredSize && mz_zip_reader_entry_close(reader) == MZ_OK;
+    if (!intact) {
+        mz_zip_reader_entry_close(reader);
+        payload.clear();
+        return payload;
+    }
+    if (ok != nullptr) {
+        *ok = true;
+    }
+    return payload;
+}
+
+QJsonObject configArchiveJsonObject(const QByteArray& payload, bool* ok) {
+    if (ok != nullptr) {
+        *ok = false;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        return {};
+    }
+    if (ok != nullptr) {
+        *ok = true;
+    }
+    return document.object();
+}
+
+} // namespace
+
+QString ConfigurationArchive::write(const QString& archivePath,
+                                    const QMap<QString, QJsonValue>& values, int schemaVersion,
+                                    bool redactCredentials) {
+    const QString failure =
+        configArchiveTranslate(QT_TRANSLATE_NOOP("snow_shot::storage::ConfigurationArchive",
+                                                 "The configuration archive could not be created"));
+    const QFileInfo target(archivePath);
+    if (archivePath.isEmpty() || target.fileName().isEmpty() ||
+        !QDir().mkpath(target.absolutePath())) {
+        return failure;
+    }
+    const QString temporary =
+        QDir(target.absolutePath())
+            .filePath(QStringLiteral(".%1.%2.part")
+                          .arg(target.fileName(), QUuid::createUuid().toString(QUuid::Id128)));
+
+    // Declared before the writer so every failure closes the archive before removing it.
+    struct TemporaryGuard {
+        QString path;
+        ~TemporaryGuard() {
+            QFile::remove(path);
+        }
+    } temporaryGuard{temporary};
+
+    QJsonObject configuration;
+    const QMap<QString, QJsonValue> currentValues =
+        ConfigurationSchema::migrateLegacyValues(values);
+    for (auto it = currentValues.cbegin(); it != currentValues.cend(); ++it) {
+        if (it.key() == QLatin1String("storage/schema_version") ||
+            configArchiveLocalDirectoryKeys().contains(it.key())) {
+            continue;
+        }
+        configuration.insert(it.key(), it.value());
+    }
+    QJsonObject manifest;
+    QJsonArray cloudOmitted;
+    if (redactCredentials) {
+        auto cloud = configuration.value(QStringLiteral("cloud_upload/configuration")).toObject();
+        auto profiles = cloud.value(QStringLiteral("configurations")).toArray();
+        for (qsizetype i = 0; i < profiles.size(); ++i) {
+            auto profile = profiles[i].toObject();
+            cloudOmitted.append(QStringLiteral("cloud:") +
+                                profile.value(QStringLiteral("id")).toString());
+            for (const auto* key : {"access_key_id", "secret_access_key", "session_token"})
+                profile.insert(QLatin1StringView(key), QString());
+            profiles[i] = profile;
+        }
+        cloud.insert(QStringLiteral("configurations"), profiles);
+        if (configuration.contains(QStringLiteral("cloud_upload/configuration")))
+            configuration.insert(QStringLiteral("cloud_upload/configuration"), cloud);
+        manifest.insert(QStringLiteral("redacted_credentials"), cloudOmitted);
+    }
+#if SNOW_SHOT_ENABLE_API_CONFIGURATION
+    if (redactCredentials) {
+        QJsonArray omitted = cloudOmitted;
+        for (const auto& key : {QStringLiteral("api_configuration/custom_models"),
+                                QStringLiteral("api_configuration/text_translation")}) {
+            auto models = configuration.value(key).toArray();
+            for (qsizetype index = 0; index < models.size(); ++index) {
+                auto model = models[index].toObject();
+                omitted.append((key.endsWith(QStringLiteral("text_translation"))
+                                    ? QStringLiteral("translation:")
+                                    : QString()) +
+                               model.value(QStringLiteral("id")).toString());
+                model.insert(QStringLiteral("api_key"), QString());
+                models[index] = model;
+            }
+            configuration.insert(key, models);
+        }
+        manifest.insert(QStringLiteral("redacted_credentials"), omitted);
+    }
+#else
+    Q_UNUSED(redactCredentials);
+#endif
+    manifest.insert(QStringLiteral("format"), QStringLiteral("snow-shot-configuration"));
+    manifest.insert(QStringLiteral("format_version"), kConfigArchiveFormatVersion);
+    manifest.insert(QStringLiteral("schema_version"), schemaVersion);
+    manifest.insert(QStringLiteral("app_version"), QCoreApplication::applicationVersion());
+    manifest.insert(QStringLiteral("created"),
+                    QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+
+    void* writer = mz_zip_writer_create();
+    if (writer == nullptr) {
+        return failure;
+    }
+    struct WriterGuard {
+        void* writer;
+        ~WriterGuard() {
+            // Minizip deletes an open writer by closing it first.
+            mz_zip_writer_delete(&writer);
+        }
+    } guard{writer};
+    if (mz_zip_writer_open_file(writer, platform::minizipPath(temporary).constData(), 0, 0) !=
+        MZ_OK) {
+        return failure;
+    }
+    const auto addEntry = [writer](const char* name, const QByteArray& payload) {
+        mz_zip_file info{};
+        info.filename = name;
+        info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+        return mz_zip_writer_add_buffer(writer, const_cast<char*>(payload.constData()),
+                                        static_cast<int32_t>(payload.size()), &info) == MZ_OK;
+    };
+    const bool entriesWritten =
+        addEntry("manifest.json", QJsonDocument(manifest).toJson(QJsonDocument::Compact)) &&
+        addEntry("config.json", QJsonDocument(configuration).toJson(QJsonDocument::Compact));
+    const int32_t closeResult = mz_zip_writer_close(writer);
+    if (!entriesWritten || closeResult != MZ_OK) {
+        return failure;
+    }
+    QFile::remove(archivePath);
+    if (!QFile::rename(temporary, archivePath)) {
+        return failure;
+    }
+    return {};
+}
+
+ConfigurationArchiveReadResult ConfigurationArchive::read(const QString& archivePath) {
+    ConfigurationArchiveReadResult result;
+    const QString invalidArchive =
+        configArchiveTranslate(QT_TRANSLATE_NOOP("snow_shot::storage::ConfigurationArchive",
+                                                 "The file is not a valid configuration archive"));
+    const auto fail = [&result](const QString& error) {
+        result.error = error;
+        return result;
+    };
+
+    void* reader = mz_zip_reader_create();
+    if (reader == nullptr || archivePath.isEmpty() ||
+        mz_zip_reader_open_file(reader, platform::minizipPath(archivePath).constData()) != MZ_OK) {
+        if (reader != nullptr) {
+            mz_zip_reader_close(reader);
+            mz_zip_reader_delete(&reader);
+        }
+        return fail(invalidArchive);
+    }
+    struct ReaderGuard {
+        void* reader;
+        ~ReaderGuard() {
+            mz_zip_reader_close(reader);
+            mz_zip_reader_delete(&reader);
+        }
+    } readerGuard{reader};
+
+    QByteArray manifestBytes;
+    QByteArray configurationBytes;
+    bool haveManifest = false;
+    bool haveConfiguration = false;
+    int entryCount = 0;
+    int32_t code = mz_zip_reader_goto_first_entry(reader);
+    while (code == MZ_OK) {
+        if (++entryCount > kConfigArchiveMaxEntries) {
+            return fail(invalidArchive);
+        }
+        mz_zip_file* entry = nullptr;
+        if (mz_zip_reader_entry_get_info(reader, &entry) != MZ_OK || entry == nullptr ||
+            entry->filename == nullptr ||
+            (entry->linkname != nullptr && entry->linkname[0] != '\0')) {
+            return fail(invalidArchive);
+        }
+        const auto mode = (entry->external_fa >> 16) & 0170000;
+        if (mode != 0 && mode != 0100000) {
+            return fail(invalidArchive);
+        }
+        const QString name = QString::fromUtf8(entry->filename);
+        const bool isManifest = name == QLatin1String("manifest.json");
+        const bool isConfiguration = name == QLatin1String("config.json");
+        const bool duplicate =
+            (isManifest && haveManifest) || (isConfiguration && haveConfiguration);
+        if ((!isManifest && !isConfiguration) || duplicate) {
+            return fail(invalidArchive);
+        }
+        bool entryOk = false;
+        QByteArray& destination = isManifest ? manifestBytes : configurationBytes;
+        destination = configArchiveEntryBytes(reader, entry->uncompressed_size,
+                                              isManifest ? kConfigArchiveMaxManifestBytes
+                                                         : kConfigArchiveMaxConfigurationBytes,
+                                              &entryOk);
+        if (!entryOk) {
+            return fail(invalidArchive);
+        }
+        if (isManifest) {
+            haveManifest = true;
+        } else {
+            haveConfiguration = true;
+        }
+        code = mz_zip_reader_goto_next_entry(reader);
+    }
+    if (code != MZ_END_OF_LIST || !haveManifest || !haveConfiguration) {
+        return fail(invalidArchive);
+    }
+
+    bool manifestOk = false;
+    const QJsonObject manifest = configArchiveJsonObject(manifestBytes, &manifestOk);
+    if (!manifestOk) {
+        return fail(invalidArchive);
+    }
+    if (manifest.value(QStringLiteral("format")).toString() !=
+        QLatin1String("snow-shot-configuration")) {
+        return fail(configArchiveTranslate(
+            QT_TRANSLATE_NOOP("snow_shot::storage::ConfigurationArchive",
+                              "The file is not a Snow Shot configuration archive")));
+    }
+    int formatVersion = 0;
+    if (!ConfigurationSchema::parseIntegerVersion(manifest.value(QStringLiteral("format_version")),
+                                                  &formatVersion)) {
+        return fail(invalidArchive);
+    }
+    if (formatVersion > kConfigArchiveFormatVersion) {
+        return fail(configArchiveTranslate(QT_TRANSLATE_NOOP(
+            "snow_shot::storage::ConfigurationArchive",
+            "The configuration archive was created by a newer version of Snow Shot")));
+    }
+    if (formatVersion != kConfigArchiveFormatVersion) {
+        return fail(invalidArchive);
+    }
+    int schemaVersion = 0;
+    if (!ConfigurationSchema::parseIntegerVersion(manifest.value(QStringLiteral("schema_version")),
+                                                  &schemaVersion)) {
+        return fail(invalidArchive);
+    }
+    if (schemaVersion > ConfigurationSchema::currentVersion()) {
+        return fail(configArchiveTranslate(QT_TRANSLATE_NOOP(
+            "snow_shot::storage::ConfigurationArchive",
+            "The configuration archive was created by a newer version of Snow Shot")));
+    }
+    result.schemaVersion = schemaVersion;
+    for (const auto& id : manifest.value(QStringLiteral("redacted_credentials")).toArray()) {
+        if (!id.isString())
+            return fail(invalidArchive);
+        result.redactedCredentialIds.append(id.toString());
+    }
+
+    bool configurationOk = false;
+    const QJsonObject configuration = configArchiveJsonObject(configurationBytes, &configurationOk);
+    if (!configurationOk) {
+        return fail(invalidArchive);
+    }
+    QMap<QString, QJsonValue> values;
+    for (auto it = configuration.begin(); it != configuration.end(); ++it) {
+        values.insert(it.key(), it.value());
+    }
+    values = ConfigurationSchema::migrateLegacyValues(std::move(values));
+    for (auto it = values.cbegin(); it != values.cend(); ++it) {
+        if (it.key() == QLatin1String("storage/schema_version") ||
+            !ConfigurationSchema::contains(it.key())) {
+            continue;
+        }
+        const ConfigurationNormalization normalized =
+            ConfigurationSchema::normalize(it.key(), it.value());
+        if (normalized.valid) {
+            result.values.insert(it.key(), normalized.value);
+        }
+    }
+    if (result.values.isEmpty()) {
+        return fail(configArchiveTranslate(
+            QT_TRANSLATE_NOOP("snow_shot::storage::ConfigurationArchive",
+                              "The configuration archive contains no compatible settings")));
+    }
+    return result;
+}
+
+void ConfigurationArchiveReadResult::preserveOmittedDirectories(
+    const QMap<QString, QJsonValue>& current) {
+    for (const auto& key : configArchiveLocalDirectoryKeys()) {
+        if (!values.contains(key) && current.contains(key)) {
+            values.insert(key, current.value(key));
+        }
+    }
+}
+
+void ConfigurationArchiveReadResult::preserveOmittedCredentials(
+    const QMap<QString, QJsonValue>& current) {
+#if SNOW_SHOT_ENABLE_API_CONFIGURATION
+    for (const auto& key : {QStringLiteral("api_configuration/custom_models"),
+                            QStringLiteral("api_configuration/text_translation")}) {
+        const bool translation = key.endsWith(QStringLiteral("text_translation"));
+        auto models = values.value(key).toArray();
+        const auto existing = current.value(key).toArray();
+        for (qsizetype index = 0; index < models.size(); ++index) {
+            auto model = models[index].toObject();
+            const auto id = model.value(QStringLiteral("id")).toString();
+            if (!redactedCredentialIds.contains(
+                    (translation ? QStringLiteral("translation:") : QString()) + id))
+                continue;
+            for (const auto& item : existing) {
+                const auto previous = item.toObject();
+                if (previous.value(QStringLiteral("id")).toString() == id &&
+                    previous.value(translation ? QStringLiteral("endpoint")
+                                               : QStringLiteral("base_url")) ==
+                        model.value(translation ? QStringLiteral("endpoint")
+                                                : QStringLiteral("base_url")) &&
+                    (!translation || (previous.value(QStringLiteral("provider")) ==
+                                          model.value(QStringLiteral("provider")) &&
+                                      previous.value(QStringLiteral("application_id")) ==
+                                          model.value(QStringLiteral("application_id"))))) {
+                    model.insert(QStringLiteral("api_key"),
+                                 previous.value(QStringLiteral("api_key")));
+                    break;
+                }
+            }
+            models[index] = model;
+        }
+        if (values.contains(key))
+            values.insert(key, models);
+    }
+#endif
+    const QString key = QStringLiteral("cloud_upload/configuration");
+    if (!values.contains(key))
+        return;
+    auto cloud = values.value(key).toObject();
+    auto profiles = cloud.value(QStringLiteral("configurations")).toArray();
+    const auto previousProfiles =
+        current.value(key).toObject().value(QStringLiteral("configurations")).toArray();
+    for (qsizetype i = 0; i < profiles.size(); ++i) {
+        auto profile = profiles[i].toObject();
+        if (!redactedCredentialIds.contains(QStringLiteral("cloud:") +
+                                            profile.value(QStringLiteral("id")).toString()))
+            continue;
+        for (const auto& item : previousProfiles) {
+            const auto previous = item.toObject();
+            bool same = true;
+            for (const auto* field :
+                 {"id", "protocol", "endpoint", "region", "bucket", "addressing_style"})
+                same = same && previous.value(QLatin1StringView(field)) ==
+                                   profile.value(QLatin1StringView(field));
+            if (!same)
+                continue;
+            for (const auto* field : {"access_key_id", "secret_access_key", "session_token"})
+                profile.insert(QLatin1StringView(field), previous.value(QLatin1StringView(field)));
+            break;
+        }
+        profiles[i] = profile;
+    }
+    cloud.insert(QStringLiteral("configurations"), profiles);
+    values.insert(key, cloud);
+}
+
+} // namespace snow_shot::storage

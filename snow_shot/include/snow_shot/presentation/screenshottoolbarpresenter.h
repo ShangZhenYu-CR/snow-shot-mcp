@@ -1,0 +1,80 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARPRESENTER_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARPRESENTER_H
+
+#include "snow_shot/presentation/screenshotselectiondisplayunit.h"
+#include "snow_shot/presentation/screenshotselectionaspectratio.h"
+#include "snow_shot/image/screenshotregiongeometry.h"
+
+#include "snow_shot/image/screenshotlayoutcompaction.h"
+
+#include "snow_shot/image/screenshotselectionbordertype.h"
+#include <QColor>
+#include <QObject>
+#include <QPoint>
+#include <QPointF>
+#include <QRect>
+#include <QRectF>
+
+struct CapturedDisplayModel;
+class ScreenshotDisplaySession;
+class ScreenshotGeometryMapper;
+class ScreenshotOverlayCoordinator;
+
+struct ScreenshotToolbarPresentationState {
+    ScreenshotSelectionDisplayUnit selectionDisplayUnit = kDefaultScreenshotSelectionDisplayUnit;
+    QRect selectionPixels;
+    QRectF selectionCanvas;
+    bool inactive = true;
+    bool selectionToolbarMode = false;
+    bool intelligentSelecting = false;
+    bool selectionDragging = false;
+    bool editing = false;
+    bool ocrAvailable = true;
+    bool selectionEditable = true;
+    bool selectionResizable = true;
+    bool cornerRadiusApplicable = true;
+    bool layoutCompactionAvailable = false;
+    int backgroundOpacityPercent = 0;
+    bool backgroundOpacityAvailable = false;
+    ScreenshotLayoutCompaction layoutCompaction = {};
+    bool aspectRatioLocked = false;
+    ScreenshotSelectionAspectRatioPreset aspectRatioPreset =
+        ScreenshotSelectionAspectRatioPreset::Free;
+    int cornerRadius = 0;
+    ScreenshotSelectionBorderType borderType = ScreenshotSelectionBorderType::Shadow;
+    int effectWidth = 0;
+    QColor effectColor = QColor(0x33, 0x33, 0x33);
+    ScreenshotRegionType regionType = ScreenshotRegionType::Rectangle;
+    [[nodiscard]] bool operator==(const ScreenshotToolbarPresentationState&) const = default;
+};
+
+class ScreenshotToolbarPresenter final : public QObject {
+  public:
+    ScreenshotToolbarPresenter(ScreenshotOverlayCoordinator& overlayCoordinator,
+                               const ScreenshotGeometryMapper& geometry,
+                               const ScreenshotDisplaySession& displaySession);
+
+    void hideToolbar();
+    void hideMainToolbar();
+    void showToolbar(const ScreenshotToolbarPresentationState& state);
+    void hideSelectionToolbar();
+    void showSelectionToolbar(const ScreenshotToolbarPresentationState& state);
+    void repositionForContentChange(const ScreenshotToolbarPresentationState& state);
+    void updateSelectionToolbarState(const ScreenshotToolbarPresentationState& state,
+                                     bool reposition = true);
+    void raiseToolbarForCanvasInteraction(const ScreenshotToolbarPresentationState& state);
+    void moveToolbar(const ScreenshotToolbarPresentationState& state);
+    void moveSelectionToolbar(const ScreenshotToolbarPresentationState& state);
+
+  private:
+    [[nodiscard]] const CapturedDisplayModel* displayForCanvasPoint(const QPointF& point) const;
+    [[nodiscard]] const CapturedDisplayModel* displayForCanvasRect(const QRectF& rect) const;
+    [[nodiscard]] QPoint logicalPositionForCanvasPoint(const CapturedDisplayModel& display,
+                                                       const QPointF& point) const;
+
+    ScreenshotOverlayCoordinator& m_overlayCoordinator;
+    const ScreenshotGeometryMapper& m_geometry;
+    const ScreenshotDisplaySession& m_displaySession;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARPRESENTER_H

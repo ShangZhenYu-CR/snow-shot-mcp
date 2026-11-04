@@ -1,0 +1,92 @@
+#ifndef SNOW_SHOT_PRESENTATION_COMPONENTS_CONTENTCARDWIDGET_H
+#define SNOW_SHOT_PRESENTATION_COMPONENTS_CONTENTCARDWIDGET_H
+
+#include "snow_shot/presentation/settings/settingsregistry.h"
+#include "snow_shot/presentation/styles/themecolorscheme.h"
+#include "snow_shot/storage/capturehistorytypes.h"
+
+#include <QFrame>
+#include <QPointer>
+#include <QBrush>
+#include <QStringList>
+
+#include <memory>
+
+class SnowShotApiClient;
+class QEvent;
+class QPaintEvent;
+class QStackedWidget;
+class SettingsPageWidget;
+class ScreenshotHistoryPageWidget;
+class QWidget;
+namespace snow_shot::presentation::settings {
+class SettingsRuntimeSession;
+}
+
+class ContentCardWidget final : public QFrame {
+    Q_OBJECT
+
+  public:
+    ContentCardWidget(const snow_shot::presentation::settings::SettingsRegistry& registry,
+                      snow_shot::presentation::settings::SettingsRuntimeSession& runtimeSession,
+                      QWidget* parent = nullptr, SnowShotApiClient* translationClient = nullptr);
+    ~ContentCardWidget() override;
+
+    [[nodiscard]] QString currentRoute() const;
+    [[nodiscard]] snow_shot::presentation::settings::SettingsLocation currentLocation() const;
+    [[nodiscard]] QVector<snow_shot::presentation::settings::SettingsSectionSummary>
+    currentSections() const;
+    void setCurrentRoute(const QString& route);
+    void activateSection(const QString& sectionId);
+    void navigateTo(const snow_shot::presentation::settings::SettingsLocation& location);
+    void showGeneralSettings();
+    void showScreenshotSettings();
+    void showTranslation(const QString& text);
+    void applyTheme(const snow_shot::presentation::styles::ThemeColorScheme& scheme);
+    void setSkinMaskOpacity(qreal opacity);
+    void retranslateUi();
+
+  signals:
+    void closeWindowRequested();
+    void routeChanged(const QString& route);
+    void sectionListChanged();
+    void locationChanged(const snow_shot::presentation::settings::SettingsLocation& location);
+    void screenshotRequested();
+    void quickActionRequested(snow_shot::presentation::GlobalShortcutAction action);
+    void
+    globalMouseDragRequested(snow_shot::presentation::settings::SettingsGlobalMouseAction action);
+    void screenshotHistoryEditRequested(const QString& recordId);
+    void screenshotHistoryPinRequested(const QString& recordId);
+    void screenshotHistoryCollageRequested(
+        const QVector<snow_shot::storage::CaptureHistoryRecord>& records);
+    void screenshotHistorySplitRequested(const snow_shot::storage::CaptureHistoryRecord& record);
+    void
+    screenshotHistoryImageEditingRequested(const snow_shot::storage::CaptureHistoryRecord& record);
+    void pinnedWindowCollageRequested(const QStringList& recordIds);
+    void pinnedWindowSplitRequested(const QString& recordId);
+    void pinnedWindowImageEditingRequested(const QString& recordId);
+
+  protected:
+    void paintEvent(QPaintEvent* event) override;
+    void changeEvent(QEvent* event) override;
+
+  private:
+    QWidget*
+    createPage(const snow_shot::presentation::settings::SettingsPageDefinition& definition);
+    void destroyActivePage();
+    void handleCommand(const snow_shot::presentation::settings::SettingsCommand& command);
+    void updateBackgroundBrush();
+
+    const snow_shot::presentation::settings::SettingsRegistry& m_registry;
+    snow_shot::presentation::settings::SettingsRuntimeSession& m_runtimeSession;
+    SnowShotApiClient* m_translationClient = nullptr;
+    QStackedWidget* m_stack = nullptr;
+    QPointer<QWidget> m_activePage;
+    QString m_activePageId;
+    snow_shot::presentation::settings::SettingsLocation m_currentLocation;
+    snow_shot::presentation::styles::ThemeColorScheme m_colorScheme;
+    QBrush m_backgroundBrush;
+    qreal m_skinMaskOpacity = 1.0;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_COMPONENTS_CONTENTCARDWIDGET_H

@@ -1,0 +1,251 @@
+#Requires -Version 7.0
+[CmdletBinding()]
+param(
+    [string]$Tag = 'v1.1.5-beta',
+    [string]$PreviousTag = 'v1.1.4-beta',
+    [string]$Winget = 'winget.exe',
+    [switch]$AllowUnrecognizedRelease,
+    [ValidateSet('Full')][string]$Edition = 'Full',
+    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
+    [switch]$SkipUpgrade,
+    # Historical release fixtures refuse; newly built installers close and restart.
+    [ValidateSet('Refuse', 'Restart')][string]$RunningAppBehavior = 'Refuse'
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+# Installs real release packages. Never run against a developer's existing installation.
+if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+    throw 'Real installation tests require a disposable GitHub-hosted Windows runner.'
+}
+. (Join-Path $PSScriptRoot 'snow-shot-winget.ps1')
+$hostArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+if ($hostArchitecture -cne $Architecture) { throw 'WinGet lifecycle validation must run on the matching native Windows host.' }
+$product = Get-SnowShotEdition $Edition $Architecture
+$version = Get-SnowShotWingetVersion $Tag
+$previousVersion = if ($SkipUpgrade) { $version } else { Get-SnowShotWingetVersion $PreviousTag }
+if (-not $SkipUpgrade -and $version -eq $previousVersion) { throw 'The upgrade fixture requires two different releases.' }
+$registryPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$($product.Registry)",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$($product.Registry)"
+)
+if (@($registryPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) {
+    throw 'Refusing to change an existing Snow Shot installation.'
+}
+$output = Join-Path $PSScriptRoot "../build/winget-install-test/$($product.Product)"
+$null = New-Item -ItemType Directory -Force -Path $output
+Start-Transcript -Path (Join-Path $output 'installation.log')
+$app = $null
+$reputationPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+$savedReputationPolicy = $null
+$savedAttachmentPolicy = $null
+. (Join-Path $PSScriptRoot 'snow-shot-winget-test-windows.ps1')
+function Invoke-WingetBounded([string[]]$Arguments) {
+    Write-Host "WinGet: $($Arguments -join ' ')"
+    $info = [Diagnostics.ProcessStartInfo]::new($Winget)
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    foreach ($argument in ($Arguments + @('--disable-interactivity', '--verbose-logs'))) {
+        $info.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::Start($info)
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $deadline = [DateTime]::UtcNow.AddSeconds(180)
+    $dialog = $false
+    while (-not $process.WaitForExit(1000)) {
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        $process.Refresh()
+        # Process.MainWindowHandle excludes owned dialogs, including launch warnings.
+        foreach ($window in [WinGetWindowDiagnostics]::ForProcess($process.Id)) {
+            $title = [WinGetWindowDiagnostics]::Title($window)
+            if ($title -in @('Window Dialog', 'Open File - Security Warning')) {
+                $dialogText = [WinGetWindowDiagnostics]::Read($window)
+                if ($title -eq 'Window Dialog' -and
+                    -not (Test-SnowShotWingetInteractiveDialog $title $dialogText)) { continue }
+                Write-Host $dialogText
+                Add-Type -AssemblyName System.Windows.Forms
+                $bounds = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+                $bitmap = [Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+                $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                try {
+                    $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
+                    $bitmap.Save((Join-Path $output 'blocking-dialog.png'), [Drawing.Imaging.ImageFormat]::Png)
+                } finally { $graphics.Dispose(); $bitmap.Dispose() }
+                $dialog = $true
+                break
+            }
+        }
+        if ($dialog) { break }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+    }
+    if (-not $process.HasExited) {
+        Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'winget|snow.?shot' } |
+            Select-Object Name, ProcessId, ParentProcessId, CommandLine | Format-List | Out-Host
+        Get-Process | Where-Object { $_.MainWindowTitle } |
+            Select-Object ProcessName, Id, MainWindowTitle | Format-Table | Out-Host
+        $process.Kill($true)
+        $process.WaitForExit()
+        Write-Host $stdout.GetAwaiter().GetResult()
+        Write-Host $stderr.GetAwaiter().GetResult()
+        if ($dialog) { throw 'WinGet displayed an interactive dialog during unattended installation; see the captured dialog text.' }
+        throw "WinGet timed out after 180 seconds: $($Arguments -join ' ')"
+    }
+    Write-Host $stdout.GetAwaiter().GetResult()
+    Write-Host $stderr.GetAwaiter().GetResult()
+    return $process.ExitCode
+}
+function Invoke-WingetChecked([string[]]$Arguments) {
+    $result = Invoke-WingetBounded $Arguments
+    if ($result -ne 0) { throw "WinGet failed ($result): $($Arguments -join ' ')" }
+}
+function Assert-InstalledVersion([string]$Expected) {
+    $entries = @($registryPaths | Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { Get-ItemProperty -LiteralPath $_ })
+    if ($entries.Count -ne 1 -or $entries[0].DisplayVersion -cne $Expected -or
+        $entries[0].DisplayName -cne $product.Name -or $entries[0].Publisher -cne 'Snow Apps') {
+        throw "Installed registration does not match Snow Shot $Expected."
+    }
+    Invoke-WingetChecked @('list', '--name', $product.Name, '--exact', '--accept-source-agreements')
+}
+try {
+    . (Join-Path $PSScriptRoot 'snow-shot-winget-test-desktop.ps1')
+    Initialize-SnowShotWingetTestDesktop
+    $current = New-SnowShotWingetManifest $Tag $output $Edition
+    $previous = if ($SkipUpgrade) { $current } else { New-SnowShotWingetManifest $PreviousTag $output $Edition }
+    foreach ($directory in @($current, $previous)) {
+        $installerManifest = Get-Content -Raw -LiteralPath (Join-Path $directory "$($product.Winget).installer.yaml")
+        if ($installerManifest -notmatch "(?m)^  - Architecture: $Architecture$") { throw 'The release does not provide a native installer.' }
+    }
+    Invoke-WingetChecked @('validate', '--manifest', $current)
+    Invoke-WingetChecked @('validate', '--manifest', $previous)
+    if ($AllowUnrecognizedRelease) {
+        # Explicit test-only consent for unsigned releases. The hosted VM is disposable;
+        # preserve/restore its reputation policy and keep hashes and antivirus enabled.
+        $existingPolicy = Get-ItemProperty -LiteralPath $reputationPolicy -ErrorAction SilentlyContinue
+        $property = if ($existingPolicy) { $existingPolicy.PSObject.Properties['EnableSmartScreen'] } else { $null }
+        $savedReputationPolicy = @{ Present = ($null -ne $property); Value = if ($property) { $property.Value } else { 0 } }
+        if (-not (Test-Path -LiteralPath $reputationPolicy)) { $null = New-Item -Path $reputationPolicy -Force }
+        $null = New-ItemProperty -LiteralPath $reputationPolicy -Name EnableSmartScreen -Value 0 -PropertyType DWord -Force
+        $savedAttachmentPolicy = Enable-SnowShotWingetTestAttachmentConsent
+        Write-Host 'Temporarily allowing unsigned release fixtures in this disposable VM; hash verification remains enabled.'
+    }
+    & $Winget settings --enable LocalManifestFiles
+    if ($LASTEXITCODE -ne 0) { throw 'Could not enable local manifests in the disposable runner.' }
+    $installDirectory = Join-Path $env:RUNNER_TEMP "$($product.Name) custom installation"
+    Invoke-WingetChecked @('install', '--manifest', $previous, '--silent', '--location',
+        $installDirectory, '--accept-package-agreements', '--accept-source-agreements')
+    Assert-InstalledVersion $previousVersion
+    $executable = Join-Path $installDirectory "bin/$($product.Executable).exe"
+    if (-not (Test-Path -LiteralPath $executable)) { throw 'Custom installation directory was ignored.' }
+    $pe = [IO.File]::ReadAllBytes($executable)
+    $peOffset = [BitConverter]::ToInt32($pe, 0x3c)
+    $machine = [BitConverter]::ToUInt16($pe, $peOffset + 4)
+    $expectedMachine = if ($Architecture -eq 'arm64') { 0xaa64 } else { 0x8664 }
+    if ($machine -ne $expectedMachine) { throw 'WinGet selected a different executable architecture.' }
+    if (Get-Process $product.Executable -ErrorAction SilentlyContinue) { throw 'Silent installation launched Snow Shot.' }
+    $userData = Join-Path $env:APPDATA "$($product.Registry)/$($product.Executable)"
+    $null = New-Item -ItemType Directory -Force -Path $userData
+    $sentinel = Join-Path $userData 'winget-preservation-test.txt'
+    $sentinelValue = [guid]::NewGuid().ToString('N')
+    [IO.File]::WriteAllText($sentinel, $sentinelValue)
+
+    if (-not $SkipUpgrade) {
+    $app = Start-Process -FilePath $executable -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds 5
+    if ($app.HasExited) { throw 'The installed app did not remain running for the upgrade test.' }
+    $before = (Get-FileHash -LiteralPath $executable).Hash
+    $result = Invoke-WingetBounded @('upgrade', '--manifest', $current, '--silent',
+        '--accept-package-agreements', '--accept-source-agreements')
+    if ($RunningAppBehavior -eq 'Refuse') {
+        if ($result -eq 0 -or $app.HasExited -or (Get-FileHash -LiteralPath $executable).Hash -cne $before) {
+            throw 'Historical upgrade failed to preserve the running application.'
+        }
+        Assert-InstalledVersion $previousVersion
+        Stop-Process -Id $app.Id
+        $app.WaitForExit()
+    } else {
+        if ($result -ne 0 -or -not $app.WaitForExit(10000)) {
+            throw 'Silent upgrade did not close the running application and complete installation.'
+        }
+        Assert-InstalledVersion $version
+        if ((Get-FileHash -LiteralPath $executable).Hash -ceq $before) {
+            throw 'Silent upgrade did not replace the old executable.'
+        }
+        $restartDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        $restarted = @()
+        do {
+            $restarted = @(Get-Process $product.Executable -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -ieq $executable })
+            if ($restarted.Count) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $restartDeadline)
+        if ($restarted.Count -ne 1) { throw 'Silent upgrade must restart the updated application once.' }
+        $app = $restarted[0]
+        Stop-Process -Id $app.Id
+        $app.WaitForExit()
+    }
+    }
+    $app = $null
+
+    if (-not $SkipUpgrade -and $RunningAppBehavior -eq 'Refuse') {
+        Invoke-WingetChecked @('upgrade', '--manifest', $current, '--silent',
+            '--accept-package-agreements', '--accept-source-agreements')
+    }
+    Assert-InstalledVersion $version
+    if (-not (Test-Path -LiteralPath $executable)) { throw 'Upgrade did not preserve the custom directory.' }
+    if ([IO.File]::ReadAllText($sentinel) -cne $sentinelValue) { throw 'Upgrade changed user data.' }
+    if (Get-Process $product.Executable -ErrorAction SilentlyContinue) { throw 'Silent upgrade launched Snow Shot.' }
+    $registration = @($registryPaths | Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { Get-ItemProperty -LiteralPath $_ })[0]
+    if ($Edition -eq 'Full' -and $version -eq '1.1.5-beta' -and -not $registration.PSObject.Properties['QuietUninstallString']) {
+        # This immutable historical release predates the quiet registration fix.
+        # Validate its supported NSIS removal directly; a separate CPack integration
+        # test verifies that newly built installers register WinGet's quiet command.
+        Write-Host 'Legacy 1.1.5-beta has no QuietUninstallString; verifying its NSIS /S removal directly.'
+        $uninstaller = $registration.UninstallString.Trim('"')
+        $removal = Start-Process -FilePath $uninstaller -ArgumentList '/S' -WindowStyle Hidden -PassThru
+        if (-not $removal.WaitForExit(30000) -or $removal.ExitCode -ne 0) { throw 'Legacy NSIS removal failed.' }
+    } else {
+        if (-not $registration.PSObject.Properties['QuietUninstallString']) { throw 'New installers must register QuietUninstallString.' }
+        Invoke-WingetChecked @('uninstall', '--id', $product.Winget, '--exact', '--silent')
+    }
+    # NSIS may finish removal in a copied child after its original process exits.
+    $removalDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (((Test-Path -LiteralPath $executable) -or @($registryPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) -and
+        [DateTime]::UtcNow -lt $removalDeadline) { Start-Sleep -Milliseconds 100 }
+    if ((Test-Path -LiteralPath $executable) -or
+        @($registryPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) {
+        throw 'Uninstall left the executable or registration behind.'
+    }
+    if ([IO.File]::ReadAllText($sentinel) -cne $sentinelValue) { throw 'Uninstall changed user data.' }
+    if ($registration.PSObject.Properties['QuietUninstallString']) {
+    Invoke-WingetChecked @('install', '--manifest', $current, '--silent', '--location',
+        $installDirectory, '--accept-package-agreements', '--accept-source-agreements')
+    Assert-InstalledVersion $version
+    if ([IO.File]::ReadAllText($sentinel) -cne $sentinelValue) { throw 'Reinstall changed user data.' }
+    Invoke-WingetChecked @('uninstall', '--id', $product.Winget, '--exact', '--silent')
+    $removalDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ((Test-Path -LiteralPath $executable) -and [DateTime]::UtcNow -lt $removalDeadline) { Start-Sleep -Milliseconds 100 }
+    if ((Test-Path -LiteralPath $executable) -or [IO.File]::ReadAllText($sentinel) -cne $sentinelValue) { throw 'Reinstalled package removal failed to preserve user data.' }
+    }
+    Write-Output "PASS: real native $Architecture WinGet install, detection, upgrade when requested, uninstall, reinstall, and data preservation."
+} finally {
+    if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id }
+    if ($savedAttachmentPolicy) { Restore-SnowShotWingetTestAttachmentConsent $savedAttachmentPolicy }
+    if ($savedReputationPolicy) {
+        if ($savedReputationPolicy.Present) {
+            $null = New-ItemProperty -LiteralPath $reputationPolicy -Name EnableSmartScreen `
+                -Value $savedReputationPolicy.Value -PropertyType DWord -Force
+        } else {
+            Remove-ItemProperty -LiteralPath $reputationPolicy -Name EnableSmartScreen -ErrorAction SilentlyContinue
+        }
+        Write-Host 'Restored the disposable VM reputation policy.'
+    }
+    $logDirectory = Join-Path $env:LOCALAPPDATA 'Packages/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe/LocalState/DiagOutputDir'
+    if (Test-Path -LiteralPath $logDirectory) {
+        Copy-Item -LiteralPath $logDirectory -Destination (Join-Path $output 'winget-logs') -Recurse -Force
+    }
+    Stop-Transcript
+}

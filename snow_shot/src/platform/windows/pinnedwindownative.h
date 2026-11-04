@@ -1,0 +1,66 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOWNATIVE_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOWNATIVE_H
+
+#include <QRect>
+#include <QKeyCombination>
+#include <QList>
+#include <QWidget>
+#include <Qt>
+
+#include <memory>
+
+namespace screenshot_pinned_window_native {
+class SystemMoveKeyboard final {
+  public:
+    explicit SystemMoveKeyboard(QWidget* window);
+    ~SystemMoveKeyboard();
+    void setKeyCombinations(const QList<QKeyCombination>& combinations);
+    [[nodiscard]] bool start();
+    void stop();
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+enum class GeometryUpdate {
+    PreserveClientPixels,
+    DiscardClientPixels,
+};
+
+enum class PaintSynchronization {
+    InvalidateAndUpdate,
+    FlushAlreadyPainted,
+};
+
+[[nodiscard]] bool
+applyClientGeometry(WId windowId, const QRect& geometry,
+                    GeometryUpdate update = GeometryUpdate::PreserveClientPixels);
+// Native minimize notifications can precede Qt's window-state notification.
+[[nodiscard]] bool isMinimized(WId windowId);
+// A minimized pinned surface reports its normal restore rectangle; its icon
+// rectangle never participates in content geometry or persistence.
+[[nodiscard]] QRect currentClientGeometry(WId windowId);
+// The complete native window frame, which is wider than the client area on
+// Windows because the pinned surface re-applies WS_THICKFRAME. Falls back to
+// the client geometry when the window rect cannot be read.
+[[nodiscard]] QRect currentWindowGeometry(WId windowId);
+// Request a leave notification for the draggable non-client region.
+[[nodiscard]] bool trackNonClientLeave(WId windowId);
+[[nodiscard]] bool applySystemResizeStyle(WId windowId);
+// Toggles only the input pass-through/no-activation extended styles. The HWND
+// and all unrelated native styles are preserved.
+[[nodiscard]] bool setInputTransparent(WId windowId, bool transparent);
+// Moves the window into or out of the topmost band without recreating the HWND
+// or disturbing its frame styles. Returns false when the targeted call is
+// unavailable so callers can fall back to Qt window flags.
+[[nodiscard]] bool setStaysOnTop(WId windowId, bool staysOnTop);
+[[nodiscard]] bool activateWindow(WId windowId);
+[[nodiscard]] bool installSynchronizedResize(WId windowId, const bool* interactiveResizeActive);
+void removeSynchronizedResize(WId windowId);
+[[nodiscard]] bool applyCursor(Qt::CursorShape shape);
+[[nodiscard]] bool synchronizeClientPaint(
+    WId windowId, PaintSynchronization synchronization = PaintSynchronization::InvalidateAndUpdate);
+} // namespace screenshot_pinned_window_native
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTPINNEDWINDOWNATIVE_H

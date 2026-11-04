@@ -1,0 +1,16 @@
+[package]
+name = "snow-selected-text-c"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+host-application-qos = ["snow-selected-text/host-application-qos"]
+language-detection = ["dep:snow-language-detection-c"]
+
+[dependencies]
+snow-selected-text = { path = "../snow-selected-text" }
+snow-language-detection-c = { path = "../snow-language-detection-c", optional = true }

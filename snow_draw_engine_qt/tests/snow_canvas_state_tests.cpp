@@ -1,0 +1,898 @@
+#include "snow_canvas_state.h"
+#include "snow_canvas_ffi_handles.h"
+#include "snow_canvas_runtime_access.h"
+#include "snow_canvas_type_conversions.h"
+#include "snow_canvas_viewport.h"
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+#include "snow_draw_engine_qt/snow_canvas_types.h"
+#include "snow_draw_engine_qt/snow_canvas_style_edit.h"
+
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string_view>
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+void filterStyleParticipatesInToolbarStateDiffs() {
+    snow_canvas_state::Snapshot previous;
+    snow_canvas_state::Snapshot next = previous;
+    next.styleToolbarState.filter_style.strength = 0.73;
+
+    const snow_canvas_state::Changes styleChanges =
+        snow_canvas_state::diffSnapshots(previous, next);
+    require(styleChanges.styleToolbarChanged,
+            "filter style changes should invalidate the toolbar state");
+
+    previous = next;
+    next.styleToolbarState.filter_style_mixed = 1;
+    const snow_canvas_state::Changes mixedChanges =
+        snow_canvas_state::diffSnapshots(previous, next);
+    require(mixedChanges.styleToolbarChanged,
+            "mixed filter properties should invalidate the toolbar state");
+
+    require(!snow_canvas_state::diffSnapshots(next, next).any(),
+            "identical snapshots should not emit state synchronization");
+    auto brushChanged = next;
+    brushChanged.styleToolbarState.brush_eraser_style.stroke_width = 42.0;
+    require(snow_canvas_state::diffSnapshots(next, brushChanged).styleToolbarChanged,
+            "independent eraser creation width must trigger toolbar synchronization");
+    require(snow_canvas_types::toCanvasStyleToolbarState(brushChanged.styleToolbarState)
+                    .brushEraserStyle.strokeWidth == 42.0,
+            "C/Qt state conversion must preserve independent brush width");
+}
+
+void strokeRenderingStylesRoundTripAndPatchIndependently() {
+    SnowCanvasShapeStyle original;
+    original.fill = QColor(Qt::transparent);
+    original.stroke = QColor(32, 64, 96);
+    original.strokeWidth = 3.0;
+    original.strokeStyle = SnowCanvasStrokeStyle::Dotted;
+    require(original.strokeRenderingStyle == SnowCanvasStrokeRenderingStyle::Architect,
+            "existing canvas styles default to Architect");
+    for (const auto rendering :
+         {SnowCanvasStrokeRenderingStyle::Architect, SnowCanvasStrokeRenderingStyle::Artist,
+          SnowCanvasStrokeRenderingStyle::Cartoonist}) {
+        auto style = original;
+        style.strokeRenderingStyle = rendering;
+        require(snow_canvas_types::toCanvasShapeStyle(
+                    snow_canvas_types::toEngineShapeStyle(style)) == style,
+                "every rendering style survives the Qt/C ABI round trip");
+        auto patched = original;
+        auto requested = style;
+        requested.strokeStyle = SnowCanvasStrokeStyle::Dashed;
+        requested.strokeWidth = 19.0;
+        snowCanvasMergeStyle(patched, requested, SnowCanvasShapeStylePropertyStrokeRenderingStyle);
+        require(patched == style,
+                "rendering patches preserve stroke pattern and unrelated properties");
+        SnowCanvasSerialNumberStyle serial;
+        serial.fill = QColor(Qt::transparent);
+        serial.strokeRenderingStyle = rendering;
+        require(snow_canvas_types::toCanvasSerialNumberStyle(
+                    snow_canvas_types::toEngineSerialNumberStyle(serial)) == serial,
+                "sequence stroke types survive the Qt/C ABI round trip");
+        auto serialPatch = serial;
+        serialPatch.number = 30;
+        serialPatch.fontSize = 42;
+        SnowCanvasSerialNumberStyle merged;
+        merged.fill = QColor(Qt::transparent);
+        snowCanvasMergeStyle(merged, serialPatch,
+                             SnowCanvasSerialNumberStyleMixedStrokeRenderingStyle);
+        require(merged == serial, "sequence stroke type patches preserve other properties");
+    }
+    auto changed = original;
+    changed.strokeRenderingStyle = SnowCanvasStrokeRenderingStyle::Artist;
+    require(changed != original, "rendering style participates in public shape equality");
+    SnowCanvasRectangleShapeStyle rectangle;
+    auto roughRectangle = rectangle;
+    roughRectangle.strokeRenderingStyle = SnowCanvasStrokeRenderingStyle::Artist;
+    require(rectangle != roughRectangle,
+            "rendering style participates in rectangle preference equality");
+    SnowCanvasArrowStyle arrow;
+    auto roughArrow = arrow;
+    roughArrow.strokeRenderingStyle = SnowCanvasStrokeRenderingStyle::Cartoonist;
+    require(arrow != roughArrow, "rendering style participates in arrow preference equality");
+
+    snow_canvas_state::Snapshot before;
+    auto after = before;
+    after.styleToolbarState.shape_style.stroke_rendering_style = SNOW_STROKE_RENDERING_STYLE_ARTIST;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "rendering changes synchronize toolbar state");
+    before = after;
+    after.styleToolbarState.shape_style_mixed = SnowCanvasShapeStyleMixedStrokeRenderingStyle;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "mixed rendering state synchronizes the toolbar");
+    before = after;
+    after.styleToolbarState.serial_number_style.stroke_rendering_style =
+        SNOW_STROKE_RENDERING_STYLE_ARTIST;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "sequence stroke types synchronize toolbar state");
+
+    SnowCanvasStyleDefaults invalid;
+    invalid.rectangle.strokeRenderingStyle = static_cast<SnowCanvasStrokeRenderingStyle>(99);
+    SnowStyleDefaults engineDefaults{};
+    require(!snow_canvas_types::toEngineStyleDefaults(invalid, engineDefaults),
+            "invalid rendering preferences are rejected before crossing the C ABI");
+    invalid = SnowCanvasStyleDefaults{};
+    invalid.serialNumber.strokeRenderingStyle = static_cast<SnowCanvasStrokeRenderingStyle>(99);
+    require(!snow_canvas_types::toEngineStyleDefaults(invalid, engineDefaults),
+            "invalid sequence stroke types are rejected before crossing the C ABI");
+}
+
+void magnifierStylePatchesAndSynchronization() {
+    SnowCanvasMagnifierStyle style;
+    require(style.factor == 2.0 &&
+                style.connectionType == SnowCanvasMagnifierConnectionType::Gradient &&
+                style.sourceOutline && style.strokeWidth == 2.0 &&
+                style.cornerRadii == SnowCanvasCornerRadii{6, 6, 6, 6},
+            "magnifier has independent usable defaults");
+    style.shape = SnowCanvasRectangleShape::Diamond;
+    style.stroke = QColor(12, 34, 56, 78);
+    style.factor = 7.3;
+    style.connectionType = SnowCanvasMagnifierConnectionType::None;
+    style.sourceOutline = false;
+    style.leaderArrowhead = SnowCanvasArrowhead::CrowfootOneOrMany;
+    style.arrowRatio = 2.3;
+    style.cornerRadii = {3, 6, 9, 12};
+    require(snow_canvas_types::toCanvasMagnifierStyle(
+                snow_canvas_types::toEngineMagnifierStyle(style)) == style,
+            "magnifier style preserves every field across the C ABI");
+    for (auto connection :
+         {SnowCanvasMagnifierConnectionType::None, SnowCanvasMagnifierConnectionType::LeaderLine,
+          SnowCanvasMagnifierConnectionType::Gradient}) {
+        for (bool outline : {false, true}) {
+            auto combination = style;
+            combination.connectionType = connection;
+            combination.sourceOutline = outline;
+            require(snow_canvas_types::toCanvasMagnifierStyle(
+                        snow_canvas_types::toEngineMagnifierStyle(combination)) == combination,
+                    "all connection and outline combinations survive the C ABI");
+        }
+    }
+
+    snow_canvas_state::Snapshot before;
+    auto after = before;
+    after.styleToolbarState.magnifier_style = snow_canvas_types::toEngineMagnifierStyle(style);
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "magnifier appearance changes synchronize the toolbar");
+    before = after;
+    after.styleToolbarState.magnifier_style.connection_type = SNOW_MAGNIFIER_CONNECTION_GRADIENT;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "connection changes synchronize the toolbar independently");
+    before = after;
+    after.styleToolbarState.magnifier_style.source_outline = 1;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "source outline changes synchronize the toolbar independently");
+    before = after;
+    after.styleToolbarState.magnifier_style.corner_radii.bottom_right = 15;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "magnifier corner changes synchronize the toolbar independently");
+    before = after;
+    after.styleToolbarState.magnifier_style.arrow_ratio = 0.5;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "magnifier arrow proportions synchronize the toolbar independently");
+    before = after;
+    after.styleToolbarState.magnifier_style_mixed = SnowCanvasMagnifierStylePropertyFactor;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "mixed magnifier values synchronize the toolbar");
+    require(
+        snow_canvas_types::toCanvasStyleToolbarState(after.styleToolbarState).magnifierStyleMixed ==
+            SnowCanvasMagnifierStylePropertyFactor,
+        "mixed magnifier properties survive conversion");
+
+    SnowCanvasRuntime runtime;
+    SnowCanvasRuntimeEditor editor(runtime, SnowCanvasTool::Magnifier);
+    require(editor.isValid(), "magnifier runtime editor can activate the tool");
+    const auto initial = editor.canvasStyleToolbarState().magnifierStyle;
+    require(editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyFactor),
+            "magnifier factor patch succeeds");
+    auto expected = initial;
+    expected.factor = style.factor;
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "factor patches preserve unrelated magnifier properties");
+    require(!runtime.canUndo(), "creation style changes do not create annotation history");
+    require(
+        editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyConnectionType),
+        "magnifier connection patch succeeds");
+    expected.connectionType = style.connectionType;
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "connection patches preserve source outline and unrelated style properties");
+    require(
+        editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertySourceOutline),
+        "magnifier source outline patch succeeds");
+    expected.sourceOutline = style.sourceOutline;
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "source outline patches preserve connection and unrelated style properties");
+    for (int connection : {-1, 3}) {
+        auto invalid = style;
+        invalid.connectionType = static_cast<SnowCanvasMagnifierConnectionType>(connection);
+        require(!editor.setMagnifierStyleFromToolbar(
+                    invalid, SnowCanvasMagnifierStylePropertyConnectionType),
+                "invalid connections leave magnifier defaults intact");
+    }
+    require(
+        editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyCornerRadius),
+        "magnifier corner patch succeeds");
+    expected.cornerRadii = style.cornerRadii;
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "corner patches preserve unrelated magnifier properties");
+    require(editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyArrowRatio),
+            "magnifier arrow proportion patch succeeds");
+    expected.arrowRatio = style.arrowRatio;
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "arrow proportion patches preserve unrelated magnifier properties");
+    for (double ratio : {0.4, 3.1, std::numeric_limits<double>::quiet_NaN()}) {
+        auto invalid = style;
+        invalid.arrowRatio = ratio;
+        require(!editor.setMagnifierStyleFromToolbar(invalid,
+                                                     SnowCanvasMagnifierStylePropertyArrowRatio),
+                "invalid arrow proportions leave magnifier defaults intact");
+    }
+    style.factor = std::numeric_limits<double>::infinity();
+    require(!editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyFactor),
+            "nonfinite magnification is rejected");
+    style.factor = 10.1;
+    require(!editor.setMagnifierStyleFromToolbar(style, SnowCanvasMagnifierStylePropertyFactor),
+            "out-of-range magnification is rejected");
+    require(editor.canvasStyleToolbarState().magnifierStyle == expected,
+            "invalid patches leave magnifier styles intact");
+
+    style.factor = 4.0;
+    for (auto target :
+         {SnowCanvasStyleEditTarget::Selection, SnowCanvasStyleEditTarget::Creation}) {
+        SnowCanvasStyleDefaults defaults;
+        auto remembered = defaults.magnifier;
+        snowCanvasMergeStyleEdit(
+            defaults,
+            SnowCanvasMagnifierEdit{style, SnowCanvasMagnifierStylePropertyFactor, target});
+        remembered.factor = style.factor;
+        require(defaults.magnifier == remembered,
+                "magnifier edits remember only the explicitly edited factor for either target");
+        snowCanvasMergeStyleEdit(
+            defaults,
+            SnowCanvasMagnifierEdit{style, SnowCanvasMagnifierStylePropertyConnectionType, target});
+        remembered.connectionType = style.connectionType;
+        require(defaults.magnifier == remembered,
+                "remembering a connection preserves the independent source outline");
+        snowCanvasMergeStyleEdit(
+            defaults,
+            SnowCanvasMagnifierEdit{style, SnowCanvasMagnifierStylePropertySourceOutline, target});
+        remembered.sourceOutline = style.sourceOutline;
+        require(defaults.magnifier == remembered,
+                "remembering a source outline preserves the independent connection and factor");
+    }
+}
+
+template <typename T> void requireEqualPair(const T& value, const char* message) {
+    // The independent copy is the behavior under test here.
+    const T copy = value; // NOLINT(performance-unnecessary-copy-initialization)
+    require(value == copy && !(value != copy), message);
+}
+
+template <typename T> void requireUnequalPair(const T& lhs, const T& rhs, const char* message) {
+    require(lhs != rhs && !(lhs == rhs), message);
+}
+
+void publicCanvasDtosUseExactCompleteEquality() {
+    SnowCanvasCornerRadii radii{1.0, 2.0, 3.0, 4.0};
+    requireEqualPair(radii, "identical corner radii should compare equal");
+    for (int field = 0; field < 4; ++field) {
+        SnowCanvasCornerRadii changed = radii;
+        double* values[] = {&changed.topLeft, &changed.topRight, &changed.bottomRight,
+                            &changed.bottomLeft};
+        *values[field] += 0.25;
+        requireUnequalPair(radii, changed, "every corner radius should participate");
+    }
+
+    SnowCanvasFilterStyle filter;
+    requireEqualPair(filter, "identical filters should compare equal");
+    auto changedFilter = filter;
+    changedFilter.type = SnowCanvasFilterType::GaussianBlur;
+    requireUnequalPair(filter, changedFilter, "filter type should participate");
+    changedFilter = filter;
+    changedFilter.strength += 0.1;
+    requireUnequalPair(filter, changedFilter, "filter strength should participate");
+    changedFilter = filter;
+    changedFilter.opacity -= 0.1;
+    requireUnequalPair(filter, changedFilter, "filter opacity should participate");
+
+    SnowCanvasShapeStyle shape;
+    shape.fill = QColor(1, 2, 3, 4);
+    shape.stroke = QColor(5, 6, 7, 8);
+    requireEqualPair(shape, "identical shape styles should compare equal");
+#define REQUIRE_SHAPE_CHANGE(field, value)                                                         \
+    do {                                                                                           \
+        auto changed = shape;                                                                      \
+        changed.field = value;                                                                     \
+        requireUnequalPair(shape, changed, "shape field should participate");                      \
+    } while (false)
+    REQUIRE_SHAPE_CHANGE(fill, QColor(9, 2, 3, 4));
+    REQUIRE_SHAPE_CHANGE(fillStyle, SnowCanvasFillStyle::CrossLine);
+    REQUIRE_SHAPE_CHANGE(stroke, QColor(9, 6, 7, 8));
+    REQUIRE_SHAPE_CHANGE(strokeWidth, 2.0);
+    REQUIRE_SHAPE_CHANGE(cornerRadii, (SnowCanvasCornerRadii{1, 2, 3, 4}));
+    REQUIRE_SHAPE_CHANGE(startArrowhead, SnowCanvasArrowhead::Bar);
+    REQUIRE_SHAPE_CHANGE(endArrowhead, SnowCanvasArrowhead::Arrow);
+    REQUIRE_SHAPE_CHANGE(strokeStyle, SnowCanvasStrokeStyle::Dashed);
+    REQUIRE_SHAPE_CHANGE(arrowRatio, 2.0);
+    REQUIRE_SHAPE_CHANGE(arrowOutlineColor, QColor(Qt::blue));
+    REQUIRE_SHAPE_CHANGE(arrowOutlineWidth, 8.0);
+    REQUIRE_SHAPE_CHANGE(arrowType, SnowCanvasArrowType::Curve);
+    REQUIRE_SHAPE_CHANGE(opacity, 0.5);
+    REQUIRE_SHAPE_CHANGE(highlightShape, SnowCanvasHighlightShape::Ellipse);
+    REQUIRE_SHAPE_CHANGE(shape, SnowCanvasRectangleShape::Diamond);
+#undef REQUIRE_SHAPE_CHANGE
+
+    SnowCanvasRectangleShapeStyle rectangle;
+    requireEqualPair(rectangle, "identical rectangle styles should compare equal");
+#define REQUIRE_RECTANGLE_CHANGE(field, value)                                                     \
+    do {                                                                                           \
+        auto changed = rectangle;                                                                  \
+        changed.field = value;                                                                     \
+        requireUnequalPair(rectangle, changed, "rectangle field should participate");              \
+    } while (false)
+    REQUIRE_RECTANGLE_CHANGE(fill, QColor(Qt::red));
+    REQUIRE_RECTANGLE_CHANGE(fillStyle, SnowCanvasFillStyle::Line);
+    REQUIRE_RECTANGLE_CHANGE(stroke, QColor(Qt::blue));
+    REQUIRE_RECTANGLE_CHANGE(strokeWidth, 3.0);
+    REQUIRE_RECTANGLE_CHANGE(strokeStyle, SnowCanvasStrokeStyle::Dotted);
+    REQUIRE_RECTANGLE_CHANGE(cornerRadii, (SnowCanvasCornerRadii{2, 3, 4, 5}));
+#undef REQUIRE_RECTANGLE_CHANGE
+
+    SnowCanvasArrowStyle arrow;
+    requireEqualPair(arrow, "identical arrow styles should compare equal");
+#define REQUIRE_ARROW_CHANGE(field, value)                                                         \
+    do {                                                                                           \
+        auto changed = arrow;                                                                      \
+        changed.field = value;                                                                     \
+        requireUnequalPair(arrow, changed, "arrow field should participate");                      \
+    } while (false)
+    REQUIRE_ARROW_CHANGE(stroke, QColor(Qt::green));
+    REQUIRE_ARROW_CHANGE(strokeWidth, 4.0);
+    REQUIRE_ARROW_CHANGE(startArrowhead, SnowCanvasArrowhead::Dot);
+    REQUIRE_ARROW_CHANGE(endArrowhead, SnowCanvasArrowhead::Triangle);
+    REQUIRE_ARROW_CHANGE(strokeStyle, SnowCanvasStrokeStyle::Dotted);
+    REQUIRE_ARROW_CHANGE(arrowRatio, 2.0);
+    REQUIRE_ARROW_CHANGE(arrowOutlineColor, QColor(Qt::blue));
+    REQUIRE_ARROW_CHANGE(arrowOutlineWidth, 8.0);
+    REQUIRE_ARROW_CHANGE(arrowType, SnowCanvasArrowType::Elbow);
+#undef REQUIRE_ARROW_CHANGE
+
+    SnowCanvasTextStyle text;
+    requireEqualPair(text, "identical text styles should compare equal");
+#define REQUIRE_TEXT_CHANGE(field, value)                                                          \
+    do {                                                                                           \
+        auto changed = text;                                                                       \
+        changed.field = value;                                                                     \
+        requireUnequalPair(text, changed, "text field should participate");                        \
+    } while (false)
+    REQUIRE_TEXT_CHANGE(color, QColor(Qt::blue));
+    REQUIRE_TEXT_CHANGE(fontSize, 31.0);
+    REQUIRE_TEXT_CHANGE(fontFamily, QStringLiteral("Exact Font"));
+    REQUIRE_TEXT_CHANGE(fill, QColor(Qt::yellow));
+    REQUIRE_TEXT_CHANGE(fillStyle, SnowCanvasFillStyle::Line);
+    REQUIRE_TEXT_CHANGE(stroke, QColor(Qt::black));
+    REQUIRE_TEXT_CHANGE(strokeWidth, 1.0);
+    REQUIRE_TEXT_CHANGE(cornerRadii, (SnowCanvasCornerRadii{1, 2, 3, 4}));
+    REQUIRE_TEXT_CHANGE(horizontalAlign, SnowCanvasTextHorizontalAlign::Right);
+    REQUIRE_TEXT_CHANGE(verticalAlign, SnowCanvasTextVerticalAlign::Bottom);
+    REQUIRE_TEXT_CHANGE(opacity, 0.75);
+#undef REQUIRE_TEXT_CHANGE
+
+    SnowCanvasSerialNumberStyle serial;
+    requireEqualPair(serial, "identical serial styles should compare equal");
+#define REQUIRE_SERIAL_CHANGE(field, value)                                                        \
+    do {                                                                                           \
+        auto changed = serial;                                                                     \
+        changed.field = value;                                                                     \
+        requireUnequalPair(serial, changed, "serial field should participate");                    \
+    } while (false)
+    REQUIRE_SERIAL_CHANGE(number, 2);
+    REQUIRE_SERIAL_CHANGE(type, SnowCanvasSerialNumberType::SolidSquare);
+    REQUIRE_SERIAL_CHANGE(numericType, SnowCanvasSerialNumberNumericType::Roman);
+    REQUIRE_SERIAL_CHANGE(color, QColor(Qt::cyan));
+    REQUIRE_SERIAL_CHANGE(fill, QColor(Qt::magenta));
+    REQUIRE_SERIAL_CHANGE(fillStyle, SnowCanvasFillStyle::CrossLine);
+    REQUIRE_SERIAL_CHANGE(fontSize, 25.0);
+    REQUIRE_SERIAL_CHANGE(fontFamily, QStringLiteral("Exact Serial Font"));
+    REQUIRE_SERIAL_CHANGE(strokeWidth, 3.0);
+    REQUIRE_SERIAL_CHANGE(strokeStyle, SnowCanvasStrokeStyle::Dashed);
+    REQUIRE_SERIAL_CHANGE(opacity, 0.5);
+#undef REQUIRE_SERIAL_CHANGE
+
+    SnowCanvasWatermarkConfig watermark;
+    requireEqualPair(watermark, "identical watermarks should compare equal");
+#define REQUIRE_WATERMARK_CHANGE(field, value)                                                     \
+    do {                                                                                           \
+        auto changed = watermark;                                                                  \
+        changed.field = value;                                                                     \
+        requireUnequalPair(watermark, changed, "watermark field should participate");              \
+    } while (false)
+    REQUIRE_WATERMARK_CHANGE(color, QColor(Qt::white));
+    REQUIRE_WATERMARK_CHANGE(text, QStringLiteral("watermark"));
+    REQUIRE_WATERMARK_CHANGE(templateValue, QStringLiteral("{text} {YYYY}"));
+    REQUIRE_WATERMARK_CHANGE(templateApplicationTime,
+                             (SnowCanvasWatermarkTemplateApplicationTime{2026, 9, 15, 12, 34, 56}));
+    REQUIRE_WATERMARK_CHANGE(fontSize, 17.0);
+    REQUIRE_WATERMARK_CHANGE(fontFamily, QStringLiteral("Exact Watermark Font"));
+    REQUIRE_WATERMARK_CHANGE(angle, 31.0);
+    REQUIRE_WATERMARK_CHANGE(gap, 57.0);
+    REQUIRE_WATERMARK_CHANGE(opacity, 0.17);
+#undef REQUIRE_WATERMARK_CHANGE
+
+    SnowCanvasStyleToolbarState toolbar;
+    requireEqualPair(toolbar, "identical toolbar states should compare equal");
+#define REQUIRE_TOOLBAR_CHANGE(field, value)                                                       \
+    do {                                                                                           \
+        auto changed = toolbar;                                                                    \
+        changed.field = value;                                                                     \
+        requireUnequalPair(toolbar, changed, "toolbar field should participate");                  \
+    } while (false)
+    REQUIRE_TOOLBAR_CHANGE(source, SnowCanvasStyleToolbarSource::SelectedRectangle);
+    auto changedToolbar = toolbar;
+    changedToolbar.shapeStyle.arrowType = SnowCanvasArrowType::Curve;
+    requireUnequalPair(toolbar, changedToolbar, "inactive shape fields should participate");
+    changedToolbar = toolbar;
+    changedToolbar.textStyle.fontFamily = QStringLiteral("text");
+    requireUnequalPair(toolbar, changedToolbar, "text style should participate");
+    changedToolbar = toolbar;
+    changedToolbar.serialNumberStyle.number = 9;
+    requireUnequalPair(toolbar, changedToolbar, "serial style should participate");
+    REQUIRE_TOOLBAR_CHANGE(textStyleMixed, 1u);
+    REQUIRE_TOOLBAR_CHANGE(canEditArrowText, true);
+    REQUIRE_TOOLBAR_CHANGE(serialNumberStyleMixed, 2u);
+    REQUIRE_TOOLBAR_CHANGE(shapeStyleMixed, 4u);
+    changedToolbar = toolbar;
+    changedToolbar.filterStyle.strength = 0.25;
+    requireUnequalPair(toolbar, changedToolbar, "filter style should participate");
+    REQUIRE_TOOLBAR_CHANGE(filterStyleMixed, 8u);
+    REQUIRE_TOOLBAR_CHANGE(brushEraserStyle, (SnowCanvasBrushEraserStyle{42.0}));
+#undef REQUIRE_TOOLBAR_CHANGE
+
+    SnowCanvasSerialNumberToolbarState serialToolbar;
+    requireEqualPair(serialToolbar, "identical serial-number toolbar states should compare equal");
+#define REQUIRE_SERIAL_TOOLBAR_CHANGE(field, value)                                                \
+    do {                                                                                           \
+        auto changed = serialToolbar;                                                              \
+        changed.field = value;                                                                     \
+        requireUnequalPair(serialToolbar, changed,                                                 \
+                           "serial-number toolbar field should participate");                      \
+    } while (false)
+    REQUIRE_SERIAL_TOOLBAR_CHANGE(visible, true);
+    REQUIRE_SERIAL_TOOLBAR_CHANGE(geometry, QRectF(1, 2, 3, 4));
+    REQUIRE_SERIAL_TOOLBAR_CHANGE(canDecrease, true);
+    REQUIRE_SERIAL_TOOLBAR_CHANGE(canIncrease, true);
+    REQUIRE_SERIAL_TOOLBAR_CHANGE(canCreateText, true);
+#undef REQUIRE_SERIAL_TOOLBAR_CHANGE
+}
+
+SnowCanvasStyleDefaults customStyleDefaults() {
+    SnowCanvasStyleDefaults defaults;
+    const QColor transparent(1, 2, 3, 0);
+    const QColor ink(17, 34, 51, 128);
+    SnowCanvasShapeStyle* shapes[] = {
+        &defaults.rectangle,          &defaults.arrow,        &defaults.line, &defaults.freeDraw,
+        &defaults.rectangleHighlight, &defaults.penHighlight,
+    };
+    double width = 3.0;
+    for (SnowCanvasShapeStyle* shape : shapes) {
+        shape->fill = transparent;
+        shape->stroke = ink;
+        shape->strokeWidth = width;
+        shape->opacity = 0.75;
+        width += 1.0;
+    }
+    defaults.line.arrowType = SnowCanvasArrowType::Straight;
+    defaults.rectangleFilter = {
+        SnowCanvasFilterType::GaussianBlur,
+        0.41,
+        0.51,
+        9.0,
+    };
+    defaults.penFilter = {
+        SnowCanvasFilterType::Inversion,
+        0.42,
+        0.52,
+        10.0,
+    };
+    defaults.text.color = ink;
+    defaults.text.fill = transparent;
+    defaults.text.stroke = QColor(68, 85, 102, 255);
+    defaults.text.fontSize = 31.0;
+    defaults.text.fontFamily = QStringLiteral("Qt Text Font");
+    defaults.serialNumber.color = ink;
+    defaults.serialNumber.fill = transparent;
+    defaults.serialNumber.type = SnowCanvasSerialNumberType::Circle;
+    defaults.serialNumber.fontSize = 25.0;
+    defaults.serialNumber.fontFamily = QStringLiteral("Qt Serial Font");
+    defaults.watermark.color = ink;
+    defaults.watermark.text = QStringLiteral("Qt watermark");
+    defaults.watermark.templateValue = QStringLiteral("{text} {YYYY-MM-DD_HH-mm-ss}");
+    defaults.watermark.templateApplicationTime =
+        SnowCanvasWatermarkTemplateApplicationTime{2026, 9, 15, 12, 34, 56};
+    defaults.watermark.fontFamily = QStringLiteral("Qt Watermark Font");
+    defaults.watermark.opacity = 0.24;
+    defaults.spotlight.color = ink;
+    defaults.spotlight.opacity = 0.62;
+    defaults.spotlightShape = SnowCanvasRectangleShape::Diamond;
+    return defaults;
+}
+
+SnowViewport createViewport(SnowCanvasRuntime& runtime) {
+    SnowViewport viewport = nullptr;
+    const SnowEngineConfig config = snow_canvas_viewport::defaultEngineConfig();
+    require(snow_viewport_create(snow_canvas_runtime::Access::handle(runtime), &config,
+                                 &viewport) == SNOW_OK &&
+                viewport != nullptr,
+            "runtime viewport creation should succeed");
+    return viewport;
+}
+
+SnowStyleToolbarState toolbarState(SnowCanvasRuntime& runtime, SnowViewport viewport,
+                                   SnowActiveTool tool) {
+    SnowRuntime handle = snow_canvas_runtime::Access::handle(runtime);
+    ScopedChangedViewportList changed;
+    require(snow_viewport_set_active_tool_ex(handle, viewport, tool, changed.outParam()) == SNOW_OK,
+            "configured tool selection should succeed");
+    SnowStyleToolbarState state{};
+    require(snow_viewport_get_style_toolbar_state(handle, viewport, &state) == SNOW_OK,
+            "configured toolbar state query should succeed");
+    return state;
+}
+
+void configuredFillStylesValidateEveryTool() {
+    for (const auto fillStyle : {SnowCanvasFillStyle::Line, SnowCanvasFillStyle::CrossLine,
+                                 SnowCanvasFillStyle::Solid, SnowCanvasFillStyle::Border}) {
+        auto defaults = customStyleDefaults();
+        SnowCanvasFillStyle* fills[] = {
+            &defaults.rectangle.fillStyle,
+            &defaults.arrow.fillStyle,
+            &defaults.line.fillStyle,
+            &defaults.freeDraw.fillStyle,
+            &defaults.rectangleHighlight.fillStyle,
+            &defaults.penHighlight.fillStyle,
+            &defaults.speechBubble.fillStyle,
+            &defaults.text.fillStyle,
+            &defaults.serialNumber.fillStyle,
+        };
+        for (auto* fill : fills)
+            *fill = fillStyle;
+
+        SnowCanvasRuntime runtime(SnowCanvasRuntimeConfig{defaults});
+        require(runtime.isValid(), "every supported fill style can initialize a runtime");
+        auto verifyStyles = [&] {
+            const auto viewport = createViewport(runtime);
+            const auto expected = snow_canvas_types::toEngineFillStyle(fillStyle);
+            require(
+                toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.fill_style ==
+                        expected &&
+                    toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SPEECH_BUBBLE)
+                            .shape_style.fill_style == expected &&
+                    toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_TEXT).text_style.fill_style ==
+                        expected &&
+                    toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SERIAL_NUMBER)
+                            .serial_number_style.fill_style == expected,
+                "configured fills reach shape, speech bubble, text and serial tools");
+        };
+        verifyStyles();
+        require(runtime.reset(), "every supported fill style survives runtime reset");
+        verifyStyles();
+
+        for (auto* fill : fills) {
+            for (const int invalid : {-1, 4}) {
+                // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+                *fill = static_cast<SnowCanvasFillStyle>(invalid);
+                SnowCanvasRuntime rejected(SnowCanvasRuntimeConfig{defaults});
+                require(!rejected.isValid(),
+                        "out-of-range fill styles are rejected for every configured tool");
+            }
+            *fill = fillStyle;
+        }
+    }
+}
+
+void configuredRuntimeProfileFollowsRestoreAndResetLifecycle() {
+    const SnowCanvasStyleDefaults defaults = customStyleDefaults();
+    SnowCanvasRuntimeConfig config;
+    config.styleDefaults = defaults;
+    SnowCanvasRuntime runtime(config);
+    require(runtime.isValid(), "a complete configured runtime should be valid");
+
+    SnowViewport viewport = createViewport(runtime);
+    SnowWatermarkConfig engineWatermark{};
+    require(snow_viewport_get_watermark_config(snow_canvas_runtime::Access::handle(runtime),
+                                               viewport, &engineWatermark) == SNOW_OK &&
+                snow_canvas_types::toCanvasWatermarkConfig(engineWatermark) == defaults.watermark,
+            "runtime watermark defaults must preserve the template snapshot and time");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.stroke_width ==
+                defaults.rectangle.strokeWidth,
+            "rectangle should expose its configured creation style");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SPOTLIGHT).shape_style.shape ==
+                SNOW_RECTANGLE_SHAPE_DIAMOND,
+            "spotlight should expose its independent configured shape");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_ARROW).shape_style.stroke_width ==
+                defaults.arrow.strokeWidth,
+            "arrow should expose its configured creation style");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_LINE).shape_style.stroke_width ==
+                defaults.line.strokeWidth,
+            "line should expose its configured creation style");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_LINE).shape_style.arrow_type ==
+                SNOW_ARROW_TYPE_STRAIGHT,
+            "line should expose its configured straight type");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_FREE_DRAW).shape_style.stroke_width ==
+                defaults.freeDraw.strokeWidth,
+            "free draw should expose its configured creation style");
+
+    SnowShapeStyle editedLine = toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_LINE).shape_style;
+    editedLine.arrow_type = SNOW_ARROW_TYPE_ELBOW;
+    SnowChangedViewportList lineChanged = nullptr;
+    require(snow_viewport_set_shape_style_patch_ex(snow_canvas_runtime::Access::handle(runtime),
+                                                   viewport, &editedLine,
+                                                   SNOW_SHAPE_STYLE_PROPERTY_ARROW_TYPE,
+                                                   SNOW_SHAPE_KIND_LINE, &lineChanged) == SNOW_OK,
+            "line arrow-type patches should be accepted");
+    snow_changed_viewports_destroy(lineChanged);
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_LINE).shape_style.arrow_type ==
+                SNOW_ARROW_TYPE_CURVE,
+            "unsupported elbow line patches should normalize to curve");
+
+    SnowShapeStyle editedFreeDraw =
+        toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_FREE_DRAW).shape_style;
+    editedFreeDraw.arrow_type = SNOW_ARROW_TYPE_STRAIGHT;
+    require(snow_viewport_set_shape_style_patch_ex(
+                snow_canvas_runtime::Access::handle(runtime), viewport, &editedFreeDraw,
+                SNOW_SHAPE_STYLE_PROPERTY_ARROW_TYPE, SNOW_SHAPE_KIND_FREE_DRAW,
+                nullptr) == SNOW_ERROR_INVALID_ARGUMENT,
+            "free draw should reject the line-only arrow-type property");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_RECTANGLE_HIGHLIGHT)
+                    .shape_style.stroke_width == defaults.rectangleHighlight.strokeWidth,
+            "rectangle highlight should expose its configured creation style");
+    require(
+        toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_PEN_HIGHLIGHT).shape_style.stroke_width ==
+            defaults.penHighlight.strokeWidth,
+        "pen highlight should expose its configured creation style");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_RECTANGLE_FILTER)
+                    .filter_style.stroke_width == defaults.rectangleFilter.strokeWidth,
+            "rectangle filter should expose its configured creation style");
+    require(
+        toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_PEN_FILTER).filter_style.stroke_width ==
+            defaults.penFilter.strokeWidth,
+        "pen filter should expose its configured creation style");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_TEXT).text_style.font_size ==
+                defaults.text.fontSize,
+            "text should expose its configured creation style");
+    const SnowSerialNumberStyle serialNumberStyle =
+        toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SERIAL_NUMBER).serial_number_style;
+    require(serialNumberStyle.font_size == defaults.serialNumber.fontSize,
+            "sequence numbers should expose their configured creation style");
+    require(serialNumberStyle.serial_number_type == SNOW_SERIAL_NUMBER_TYPE_CIRCLE,
+            "sequence numbers should expose their configured creation type");
+
+    SnowShapeStyle edited = toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style;
+    edited.stroke_width = 41.0;
+    SnowChangedViewportList changed = nullptr;
+    require(snow_viewport_set_shape_style_patch_ex(snow_canvas_runtime::Access::handle(runtime),
+                                                   viewport, &edited,
+                                                   SNOW_SHAPE_STYLE_PROPERTY_STROKE_WIDTH,
+                                                   SNOW_SHAPE_KIND_RECTANGLE, &changed) == SNOW_OK,
+            "editing the configured rectangle style should succeed");
+    snow_changed_viewports_destroy(changed);
+
+    const QByteArray fullSession = runtime.serializeDocumentSession();
+    const QByteArray documentHistory = runtime.serializeDocumentHistory();
+    require(!fullSession.isEmpty() && !documentHistory.isEmpty(),
+            "configured runtime serialization should succeed");
+
+    require(runtime.restoreDocumentSession(fullSession),
+            "full configured session restore should succeed");
+    viewport = createViewport(runtime);
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.stroke_width ==
+                41.0,
+            "full session restore should retain current editor styles");
+
+    require(runtime.restoreDocumentHistory(documentHistory),
+            "configured document-history restore should succeed");
+    viewport = createViewport(runtime);
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.stroke_width ==
+                defaults.rectangle.strokeWidth,
+            "history-only restore should use the target runtime profile");
+
+    edited = toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style;
+    edited.stroke_width = 42.0;
+    changed = nullptr;
+    require(snow_viewport_set_shape_style_patch_ex(snow_canvas_runtime::Access::handle(runtime),
+                                                   viewport, &edited,
+                                                   SNOW_SHAPE_STYLE_PROPERTY_STROKE_WIDTH,
+                                                   SNOW_SHAPE_KIND_RECTANGLE, &changed) == SNOW_OK,
+            "style mutation before clear should succeed");
+    snow_changed_viewports_destroy(changed);
+    require(runtime.clearDocumentPreservingViewports(),
+            "configured clear should preserve attached viewports");
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.stroke_width ==
+                42.0,
+            "configured clear should preserve the current creation style on the retained viewport");
+
+    require(runtime.reset(), "configured runtime reset should succeed");
+    viewport = createViewport(runtime);
+    require(toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE).shape_style.stroke_width ==
+                defaults.rectangle.strokeWidth,
+            "configured runtime reset should restore the immutable profile");
+
+    SnowCanvasStyleDefaults elbowLineDefaults = defaults;
+    elbowLineDefaults.line.arrowType = SnowCanvasArrowType::Elbow;
+    SnowCanvasRuntimeConfig elbowLineConfig;
+    elbowLineConfig.styleDefaults = elbowLineDefaults;
+    SnowCanvasRuntime elbowLineRuntime(elbowLineConfig);
+    require(elbowLineRuntime.isValid(),
+            "a configured runtime should accept and normalize an elbow Line default");
+    SnowViewport elbowLineViewport = createViewport(elbowLineRuntime);
+    require(toolbarState(elbowLineRuntime, elbowLineViewport, SNOW_ACTIVE_TOOL_LINE)
+                    .shape_style.arrow_type == SNOW_ARROW_TYPE_CURVE,
+            "an unsupported elbow Line default should normalize to curve");
+
+    SnowCanvasStyleDefaults invalid = defaults;
+    invalid.text.fill = QColor();
+    SnowCanvasRuntimeConfig invalidConfig;
+    invalidConfig.styleDefaults = invalid;
+    SnowCanvasRuntime rejected(invalidConfig);
+    require(!rejected.isValid(), "an invalid configured profile should be rejected atomically");
+
+    invalid = defaults;
+    // Runtime configuration must reject values that arrive outside the C++ enum domain.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+    invalid.arrow.arrowType = static_cast<SnowCanvasArrowType>(99);
+    invalidConfig.styleDefaults = invalid;
+    SnowCanvasRuntime rejectedEnum(invalidConfig);
+    require(!rejectedEnum.isValid(),
+            "an invalid configured enum should be rejected before C ABI conversion");
+
+    invalid = defaults;
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+    invalid.serialNumber.type = static_cast<SnowCanvasSerialNumberType>(99);
+    invalidConfig.styleDefaults = invalid;
+    SnowCanvasRuntime rejectedSerialType(invalidConfig);
+    require(!rejectedSerialType.isValid(),
+            "an invalid sequence-number type should be rejected before C ABI conversion");
+
+    invalid = defaults;
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+    invalid.spotlightShape = static_cast<SnowCanvasRectangleShape>(99);
+    invalidConfig.styleDefaults = invalid;
+    SnowCanvasRuntime rejectedSpotlightShape(invalidConfig);
+    require(!rejectedSpotlightShape.isValid(),
+            "an invalid spotlight shape should be rejected before C ABI conversion");
+
+    SnowCanvasStyleDefaults smartEraseDefaults = defaults;
+    smartEraseDefaults.rectangleFilter.type = SnowCanvasFilterType::SmartErase;
+    smartEraseDefaults.penFilter.type = SnowCanvasFilterType::SmartErase;
+    SnowCanvasRuntimeConfig smartEraseConfig;
+    smartEraseConfig.styleDefaults = smartEraseDefaults;
+    SnowCanvasRuntime smartEraseRuntime(smartEraseConfig);
+    require(smartEraseRuntime.isValid(),
+            "a configured runtime with Smart Erase filter defaults should be valid");
+    require(smartEraseRuntime.clearDocumentPreservingViewports(),
+            "a Smart Erase configured runtime should clear its document");
+}
+
+void watermarkConfigurationConversionsPreserveSnapshotsAndUtf8Boundaries() {
+    SnowCanvasWatermarkConfig config;
+    config.color = QColor(12, 34, 56, 78);
+    config.text = QStringLiteral("watermark");
+    config.templateValue = QStringLiteral("  {text} @ {YYYY-MM-DD_HH-mm-ss}  ");
+    config.templateApplicationTime =
+        SnowCanvasWatermarkTemplateApplicationTime{2026, 9, 15, 12, 34, 56};
+    config.fontSize = 21.0;
+    config.fontFamily = QStringLiteral("Template Font");
+    config.angle = -17.0;
+    config.gap = 83.0;
+    config.opacity = 0.42;
+
+    const SnowWatermarkConfig engine = snow_canvas_types::toEngineWatermarkConfig(config);
+    require(snow_canvas_types::toCanvasWatermarkConfig(engine) == config,
+            "Qt/C watermark conversion must preserve the complete template snapshot");
+
+    const QString emoji = QString::fromUcs4(U"\U0001F600");
+    config.templateValue = emoji.repeated(300);
+    const SnowWatermarkConfig truncated = snow_canvas_types::toEngineWatermarkConfig(config);
+    const SnowCanvasWatermarkConfig roundTrip =
+        snow_canvas_types::toCanvasWatermarkConfig(truncated);
+    require(truncated.template_value_utf8_len == 1024 &&
+                roundTrip.templateValue == emoji.repeated(256) &&
+                !roundTrip.templateValue.contains(QChar::ReplacementCharacter),
+            "template ABI truncation must stop on a valid UTF-8 boundary");
+
+    snow_canvas_state::Snapshot before;
+    snow_canvas_state::Snapshot after = before;
+    after.watermarkConfig = engine;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "template snapshots must participate in C state diff detection");
+    before = after;
+    after.watermarkConfig.template_application_time.second = 57;
+    require(snow_canvas_state::diffSnapshots(before, after).styleToolbarChanged,
+            "template application time must participate in C state diff detection");
+}
+
+void serialNumberStrokePatchesPreserveOtherProperties() {
+    const SnowCanvasSerialNumberStyle original;
+    auto requested = original;
+    requested.number = 27;
+    requested.numericType = SnowCanvasSerialNumberNumericType::Roman;
+    requested.strokeWidth = 4.0;
+    requested.strokeStyle = SnowCanvasStrokeStyle::Dashed;
+    auto actual = original;
+    auto expected = original;
+    expected.strokeWidth = requested.strokeWidth;
+    snowCanvasMergeStyle(actual, requested, SnowCanvasSerialNumberStyleMixedStrokeWidth);
+    require(actual == expected, "stroke width patches preserve all other serial properties");
+    expected.strokeStyle = requested.strokeStyle;
+    snowCanvasMergeStyle(actual, requested, SnowCanvasSerialNumberStyleMixedStrokeStyle);
+    require(actual == expected, "stroke style patches preserve all other serial properties");
+}
+
+void defaultRuntimeUsesGenericEngineDefaults() {
+    SnowStyleDefaults expected{};
+    require(snow_runtime_style_defaults_default(&expected) == SNOW_OK,
+            "generic C defaults should be available");
+    require(expected.spotlight_shape == SNOW_RECTANGLE_SHAPE_RECTANGLE,
+            "generic spotlight defaults should remain rectangular");
+    SnowCanvasRuntime runtime;
+    require(runtime.isValid(), "default runtime creation should be valid");
+    SnowViewport viewport = createViewport(runtime);
+    const SnowStyleToolbarState state = toolbarState(runtime, viewport, SNOW_ACTIVE_TOOL_SHAPE);
+    require(state.shape_style.stroke.r == expected.rectangle.stroke.r &&
+                state.shape_style.stroke.g == expected.rectangle.stroke.g &&
+                state.shape_style.stroke.b == expected.rectangle.stroke.b &&
+                state.shape_style.stroke_width == expected.rectangle.stroke_width,
+            "default runtime creation should retain generic engine defaults");
+}
+
+void serializedSnapshotsOwnBytesAndPreserveUndoAndRedo() {
+    SnowCanvasRuntime runtime;
+    const QByteArray annotation =
+        R"({"version":1,"operations":[{"type":"rectangle","bounds":[10,20,30,40]}]})";
+    require(!runtime.applyAnnotationTransaction(annotation).isEmpty() &&
+                !runtime.applyAnnotationTransaction(annotation).isEmpty() && runtime.undo(),
+            "create a document with both undo and redo history");
+    const QByteArray snapshot = runtime.serializeDocumentSession();
+    const auto handle = snow_canvas_runtime::Access::handle(runtime);
+    std::size_t size = 0;
+    require(snow_runtime_serialize_document_session(handle, nullptr, 0, &size) == SNOW_OK,
+            "query legacy snapshot size");
+    QByteArray legacy(qsizetype(size), Qt::Uninitialized);
+    require(snow_runtime_serialize_document_session(
+                handle, reinterpret_cast<std::uint8_t*>(legacy.data()), size, &size) == SNOW_OK &&
+                snapshot == legacy,
+            "single-serialization snapshots preserve every legacy session byte");
+    runtime.destroyAsync();
+    SnowCanvasRuntime restored;
+    require(restored.restoreDocumentSession(snapshot) && restored.canUndo() && restored.canRedo(),
+            "snapshot owns independent bytes after its source runtime is destroyed");
+    require(restored.redo() && !restored.canRedo() && restored.undo() && restored.undo() &&
+                !restored.canUndo() && restored.redo() && restored.redo() && !restored.canRedo(),
+            "restored snapshots retain complete undo and redo transactions");
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--stroke-rendering-only") {
+        strokeRenderingStylesRoundTripAndPatchIndependently();
+        return 0;
+    }
+    strokeRenderingStylesRoundTripAndPatchIndependently();
+    magnifierStylePatchesAndSynchronization();
+    serialNumberStrokePatchesPreserveOtherProperties();
+    filterStyleParticipatesInToolbarStateDiffs();
+    publicCanvasDtosUseExactCompleteEquality();
+    watermarkConfigurationConversionsPreserveSnapshotsAndUtf8Boundaries();
+    configuredFillStylesValidateEveryTool();
+    configuredRuntimeProfileFollowsRestoreAndResetLifecycle();
+    defaultRuntimeUsesGenericEngineDefaults();
+    serializedSnapshotsOwnBytesAndPreserveUndoAndRedo();
+    return 0;
+}

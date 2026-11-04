@@ -1,0 +1,1999 @@
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define SNOW_ARROW_PATH_UTF8_CAPACITY 4096
+#define SNOW_ARROWHEAD_PRIMITIVE_CAPACITY 16
+#define SNOW_ARROWHEAD_PRIMITIVE_POINT_CAPACITY 8
+#define SNOW_FONT_FAMILY_UTF8_CAPACITY 128
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct SnowRuntimeImpl SnowRuntimeImpl;
+typedef SnowRuntimeImpl* SnowRuntime;
+
+typedef struct SnowViewportImpl SnowViewportImpl;
+typedef SnowViewportImpl* SnowViewport;
+typedef struct SnowPatchHandleImpl SnowPatchHandleImpl;
+typedef SnowPatchHandleImpl* SnowPatchHandle;
+typedef struct SnowChangedViewportListImpl SnowChangedViewportListImpl;
+typedef SnowChangedViewportListImpl* SnowChangedViewportList;
+
+typedef struct SnowSerializedBytesImpl SnowSerializedBytesImpl;
+typedef SnowSerializedBytesImpl* SnowSerializedBytes;
+typedef struct SnowRuntimeConfig SnowRuntimeConfig;
+
+typedef enum SnowError {
+    SNOW_OK = 0,
+    SNOW_ERROR_INVALID_ARGUMENT = 1,
+    SNOW_ERROR_NOT_FOUND = 2,
+    SNOW_ERROR_INVALID_STATE = 3,
+    SNOW_ERROR_BUFFER_TOO_SMALL = 4,
+    SNOW_ERROR_STALE_REVISION = 5,
+    SNOW_ERROR_UNSUPPORTED = 6,
+    SNOW_ERROR_INTERNAL = 7
+} SnowError;
+
+SnowError snow_runtime_serialize_document_session(SnowRuntime runtime, uint8_t* buffer,
+                                                  size_t buffer_capacity, size_t* out_size);
+// Serializes once into an independent snapshot owned by the returned handle.
+// Release it with snow_serialized_bytes_destroy after copying/consuming its data.
+SnowError snow_runtime_serialize_document_session_bytes(SnowRuntime runtime,
+                                                        SnowSerializedBytes* out_bytes);
+// A restorable session of committed document/configuration without undo/redo or input drafts.
+// Snapshot serialization depends only on current content, never on accumulated history.
+// Retains the persisted-session limit of 16 MiB for current content.
+SnowError snow_runtime_serialize_document_snapshot_bytes(SnowRuntime runtime,
+                                                         SnowSerializedBytes* out_bytes);
+// Canonical current-document JSON bytes, not a hash or a restorable session.
+// Excludes history, editor defaults, revisions and unused trailing element slots.
+// Both functions return owned handles released with snow_serialized_bytes_destroy.
+SnowError snow_runtime_document_checkpoint_bytes(SnowRuntime runtime,
+                                                 SnowSerializedBytes* out_bytes);
+// The read-only data remains valid until the handle is destroyed, even if the
+// originating runtime changes or is destroyed.
+SnowError snow_serialized_bytes_data(SnowSerializedBytes bytes, const uint8_t** out_data,
+                                     size_t* out_size);
+void snow_serialized_bytes_destroy(SnowSerializedBytes bytes);
+// Current draw-template schema version; versions 1 through this value are supported.
+uint32_t snow_draw_template_schema_version(void);
+SnowError snow_runtime_serialize_selected_draw_template(SnowRuntime runtime, uint8_t* buffer,
+                                                        size_t buffer_capacity, size_t* out_size);
+SnowError snow_runtime_serialize_selected_element_ids(SnowRuntime runtime, uint8_t* buffer,
+                                                      size_t buffer_capacity, size_t* out_size);
+SnowError snow_runtime_create_from_document_session_with_config(const uint8_t* bytes, size_t size,
+                                                                const SnowRuntimeConfig* config,
+                                                                SnowRuntime* out_runtime);
+SnowError snow_runtime_serialize_document_history(SnowRuntime runtime, uint8_t* buffer,
+                                                  size_t buffer_capacity, size_t* out_size);
+SnowError snow_runtime_create_from_document_history_with_config(const uint8_t* bytes, size_t size,
+                                                                const SnowRuntimeConfig* config,
+                                                                SnowRuntime* out_runtime);
+
+typedef enum SnowZoomFocus {
+    SNOW_ZOOM_FOCUS_POINTER = 0,
+    SNOW_ZOOM_FOCUS_CENTER = 1
+} SnowZoomFocus;
+
+typedef struct SnowAutoFilterBounds {
+    double left, top, right, bottom;
+} SnowAutoFilterBounds;
+typedef struct SnowAutoFilterRegion {
+    uint64_t id;
+    SnowAutoFilterBounds bounds;
+    uint8_t category[128];
+} SnowAutoFilterRegion;
+typedef enum SnowActiveTool {
+    SNOW_ACTIVE_TOOL_SELECT = 0,
+    SNOW_ACTIVE_TOOL_SHAPE = 1,
+    SNOW_ACTIVE_TOOL_ARROW = 2,
+    SNOW_ACTIVE_TOOL_TEXT = 3,
+    SNOW_ACTIVE_TOOL_SERIAL_NUMBER = 4,
+    SNOW_ACTIVE_TOOL_LINE = 5,
+    SNOW_ACTIVE_TOOL_FREE_DRAW = 6,
+    SNOW_ACTIVE_TOOL_RECTANGLE_HIGHLIGHT = 7,
+    SNOW_ACTIVE_TOOL_ERASER = 8,
+    SNOW_ACTIVE_TOOL_RECTANGLE_FILTER = 9,
+    SNOW_ACTIVE_TOOL_WATERMARK = 10,
+    SNOW_ACTIVE_TOOL_PEN_HIGHLIGHT = 11,
+    SNOW_ACTIVE_TOOL_PEN_FILTER = 12,
+    SNOW_ACTIVE_TOOL_SPOTLIGHT = 13,
+    SNOW_ACTIVE_TOOL_AUTO_FILTER = 14,
+    SNOW_ACTIVE_TOOL_RECTANGLE_ERASER = 15,
+    SNOW_ACTIVE_TOOL_BRUSH_ERASER = 16,
+    SNOW_ACTIVE_TOOL_DISTANCE = 17,
+    SNOW_ACTIVE_TOOL_ANGLE = 18,
+    SNOW_ACTIVE_TOOL_MAGNIFIER = 19,
+    SNOW_ACTIVE_TOOL_SPEECH_BUBBLE = 20,
+    SNOW_ACTIVE_TOOL_BRACKET = 21
+} SnowActiveTool;
+#define SNOW_ACTIVE_TOOL_FILTER SNOW_ACTIVE_TOOL_RECTANGLE_FILTER
+#define SNOW_ACTIVE_TOOL_HIGHLIGHT SNOW_ACTIVE_TOOL_RECTANGLE_HIGHLIGHT
+
+typedef enum SnowStyleToolbarSource {
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE = 0,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE = 1,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_ARROW = 2,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_ARROW = 3,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_TEXT = 4,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_TEXT = 5,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SERIAL_NUMBER = 6,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SERIAL_NUMBER = 7,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_LINE = 8,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_LINE = 9,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_FREE_DRAW = 10,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_FREE_DRAW = 11,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_HIGHLIGHT = 12,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_HIGHLIGHT = 13,
+    SNOW_STYLE_TOOLBAR_SOURCE_ERASER = 14,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_FILTER = 15,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_FILTER = 16,
+    SNOW_STYLE_TOOLBAR_SOURCE_WATERMARK = 17,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_PEN_HIGHLIGHT = 18,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_PEN_HIGHLIGHT = 19,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_PEN_FILTER = 20,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_PEN_FILTER = 21,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SPOTLIGHT = 22,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SPOTLIGHT = 23,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_ERASER = 24,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_BRUSH_ERASER = 25,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_DISTANCE = 26,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_DISTANCE = 27,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_ANGLE = 28,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_ANGLE = 29,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_MAGNIFIER = 30,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_MAGNIFIER = 31,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SPEECH_BUBBLE = 32,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SPEECH_BUBBLE = 33,
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_BRACKET = 34,
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_BRACKET = 35
+} SnowStyleToolbarSource;
+#define SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_FILTER SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_FILTER
+#define SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_FILTER                                                  \
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_FILTER
+#define SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_HIGHLIGHT                                                \
+    SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_HIGHLIGHT
+#define SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_HIGHLIGHT                                               \
+    SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_HIGHLIGHT
+
+typedef enum SnowFilterType {
+    SNOW_FILTER_TYPE_MOSAIC = 0,
+    SNOW_FILTER_TYPE_GAUSSIAN_BLUR = 1,
+    SNOW_FILTER_TYPE_GRAYSCALE = 2,
+    SNOW_FILTER_TYPE_INVERSION = 3,
+    SNOW_FILTER_TYPE_EMBOSS = 4,
+    SNOW_FILTER_TYPE_SMART_ERASE = 5,
+    SNOW_FILTER_TYPE_BRIGHTNESS = 6,
+    SNOW_FILTER_TYPE_RESTORE_BACKGROUND = 7
+} SnowFilterType;
+
+typedef struct SnowBrushEraserStyle {
+    double stroke_width;
+} SnowBrushEraserStyle;
+
+#define SNOW_BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH (1u << 0)
+
+typedef struct SnowFilterStyle {
+    SnowFilterType filter_type;
+    double strength;
+    double opacity;
+    double stroke_width;
+} SnowFilterStyle;
+
+#define SNOW_TEXT_STYLE_MIXED_COLOR (1u << 0)
+#define SNOW_TEXT_STYLE_MIXED_FONT_SIZE (1u << 1)
+#define SNOW_TEXT_STYLE_MIXED_FONT_FAMILY (1u << 2)
+#define SNOW_TEXT_STYLE_MIXED_FILL (1u << 3)
+#define SNOW_TEXT_STYLE_MIXED_FILL_STYLE (1u << 4)
+#define SNOW_TEXT_STYLE_MIXED_STROKE (1u << 5)
+#define SNOW_TEXT_STYLE_MIXED_STROKE_WIDTH (1u << 6)
+#define SNOW_TEXT_STYLE_MIXED_CORNER_RADII (1u << 7)
+#define SNOW_TEXT_STYLE_MIXED_HORIZONTAL_ALIGN (1u << 8)
+#define SNOW_TEXT_STYLE_MIXED_VERTICAL_ALIGN (1u << 9)
+#define SNOW_TEXT_STYLE_MIXED_OPACITY (1u << 10)
+#define SNOW_TEXT_STYLE_MIXED_BOLD (1u << 11)
+#define SNOW_TEXT_STYLE_MIXED_ITALIC (1u << 12)
+#define SNOW_TEXT_STYLE_ALL_PROPERTIES ((1u << 13) - 1u)
+
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_NUMBER (1u << 0)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_COLOR (1u << 1)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_FILL (1u << 2)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE (1u << 3)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE (1u << 4)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY (1u << 5)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH (1u << 6)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE (1u << 7)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_OPACITY (1u << 8)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_TYPE (1u << 9)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE (1u << 10)
+#define SNOW_SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE (1u << 11)
+
+typedef enum SnowSerialNumberNumericType {
+    SNOW_SERIAL_NUMBER_NUMERIC_TYPE_ARABIC = 0,
+    SNOW_SERIAL_NUMBER_NUMERIC_TYPE_ROMAN = 1,
+    SNOW_SERIAL_NUMBER_NUMERIC_TYPE_LOWERCASE_LETTERS = 2,
+    SNOW_SERIAL_NUMBER_NUMERIC_TYPE_UPPERCASE_LETTERS = 3,
+    SNOW_SERIAL_NUMBER_NUMERIC_TYPE_CHINESE = 4
+} SnowSerialNumberNumericType;
+
+typedef enum SnowSerialNumberType {
+    SNOW_SERIAL_NUMBER_TYPE_OUTLINED_CIRCLE = 0,
+    SNOW_SERIAL_NUMBER_TYPE_SOLID_CIRCLE = 1,
+    SNOW_SERIAL_NUMBER_TYPE_OUTLINED_SQUARE = 2,
+    SNOW_SERIAL_NUMBER_TYPE_SOLID_SQUARE = 3,
+    SNOW_SERIAL_NUMBER_TYPE_CIRCLE = 4
+} SnowSerialNumberType;
+
+#ifdef __cplusplus
+static_assert(sizeof(SnowSerialNumberType) == sizeof(uint32_t),
+              "SnowSerialNumberType must remain a four-byte C ABI enum");
+#endif
+
+typedef enum SnowPointerEventType {
+    SNOW_POINTER_EVENT_DOWN = 0,
+    SNOW_POINTER_EVENT_MOVE = 1,
+    SNOW_POINTER_EVENT_UP = 2,
+    SNOW_POINTER_EVENT_CANCEL = 3,
+    SNOW_POINTER_EVENT_ENTER = 4,
+    SNOW_POINTER_EVENT_LEAVE = 5,
+    SNOW_POINTER_EVENT_DOUBLE_CLICK = 6
+} SnowPointerEventType;
+
+typedef enum SnowPointerDevice {
+    SNOW_POINTER_DEVICE_MOUSE = 0,
+    SNOW_POINTER_DEVICE_TOUCH = 1,
+    SNOW_POINTER_DEVICE_PEN = 2,
+    SNOW_POINTER_DEVICE_UNKNOWN = 3
+} SnowPointerDevice;
+
+typedef enum SnowPointerButton {
+    SNOW_POINTER_BUTTON_NONE = 0,
+    SNOW_POINTER_BUTTON_PRIMARY = 1,
+    SNOW_POINTER_BUTTON_SECONDARY = 2,
+    SNOW_POINTER_BUTTON_MIDDLE = 3
+} SnowPointerButton;
+
+typedef enum SnowInputEventKind {
+    SNOW_INPUT_EVENT_POINTER = 0,
+    SNOW_INPUT_EVENT_WHEEL = 1,
+    SNOW_INPUT_EVENT_KEY = 2,
+    SNOW_INPUT_EVENT_FOCUS_LOST = 3
+} SnowInputEventKind;
+
+typedef enum SnowWheelDeltaKind {
+    SNOW_WHEEL_DELTA_PIXEL = 0,
+    SNOW_WHEEL_DELTA_ANGLE = 1
+} SnowWheelDeltaKind;
+
+typedef enum SnowKeyEventType { SNOW_KEY_EVENT_DOWN = 0, SNOW_KEY_EVENT_UP = 1 } SnowKeyEventType;
+
+typedef enum SnowKeyCode {
+    SNOW_KEY_CODE_UNKNOWN = 0,
+    SNOW_KEY_CODE_SPACE = 1,
+    SNOW_KEY_CODE_ESCAPE = 2,
+    SNOW_KEY_CODE_ARROW_UP = 3,
+    SNOW_KEY_CODE_ARROW_DOWN = 4,
+    SNOW_KEY_CODE_ARROW_LEFT = 5,
+    SNOW_KEY_CODE_ARROW_RIGHT = 6,
+    SNOW_KEY_CODE_CHARACTER = 7,
+    SNOW_KEY_CODE_BACKSPACE = 8,
+    SNOW_KEY_CODE_DELETE = 9
+} SnowKeyCode;
+
+typedef enum SnowPointerCaptureCommandKind {
+    SNOW_POINTER_CAPTURE_NO_CHANGE = 0,
+    SNOW_POINTER_CAPTURE_CAPTURE = 1,
+    SNOW_POINTER_CAPTURE_RELEASE = 2
+} SnowPointerCaptureCommandKind;
+
+typedef enum SnowCursorCommandKind {
+    SNOW_CURSOR_NO_CHANGE = 0,
+    SNOW_CURSOR_SET = 1
+} SnowCursorCommandKind;
+
+typedef enum SnowCursorStyle {
+    SNOW_CURSOR_STYLE_DEFAULT = 0,
+    SNOW_CURSOR_STYLE_CROSSHAIR = 1,
+    SNOW_CURSOR_STYLE_GRAB = 2,
+    SNOW_CURSOR_STYLE_GRABBING = 3,
+    SNOW_CURSOR_STYLE_MOVE = 4,
+    SNOW_CURSOR_STYLE_RESIZE_HORIZONTAL = 5,
+    SNOW_CURSOR_STYLE_RESIZE_VERTICAL = 6,
+    SNOW_CURSOR_STYLE_RESIZE_NWSE = 7,
+    SNOW_CURSOR_STYLE_RESIZE_NESW = 8,
+    SNOW_CURSOR_STYLE_NOT_ALLOWED = 9,
+    SNOW_CURSOR_STYLE_TEXT = 10,
+    SNOW_CURSOR_STYLE_CORNER_RADIUS = 11,
+    SNOW_CURSOR_STYLE_HIDDEN = 12,
+    SNOW_CURSOR_STYLE_STROKE = 13,
+    SNOW_CURSOR_STYLE_ERASER = 14
+} SnowCursorStyle;
+
+typedef enum SnowSceneDisplayItemKind {
+    SNOW_SCENE_DISPLAY_ITEM_UNKNOWN = 0,
+    SNOW_SCENE_DISPLAY_ITEM_DRAW_RECT = 1,
+    SNOW_SCENE_DISPLAY_ITEM_STROKE = 2,
+    SNOW_SCENE_DISPLAY_ITEM_TEXT = 3,
+    SNOW_SCENE_DISPLAY_ITEM_IMAGE = 4,
+    SNOW_SCENE_DISPLAY_ITEM_ARROW = 5,
+    SNOW_SCENE_DISPLAY_ITEM_SERIAL_NUMBER = 6,
+    SNOW_SCENE_DISPLAY_ITEM_SERIAL_NUMBER_CONNECTOR = 7,
+    SNOW_SCENE_DISPLAY_ITEM_FILTER = 8,
+    SNOW_SCENE_DISPLAY_ITEM_MAGNIFIER = 9,
+    SNOW_SCENE_DISPLAY_ITEM_SPEECH_BUBBLE = 10
+} SnowSceneDisplayItemKind;
+
+typedef enum SnowBlendMode {
+    SNOW_BLEND_MODE_NORMAL = 0,
+    SNOW_BLEND_MODE_MULTIPLY = 1
+} SnowBlendMode;
+
+typedef enum SnowOverlayDisplayItemKind {
+    SNOW_OVERLAY_DISPLAY_ITEM_DRAW_RECT = 1,
+    SNOW_OVERLAY_DISPLAY_ITEM_SNAP_GUIDE = 2,
+    SNOW_OVERLAY_DISPLAY_ITEM_FOCUS_CONNECTION = 3,
+    SNOW_OVERLAY_DISPLAY_ITEM_PEN_FILTER_CONTOUR = 4
+} SnowOverlayDisplayItemKind;
+
+typedef enum SnowArrowhead {
+    SNOW_ARROWHEAD_NONE = 0,
+    SNOW_ARROWHEAD_ARROW = 1,
+    SNOW_ARROWHEAD_BAR = 2,
+    SNOW_ARROWHEAD_DOT = 3,
+    SNOW_ARROWHEAD_CIRCLE = 4,
+    SNOW_ARROWHEAD_CIRCLE_OUTLINE = 5,
+    SNOW_ARROWHEAD_TRIANGLE = 6,
+    SNOW_ARROWHEAD_TRIANGLE_OUTLINE = 7,
+    SNOW_ARROWHEAD_DIAMOND = 8,
+    SNOW_ARROWHEAD_DIAMOND_OUTLINE = 9,
+    SNOW_ARROWHEAD_CROWFOOT_ONE = 10,
+    SNOW_ARROWHEAD_CROWFOOT_MANY = 11,
+    SNOW_ARROWHEAD_CROWFOOT_ONE_OR_MANY = 12,
+    SNOW_ARROWHEAD_SQUARE = 13,
+    SNOW_ARROWHEAD_INVERTED_TRIANGLE = 14,
+    SNOW_ARROWHEAD_INDENTED_TRIANGLE = 15
+} SnowArrowhead;
+
+typedef enum SnowArrowShaftType {
+    SNOW_ARROW_SHAFT_TYPE_PLAIN = 0,
+    SNOW_ARROW_SHAFT_TYPE_TAPERED = 1,
+} SnowArrowShaftType;
+
+typedef enum SnowArrowType {
+    SNOW_ARROW_TYPE_STRAIGHT = 0,
+    SNOW_ARROW_TYPE_CURVE = 1,
+    SNOW_ARROW_TYPE_ELBOW = 2
+} SnowArrowType;
+
+typedef enum SnowArrowheadPrimitiveKind {
+    SNOW_ARROWHEAD_PRIMITIVE_NONE = 0,
+    SNOW_ARROWHEAD_PRIMITIVE_LINE = 1,
+    SNOW_ARROWHEAD_PRIMITIVE_POLYGON = 2,
+    SNOW_ARROWHEAD_PRIMITIVE_CIRCLE = 3
+} SnowArrowheadPrimitiveKind;
+
+typedef enum SnowArrowheadFillMode {
+    SNOW_ARROWHEAD_FILL_STROKE = 0,
+    SNOW_ARROWHEAD_FILL_BACKGROUND = 1
+} SnowArrowheadFillMode;
+
+typedef enum SnowArrowheadDashMode {
+    SNOW_ARROWHEAD_DASH_INHERIT = 0,
+    SNOW_ARROWHEAD_DASH_SOLID = 1,
+    SNOW_ARROWHEAD_DASH_DOTTED_CAP = 2
+} SnowArrowheadDashMode;
+
+typedef enum SnowArrowPathCommandKind {
+    SNOW_ARROW_PATH_COMMAND_NONE = 0,
+    SNOW_ARROW_PATH_COMMAND_MOVE_TO = 1,
+    SNOW_ARROW_PATH_COMMAND_LINE_TO = 2,
+    SNOW_ARROW_PATH_COMMAND_QUAD_TO = 3,
+    SNOW_ARROW_PATH_COMMAND_CUBIC_TO = 4
+} SnowArrowPathCommandKind;
+
+typedef enum SnowTextHorizontalAlign {
+    SNOW_TEXT_HORIZONTAL_ALIGN_LEFT = 0,
+    SNOW_TEXT_HORIZONTAL_ALIGN_CENTER = 1,
+    SNOW_TEXT_HORIZONTAL_ALIGN_RIGHT = 2
+} SnowTextHorizontalAlign;
+
+typedef enum SnowTextVerticalAlign {
+    SNOW_TEXT_VERTICAL_ALIGN_TOP = 0,
+    SNOW_TEXT_VERTICAL_ALIGN_CENTER = 1,
+    SNOW_TEXT_VERTICAL_ALIGN_BOTTOM = 2
+} SnowTextVerticalAlign;
+
+typedef enum SnowFillStyle {
+    SNOW_FILL_STYLE_LINE = 0,
+    SNOW_FILL_STYLE_CROSS_LINE = 1,
+    SNOW_FILL_STYLE_SOLID = 2,
+    SNOW_FILL_STYLE_BORDER = 3
+} SnowFillStyle;
+
+typedef enum SnowStrokeStyle {
+    SNOW_STROKE_STYLE_SOLID = 0,
+    SNOW_STROKE_STYLE_DASHED = 1,
+    SNOW_STROKE_STYLE_DOTTED = 2
+} SnowStrokeStyle;
+
+typedef enum SnowStrokeRenderingStyle {
+    SNOW_STROKE_RENDERING_STYLE_ARCHITECT = 0,
+    SNOW_STROKE_RENDERING_STYLE_ARTIST = 1,
+    SNOW_STROKE_RENDERING_STYLE_CARTOONIST = 2
+} SnowStrokeRenderingStyle;
+
+// Maximum canvas-space displacement; shared by paint bounds and the host renderer.
+double snow_stroke_rendering_outset(SnowStrokeRenderingStyle style, double primitive_scale);
+
+typedef enum SnowDisplayRectShape {
+    SNOW_DISPLAY_RECT_SHAPE_RECTANGLE = 0,
+    SNOW_DISPLAY_RECT_SHAPE_ELLIPSE = 1,
+    SNOW_DISPLAY_RECT_SHAPE_DIAMOND = 2
+} SnowDisplayRectShape;
+
+typedef enum SnowOverlayRectKind {
+    SNOW_OVERLAY_RECT_UNSPECIFIED = 0,
+    SNOW_OVERLAY_RECT_SELECTION_MARQUEE = 1,
+    SNOW_OVERLAY_RECT_SELECTION_CANDIDATE_FRAME = 2,
+    SNOW_OVERLAY_RECT_SELECTION_FRAME = 3,
+    SNOW_OVERLAY_RECT_SELECTION_MULTI_FRAME = 4,
+    SNOW_OVERLAY_RECT_SELECTION_RESIZE_HANDLE = 5,
+    SNOW_OVERLAY_RECT_SELECTION_ROTATION_HANDLE = 6,
+    SNOW_OVERLAY_RECT_SELECTION_CORNER_RADIUS_HANDLE = 7,
+    SNOW_OVERLAY_RECT_ARROW_ENDPOINT_HANDLE = 8,
+    SNOW_OVERLAY_RECT_ARROW_FOCUS_HANDLE = 9,
+    SNOW_OVERLAY_RECT_ARROW_SEGMENT_HANDLE = 10,
+    SNOW_OVERLAY_RECT_TEXT_ACTUAL_FRAME = 11,
+    SNOW_OVERLAY_RECT_TEXT_HOVER_UNDERLINE = 12,
+    SNOW_OVERLAY_RECT_ERASER_CURSOR = 13,
+    SNOW_OVERLAY_RECT_BINDING_HIGHLIGHT = 14,
+    SNOW_OVERLAY_RECT_MAGNIFIER_MOVE_HANDLE = 15,
+    SNOW_OVERLAY_RECT_MAGNIFIER_SELECTION_FRAME = 16,
+    SNOW_OVERLAY_RECT_SPEECH_BUBBLE_ADD_TAIL_HANDLE = 17,
+    SNOW_OVERLAY_RECT_SPEECH_BUBBLE_TAIL_BASE_HANDLE = 18,
+    SNOW_OVERLAY_RECT_SPEECH_BUBBLE_TAIL_TIP_HANDLE = 19,
+    SNOW_OVERLAY_RECT_SHAPE_TEXT_HANDLE = 20
+} SnowOverlayRectKind;
+
+typedef enum SnowSnapGuideKind {
+    SNOW_SNAP_GUIDE_POINT = 0,
+    SNOW_SNAP_GUIDE_GAP = 1
+} SnowSnapGuideKind;
+
+typedef enum SnowSnapGuideAxis {
+    SNOW_SNAP_GUIDE_HORIZONTAL = 0,
+    SNOW_SNAP_GUIDE_VERTICAL = 1
+} SnowSnapGuideAxis;
+
+typedef struct SnowColorRgba8 {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t a;
+} SnowColorRgba8;
+
+typedef struct SnowCornerRadii {
+    double top_left;
+    double top_right;
+    double bottom_right;
+    double bottom_left;
+} SnowCornerRadii;
+
+typedef struct SnowWatermarkTemplateApplicationTime {
+    int32_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+    uint8_t reserved0[3];
+} SnowWatermarkTemplateApplicationTime;
+
+typedef struct SnowWatermarkConfig {
+    SnowColorRgba8 color;
+    uint32_t text_utf8_len;
+    char text_utf8[256];
+    double font_size;
+    uint32_t font_family_utf8_len;
+    char font_family_utf8[128];
+    double angle;
+    double gap;
+    double opacity;
+    uint32_t template_value_utf8_len;
+    char template_value_utf8[1024];
+    uint8_t has_template_application_time;
+    uint8_t reserved0[3];
+    SnowWatermarkTemplateApplicationTime template_application_time;
+} SnowWatermarkConfig;
+
+typedef struct SnowSpotlightConfig {
+    SnowColorRgba8 color;
+    double opacity;
+} SnowSpotlightConfig;
+
+typedef enum SnowHighlightShape {
+    SNOW_HIGHLIGHT_SHAPE_RECTANGLE = 0,
+    SNOW_HIGHLIGHT_SHAPE_ELLIPSE = 1
+} SnowHighlightShape;
+
+typedef enum SnowRectangleShape {
+    SNOW_RECTANGLE_SHAPE_RECTANGLE = 0,
+    SNOW_RECTANGLE_SHAPE_ELLIPSE = 1,
+    SNOW_RECTANGLE_SHAPE_DIAMOND = 2,
+    SNOW_RECTANGLE_SHAPE_THOUGHT_BUBBLE = 3
+} SnowRectangleShape;
+
+typedef enum SnowBrushMode {
+    SNOW_BRUSH_MODE_REGULAR = 0,
+    SNOW_BRUSH_MODE_PRESSURE_SENSITIVE = 1
+} SnowBrushMode;
+
+typedef struct SnowShapeStyle {
+    SnowColorRgba8 fill;
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowCornerRadii corner_radii;
+    SnowArrowhead start_arrowhead;
+    SnowArrowhead end_arrowhead;
+    SnowStrokeStyle stroke_style;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+    SnowArrowType arrow_type;
+    SnowArrowShaftType arrow_shaft_type;
+    double arrow_ratio;
+    SnowFillStyle fill_style;
+    double opacity;
+    SnowHighlightShape highlight_shape;
+    SnowRectangleShape shape;
+    SnowBrushMode brush_mode;
+    SnowColorRgba8 arrow_outline_color;
+    double arrow_outline_width;
+} SnowShapeStyle;
+
+typedef enum SnowShapeKind {
+    SNOW_SHAPE_KIND_RECTANGLE = 0,
+    SNOW_SHAPE_KIND_ARROW = 1,
+    SNOW_SHAPE_KIND_LINE = 2,
+    SNOW_SHAPE_KIND_FREE_DRAW = 3,
+    SNOW_SHAPE_KIND_RECTANGLE_HIGHLIGHT = 4,
+    SNOW_SHAPE_KIND_PEN_HIGHLIGHT = 5,
+    SNOW_SHAPE_KIND_SPOTLIGHT = 6,
+    SNOW_SHAPE_KIND_SPEECH_BUBBLE = 7
+} SnowShapeKind;
+#define SNOW_SHAPE_KIND_HIGHLIGHT SNOW_SHAPE_KIND_RECTANGLE_HIGHLIGHT
+
+#define SNOW_SHAPE_STYLE_PROPERTY_FILL (1u << 0)
+#define SNOW_SHAPE_STYLE_PROPERTY_FILL_STYLE (1u << 1)
+#define SNOW_SHAPE_STYLE_PROPERTY_STROKE (1u << 2)
+#define SNOW_SHAPE_STYLE_PROPERTY_STROKE_WIDTH (1u << 3)
+#define SNOW_SHAPE_STYLE_PROPERTY_CORNER_RADII (1u << 4)
+#define SNOW_SHAPE_STYLE_PROPERTY_START_ARROWHEAD (1u << 5)
+#define SNOW_SHAPE_STYLE_PROPERTY_END_ARROWHEAD (1u << 6)
+#define SNOW_SHAPE_STYLE_PROPERTY_STROKE_STYLE (1u << 7)
+#define SNOW_SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR (1u << 16)
+#define SNOW_SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH (1u << 17)
+#define SNOW_SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR SNOW_SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR
+#define SNOW_SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH SNOW_SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH
+#define SNOW_SHAPE_STYLE_PROPERTY_ARROW_RATIO (1u << 13)
+#define SNOW_SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE (1u << 12)
+#define SNOW_SHAPE_STYLE_PROPERTY_ARROW_TYPE (1u << 8)
+#define SNOW_SHAPE_STYLE_PROPERTY_OPACITY (1u << 9)
+#define SNOW_SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE (1u << 10)
+#define SNOW_SHAPE_STYLE_PROPERTY_SHAPE (1u << 11)
+#define SNOW_SHAPE_STYLE_PROPERTY_BRUSH_MODE (1u << 14)
+#define SNOW_SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE (1u << 15)
+#define SNOW_SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE                                              \
+    SNOW_SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE
+#define SNOW_SHAPE_STYLE_PROPERTY_LINE                                                             \
+    (SNOW_SHAPE_STYLE_PROPERTY_FILL | SNOW_SHAPE_STYLE_PROPERTY_FILL_STYLE |                       \
+     SNOW_SHAPE_STYLE_PROPERTY_STROKE | SNOW_SHAPE_STYLE_PROPERTY_STROKE_WIDTH |                   \
+     SNOW_SHAPE_STYLE_PROPERTY_ARROW_RATIO | SNOW_SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE |          \
+     SNOW_SHAPE_STYLE_PROPERTY_STROKE_STYLE | SNOW_SHAPE_STYLE_PROPERTY_ARROW_TYPE |               \
+     SNOW_SHAPE_STYLE_PROPERTY_OPACITY | SNOW_SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE)
+#define SNOW_SHAPE_STYLE_PROPERTY_FREE_DRAW                                                        \
+    (SNOW_SHAPE_STYLE_PROPERTY_FILL | SNOW_SHAPE_STYLE_PROPERTY_FILL_STYLE |                       \
+     SNOW_SHAPE_STYLE_PROPERTY_STROKE | SNOW_SHAPE_STYLE_PROPERTY_STROKE_WIDTH |                   \
+     SNOW_SHAPE_STYLE_PROPERTY_STROKE_STYLE | SNOW_SHAPE_STYLE_PROPERTY_OPACITY |                  \
+     SNOW_SHAPE_STYLE_PROPERTY_BRUSH_MODE)
+
+typedef struct SnowRectangleShapeStyle {
+    SnowColorRgba8 fill;
+    SnowFillStyle fill_style;
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowStrokeStyle stroke_style;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+    SnowCornerRadii corner_radii;
+} SnowRectangleShapeStyle;
+
+typedef struct SnowArrowStyle {
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowArrowhead start_arrowhead;
+    SnowArrowhead end_arrowhead;
+    SnowStrokeStyle stroke_style;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+    SnowArrowType arrow_type;
+    SnowArrowShaftType arrow_shaft_type;
+    double arrow_ratio;
+    uint8_t reserved0[4];
+    SnowColorRgba8 arrow_outline_color;
+    double arrow_outline_width;
+} SnowArrowStyle;
+
+typedef struct SnowTextStyle {
+    SnowColorRgba8 color;
+    double font_size;
+    SnowColorRgba8 fill;
+    SnowFillStyle fill_style;
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowCornerRadii corner_radii;
+    SnowTextHorizontalAlign horizontal_align;
+    SnowTextVerticalAlign vertical_align;
+    double opacity;
+    uint8_t reserved0[4];
+    uint32_t font_family_utf8_len;
+    uint8_t font_family_truncated;
+    uint8_t bold;
+    uint8_t italic;
+    uint8_t reserved1[1];
+    char font_family_utf8[SNOW_FONT_FAMILY_UTF8_CAPACITY];
+} SnowTextStyle;
+
+typedef struct SnowSerialNumberStyle {
+    int64_t number;
+    SnowColorRgba8 color;
+    SnowColorRgba8 fill;
+    SnowFillStyle fill_style;
+    double font_size;
+    double stroke_width;
+    SnowStrokeStyle stroke_style;
+    double opacity;
+    SnowSerialNumberType serial_number_type;
+    uint32_t font_family_utf8_len;
+    uint8_t font_family_truncated;
+    uint8_t reserved1[3];
+    char font_family_utf8[SNOW_FONT_FAMILY_UTF8_CAPACITY];
+    SnowSerialNumberNumericType numeric_type;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+} SnowSerialNumberStyle;
+
+typedef enum SnowDistanceUnit {
+    SNOW_DISTANCE_UNIT_PX = 0,
+    SNOW_DISTANCE_UNIT_CM = 1,
+    SNOW_DISTANCE_UNIT_M = 2,
+    SNOW_DISTANCE_UNIT_KM = 3,
+    SNOW_DISTANCE_UNIT_MM = 4,
+    SNOW_DISTANCE_UNIT_PT = 5,
+    SNOW_DISTANCE_UNIT_IN = 6,
+    SNOW_DISTANCE_UNIT_FT = 7,
+    SNOW_DISTANCE_UNIT_UM = 8
+} SnowDistanceUnit;
+
+typedef struct SnowDistanceStyle {
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    double factor;
+    SnowDistanceUnit unit;
+    uint32_t decimal_places;
+    double endpoint_scale;
+    SnowArrowhead endpoint_style;
+} SnowDistanceStyle;
+
+#define SNOW_DISTANCE_STYLE_PROPERTY_STROKE (1u << 0)
+#define SNOW_DISTANCE_STYLE_PROPERTY_STROKE_WIDTH (1u << 1)
+#define SNOW_DISTANCE_STYLE_PROPERTY_FACTOR (1u << 2)
+#define SNOW_DISTANCE_STYLE_PROPERTY_UNIT (1u << 3)
+#define SNOW_DISTANCE_STYLE_PROPERTY_DECIMAL_PLACES (1u << 4)
+#define SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_SCALE (1u << 5)
+#define SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_STYLE (1u << 6)
+#define SNOW_DISTANCE_STYLE_PROPERTY_ALL ((1u << 7) - 1u)
+#define SNOW_DISTANCE_STYLE_MIXED_STROKE SNOW_DISTANCE_STYLE_PROPERTY_STROKE
+#define SNOW_DISTANCE_STYLE_MIXED_STROKE_WIDTH SNOW_DISTANCE_STYLE_PROPERTY_STROKE_WIDTH
+#define SNOW_DISTANCE_STYLE_MIXED_FACTOR SNOW_DISTANCE_STYLE_PROPERTY_FACTOR
+#define SNOW_DISTANCE_STYLE_MIXED_UNIT SNOW_DISTANCE_STYLE_PROPERTY_UNIT
+#define SNOW_DISTANCE_STYLE_MIXED_DECIMAL_PLACES SNOW_DISTANCE_STYLE_PROPERTY_DECIMAL_PLACES
+#define SNOW_DISTANCE_STYLE_MIXED_ENDPOINT_SCALE SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_SCALE
+#define SNOW_DISTANCE_STYLE_MIXED_ENDPOINT_STYLE SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_STYLE
+
+typedef enum SnowAngleUnit {
+    SNOW_ANGLE_UNIT_DEGREES = 0,
+    SNOW_ANGLE_UNIT_RADIANS = 1
+} SnowAngleUnit;
+
+typedef enum SnowAngleType {
+    SNOW_ANGLE_TYPE_DIRECTED = 0,
+    SNOW_ANGLE_TYPE_INTERIOR = 1,
+} SnowAngleType;
+
+typedef struct SnowBracketStyle {
+    SnowColorRgba8 stroke;
+    double stroke_width;
+} SnowBracketStyle;
+#define SNOW_BRACKET_STYLE_PROPERTY_STROKE (1u << 0)
+#define SNOW_BRACKET_STYLE_PROPERTY_STROKE_WIDTH (1u << 1)
+#define SNOW_BRACKET_STYLE_PROPERTY_ALL 3u
+
+typedef struct SnowAngleStyle {
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowAngleUnit unit;
+    uint32_t decimal_places;
+    SnowAngleType angle_type;
+} SnowAngleStyle;
+
+#define SNOW_ANGLE_STYLE_PROPERTY_STROKE (1u << 0)
+#define SNOW_ANGLE_STYLE_PROPERTY_STROKE_WIDTH (1u << 1)
+#define SNOW_ANGLE_STYLE_PROPERTY_UNIT (1u << 2)
+#define SNOW_ANGLE_STYLE_PROPERTY_DECIMAL_PLACES (1u << 3)
+#define SNOW_ANGLE_STYLE_PROPERTY_TYPE (1u << 4)
+#define SNOW_ANGLE_STYLE_MIXED_TYPE SNOW_ANGLE_STYLE_PROPERTY_TYPE
+#define SNOW_ANGLE_STYLE_PROPERTY_ALL ((1u << 5) - 1u)
+#define SNOW_ANGLE_STYLE_MIXED_STROKE SNOW_ANGLE_STYLE_PROPERTY_STROKE
+#define SNOW_ANGLE_STYLE_MIXED_STROKE_WIDTH SNOW_ANGLE_STYLE_PROPERTY_STROKE_WIDTH
+#define SNOW_ANGLE_STYLE_MIXED_UNIT SNOW_ANGLE_STYLE_PROPERTY_UNIT
+#define SNOW_ANGLE_STYLE_MIXED_DECIMAL_PLACES SNOW_ANGLE_STYLE_PROPERTY_DECIMAL_PLACES
+
+typedef enum SnowMagnifierConnectionType {
+    SNOW_MAGNIFIER_CONNECTION_NONE = 0,
+    SNOW_MAGNIFIER_CONNECTION_LEADER_LINE = 1,
+    SNOW_MAGNIFIER_CONNECTION_GRADIENT = 2
+} SnowMagnifierConnectionType;
+
+typedef struct SnowMagnifierStyle {
+    SnowRectangleShape shape;
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    double factor;
+    SnowMagnifierConnectionType connection_type;
+    uint8_t source_outline;
+    uint8_t reserved[3];
+    SnowArrowhead leader_arrowhead;
+    SnowCornerRadii corner_radii;
+    double arrow_ratio;
+} SnowMagnifierStyle;
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_SHAPE (1u << 0)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_STROKE (1u << 1)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_STROKE_WIDTH (1u << 2)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_FACTOR (1u << 3)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_CONNECTION_TYPE (1u << 4)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_LEADER_ARROWHEAD (1u << 5)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_CORNER_RADII (1u << 6)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_ARROW_RATIO (1u << 7)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_SOURCE_OUTLINE (1u << 8)
+#define SNOW_MAGNIFIER_STYLE_PROPERTY_ALL ((1u << 9) - 1u)
+
+typedef struct SnowStyleToolbarState {
+    SnowStyleToolbarSource source;
+    uint32_t selected_element_count;
+    SnowShapeStyle shape_style;
+    SnowTextStyle text_style;
+    SnowSerialNumberStyle serial_number_style;
+    uint32_t text_style_mixed;
+    uint32_t serial_number_style_mixed;
+    uint32_t shape_style_mixed;
+    SnowFilterStyle filter_style;
+    uint32_t filter_style_mixed;
+    SnowBrushEraserStyle brush_eraser_style;
+    SnowDistanceStyle distance_style;
+    uint32_t distance_style_mixed;
+    SnowAngleStyle angle_style;
+    SnowBracketStyle bracket_style;
+    uint32_t angle_style_mixed;
+    uint32_t bracket_style_mixed;
+    /* Calibrated length before applying the factor; zero without a single valid distance. */
+    double distance_measured_length;
+    SnowMagnifierStyle magnifier_style;
+    uint32_t magnifier_style_mixed;
+} SnowStyleToolbarState;
+
+typedef struct SnowStyleDefaults {
+    SnowShapeStyle rectangle;
+    SnowShapeStyle arrow;
+    SnowShapeStyle line;
+    SnowShapeStyle free_draw;
+    SnowShapeStyle rectangle_highlight;
+    SnowShapeStyle pen_highlight;
+    SnowFilterStyle rectangle_filter;
+    SnowFilterStyle pen_filter;
+    SnowTextStyle text;
+    SnowSerialNumberStyle serial_number;
+    SnowWatermarkConfig watermark;
+    SnowSpotlightConfig spotlight;
+    SnowBrushEraserStyle brush_eraser;
+    SnowRectangleShape spotlight_shape;
+    SnowDistanceStyle distance;
+    SnowAngleStyle angle;
+    SnowBracketStyle bracket;
+    SnowCornerRadii spotlight_corner_radii;
+    SnowMagnifierStyle magnifier;
+    SnowShapeStyle speech_bubble;
+} SnowStyleDefaults;
+
+struct SnowRuntimeConfig {
+    const SnowStyleDefaults* style_defaults;
+};
+
+typedef struct SnowSerialNumberToolbarState {
+    uint8_t visible;
+    uint8_t can_decrease;
+    uint8_t can_increase;
+    uint8_t can_create_text;
+    uint8_t reserved0[4];
+    double left;
+    double top;
+    double width;
+    double height;
+} SnowSerialNumberToolbarState;
+
+typedef struct SnowHistoryState {
+    uint8_t can_undo;
+    uint8_t can_redo;
+    uint8_t reserved0[6];
+} SnowHistoryState;
+
+typedef struct SnowModifiers {
+    uint8_t ctrl;
+    uint8_t shift;
+    uint8_t alt;
+    uint8_t meta;
+} SnowModifiers;
+
+typedef struct SnowSnapConfig {
+    uint8_t enabled;
+    uint8_t enable_point_snaps;
+    uint8_t enable_gap_snaps;
+    uint8_t show_guides;
+    uint8_t show_gap_size;
+    uint8_t reserved0[3];
+    double distance;
+    SnowColorRgba8 line_color;
+    double line_width;
+    double marker_size;
+    double gap_dash_length;
+    double gap_dash_gap;
+} SnowSnapConfig;
+
+typedef struct SnowGridConfig {
+    uint8_t enabled;
+    uint8_t reserved0[7];
+    double size;
+} SnowGridConfig;
+
+typedef struct SnowEngineConfig {
+    double min_zoom;
+    double max_zoom;
+    SnowZoomFocus zoom_focus;
+    double wheel_zoom_sensitivity;
+    SnowColorRgba8 clear_color;
+    SnowSnapConfig snap;
+    SnowGridConfig grid;
+    uint8_t enable_pointer_capture;
+    uint8_t reserved[7];
+} SnowEngineConfig;
+
+#define SNOW_TEXT_UTF8_CAPACITY 1024
+
+typedef struct SnowElementId {
+    uint32_t index;
+    uint32_t generation;
+} SnowElementId;
+
+typedef struct SnowTextLayoutSize {
+    /* Exact host-renderer measured text width. */
+    double width;
+    /* Exact host-renderer measured text height. */
+    double height;
+    /* Measured painted ink width (widest line); 0 means "not measured" and
+       consumers fall back to width. */
+    double content_width;
+    /* Measured painted ink height; 0 means "not measured" and consumers fall
+       back to height. */
+    double content_height;
+} SnowTextLayoutSize;
+
+typedef struct SnowTextLayoutOverride {
+    /* Text element that this exact host-renderer layout applies to. */
+    SnowElementId id;
+    SnowTextLayoutSize size;
+} SnowTextLayoutOverride;
+
+typedef struct SnowTextCommitDraft {
+    /* Existing text element to edit when has_existing_element is nonzero. Ignored for new text. */
+    SnowElementId element_id;
+    /* Owner of a new arrow label; generation zero means standalone text. */
+    SnowElementId arrow_id;
+    /* Nonzero edits element_id; zero creates a new text element. */
+    uint8_t has_existing_element;
+    /* Nonzero keeps auto-resize enabled after commit. */
+    uint8_t auto_resize;
+    /* Nonzero updates the editor default text style from style when text is non-empty. */
+    uint8_t update_default_style;
+    uint8_t reserved0[5];
+    /* Final host-measured text center in canvas coordinates. */
+    double center_x;
+    double center_y;
+    /* UTF-8 draft contents. May be null only when text_utf8_len is zero. */
+    const char* text_utf8;
+    uint32_t text_utf8_len;
+    uint32_t reserved1;
+    /* Exact host-renderer layout for the committed text. */
+    SnowTextLayoutSize measured_layout;
+    /* Full draft style to persist for the committed text. */
+    SnowTextStyle style;
+    SnowElementId bubble_id;
+    double minimum_grapheme_width;
+    double text_ink_reserve;
+} SnowTextCommitDraft;
+
+typedef struct SnowActiveTextDraftPresentation {
+    SnowElementId element_id;
+    SnowElementId arrow_id;
+    uint8_t has_existing_element;
+    uint8_t auto_resize;
+    uint8_t reserved0[6];
+    double center_x;
+    double center_y;
+    double width;
+    double height;
+    double rotation;
+    /* Painted ink box of the draft preview; 0 means "not measured". */
+    double content_width;
+    double content_height;
+    const char* text_utf8;
+    uint32_t text_utf8_len;
+    uint32_t reserved1;
+    SnowTextStyle style;
+    SnowElementId bubble_id;
+    double minimum_grapheme_width;
+    double text_ink_reserve;
+} SnowActiveTextDraftPresentation;
+
+typedef struct SnowTextElementInfo {
+    SnowElementId id;
+    SnowElementId arrow_id;
+    double arrow_width;
+    double center_x;
+    double center_y;
+    double width;
+    double height;
+    double content_width;
+    double content_height;
+    double rotation;
+    double font_size;
+    /* Alignment travels with geometry for offscreen layout measurements. */
+    SnowTextHorizontalAlign horizontal_align;
+    SnowTextVerticalAlign vertical_align;
+    uint32_t text_utf8_len;
+    uint8_t text_truncated;
+    uint8_t auto_resize;
+    /* Nonzero asks the host to measure natural unwrapped width; zero asks for
+       wrapped height using width. */
+    uint8_t measure_natural_width;
+    uint8_t reserved0[1];
+    char text_utf8[SNOW_TEXT_UTF8_CAPACITY];
+    uint32_t font_family_utf8_len;
+    uint8_t font_family_truncated;
+    uint8_t bold;
+    uint8_t italic;
+    uint8_t reserved1[1];
+    char font_family_utf8[SNOW_FONT_FAMILY_UTF8_CAPACITY];
+    SnowElementId bubble_id;
+    double minimum_grapheme_width;
+    double text_ink_reserve;
+    double bubble_body_width;
+    double bubble_body_height;
+    SnowRectangleShape bubble_shape;
+    double bubble_stroke_width;
+    SnowCornerRadii bubble_corner_radii;
+} SnowTextElementInfo;
+
+typedef struct SnowSpeechBubbleTextLayoutRequest {
+    SnowTextElementInfo info;
+    SnowTextStyle style;
+    uint64_t key;
+} SnowSpeechBubbleTextLayoutRequest;
+typedef struct SnowSpeechBubbleTextLayoutMetrics {
+    SnowElementId text_id;
+    uint64_t key;
+    SnowTextLayoutSize size;
+    double minimum_grapheme_width;
+    double text_ink_reserve;
+} SnowSpeechBubbleTextLayoutMetrics;
+uint32_t snow_runtime_speech_bubble_text_count(SnowRuntime runtime);
+SnowError snow_viewport_get_speech_bubble_text_target(SnowRuntime runtime, SnowViewport viewport,
+                                                      uint8_t use_point, double x, double y,
+                                                      SnowTextElementInfo* out_info,
+                                                      SnowTextStyle* out_style, uint8_t* out_found);
+SnowError snow_viewport_take_speech_bubble_text_edit_request(SnowRuntime runtime,
+                                                             SnowViewport viewport,
+                                                             SnowElementId* out_owner,
+                                                             uint8_t* out_requested);
+/* Resolves and consumes the requested bubble's text target independently of selection. */
+SnowError snow_viewport_take_speech_bubble_text_edit_target(SnowRuntime runtime,
+                                                            SnowViewport viewport,
+                                                            SnowTextElementInfo* out_info,
+                                                            SnowTextStyle* out_style,
+                                                            uint8_t* out_found);
+SnowError snow_speech_bubble_resolve_text_layout(const SnowTextElementInfo* info,
+                                                 double minimum_grapheme_width,
+                                                 double text_ink_reserve,
+                                                 double wrapped_text_height, double* out_body_width,
+                                                 double* out_body_height, double* out_content_width,
+                                                 double* out_content_height);
+SnowError
+snow_viewport_get_speech_bubble_text_layout_requests(SnowRuntime runtime, SnowViewport viewport,
+                                                     SnowSpeechBubbleTextLayoutRequest* out_items,
+                                                     uint32_t capacity, uint32_t* out_count);
+SnowError snow_viewport_apply_speech_bubble_text_layout_metrics_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowSpeechBubbleTextLayoutMetrics* items,
+    uint32_t count, SnowChangedViewportList* out_changed);
+
+typedef struct SnowArrowTextLayoutRequest {
+    SnowTextElementInfo info;
+    SnowTextStyle style;
+    uint64_t key;
+    double max_width;
+    uint32_t distance_value_chars;
+} SnowArrowTextLayoutRequest;
+
+typedef struct SnowArrowTextLayoutResult {
+    SnowElementId text_id;
+    uint64_t key;
+    SnowTextLayoutSize size;
+} SnowArrowTextLayoutResult;
+
+typedef struct SnowArrowTextLayoutMetrics {
+    SnowElementId text_id;
+    uint64_t key;
+    SnowTextLayoutSize size;
+    /* Natural layout width; size.width must be min(natural_width, max_width).
+       Zero means
+     * unknown and restricts reuse to the original constraint. */
+    double natural_width;
+    double distance_value_width;
+} SnowArrowTextLayoutMetrics;
+
+/* Call before requesting replacement layouts after host font or DPI changes. */
+SnowError snow_viewport_invalidate_arrow_text_layouts(SnowRuntime runtime, SnowViewport viewport);
+
+/* Pending host measurement for the empty label attached by an active serial
+   number drag; measure the empty draft for this font and apply the result. */
+typedef struct SnowSerialLabelLayoutRequest {
+    SnowElementId text_id;
+    double font_size;
+    uint32_t font_family_utf8_len;
+    uint8_t font_family_truncated;
+    uint8_t reserved0[3];
+    char font_family_utf8[SNOW_FONT_FAMILY_UTF8_CAPACITY];
+} SnowSerialLabelLayoutRequest;
+
+uint32_t snow_runtime_arrow_text_count(SnowRuntime runtime);
+SnowError snow_viewport_take_distance_value_edit_target(SnowRuntime runtime, SnowViewport viewport,
+                                                        SnowTextElementInfo* out_info,
+                                                        SnowTextStyle* out_style,
+                                                        uint8_t* out_found);
+/* Draft text includes temporary IME composition; only commit changes calibration. */
+SnowError snow_viewport_set_distance_value_draft_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    SnowElementId owner, const char* text,
+                                                    uint32_t length, SnowTextLayoutSize layout,
+                                                    SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_commit_distance_value_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                 SnowElementId owner, double value,
+                                                 SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_get_arrow_text_layout_requests(SnowRuntime runtime, SnowViewport viewport,
+                                                       SnowArrowTextLayoutRequest* out_items,
+                                                       uint32_t capacity, uint32_t* out_count);
+SnowError snow_viewport_apply_arrow_text_layouts_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    const SnowArrowTextLayoutResult* layouts,
+                                                    uint32_t count,
+                                                    SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_apply_arrow_text_layout_metrics_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowArrowTextLayoutMetrics* layouts,
+    uint32_t count, SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_get_serial_label_layout_request(SnowRuntime runtime, SnowViewport viewport,
+                                                        SnowSerialLabelLayoutRequest* out_request,
+                                                        uint8_t* out_has_request);
+SnowError
+snow_viewport_apply_serial_label_layout_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           SnowElementId text_id, SnowTextLayoutSize layout,
+                                           SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_get_bound_label_layout_request(SnowRuntime runtime, SnowViewport viewport,
+                                                       SnowSerialLabelLayoutRequest* out_request,
+                                                       uint8_t* out_has_request);
+SnowError snow_viewport_apply_bound_label_layout_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    SnowElementId text_id,
+                                                    SnowTextLayoutSize layout,
+                                                    SnowChangedViewportList* out_changed_viewports);
+
+typedef struct SnowPointerEvent {
+    uint32_t pointer_id;
+    SnowPointerEventType event_type;
+    SnowPointerDevice device;
+    double position_x;
+    double position_y;
+    SnowPointerButton button;
+    uint8_t buttons;
+    uint8_t has_pressure;
+    uint8_t reserved0[2];
+    SnowModifiers modifiers;
+    double pressure;
+    uint64_t timestamp_ms;
+} SnowPointerEvent;
+
+typedef struct SnowWheelEvent {
+    double position_x;
+    double position_y;
+    double delta_x;
+    double delta_y;
+    SnowWheelDeltaKind delta_kind;
+    SnowModifiers modifiers;
+} SnowWheelEvent;
+
+typedef struct SnowKeyEvent {
+    SnowKeyEventType event_type;
+    SnowKeyCode key_code;
+    uint32_t codepoint;
+    SnowModifiers modifiers;
+    uint8_t repeat;
+    uint8_t reserved0[3];
+} SnowKeyEvent;
+
+typedef struct SnowInputEvent {
+    SnowInputEventKind kind;
+    SnowPointerEvent pointer;
+    SnowWheelEvent wheel;
+    SnowKeyEvent key;
+} SnowInputEvent;
+
+typedef struct SnowInteractionOutput {
+    uint8_t consumed;
+    uint8_t reserved0[3];
+    SnowPointerCaptureCommandKind capture_kind;
+    uint32_t capture_pointer_id;
+    SnowCursorCommandKind cursor_kind;
+    SnowCursorStyle cursor_style;
+} SnowInteractionOutput;
+
+typedef struct SnowPatchCursor {
+    uint64_t scene_revision;
+    uint64_t decoration_revision;
+    uint64_t overlay_revision;
+} SnowPatchCursor;
+
+typedef struct SnowPatchOp {
+    uint32_t start;
+    uint32_t delete_count;
+    uint32_t insert_offset;
+    uint32_t insert_count;
+} SnowPatchOp;
+
+typedef struct SnowPenFilterGeometryPatch {
+    SnowElementId element_id;
+    uint64_t expected_geometry_revision;
+    uint64_t resulting_geometry_revision;
+    uint32_t retain_prefix_count;
+    uint32_t append_offset;
+    uint32_t append_count;
+    double old_changed_min_x;
+    double old_changed_min_y;
+    double old_changed_max_x;
+    double old_changed_max_y;
+    double new_changed_min_x;
+    double new_changed_min_y;
+    double new_changed_max_x;
+    double new_changed_max_y;
+    uint8_t full_reset;
+    uint8_t element_removed;
+    uint8_t reserved0[6];
+} SnowPenFilterGeometryPatch;
+
+typedef enum SnowPathGeometryRole {
+    SNOW_PATH_GEOMETRY_ROLE_CENTERLINE = 0,
+    SNOW_PATH_GEOMETRY_ROLE_PRESSURE_OUTLINE = 1
+} SnowPathGeometryRole;
+
+typedef struct SnowPathGeometryPatch {
+    SnowElementId element_id;
+    uint64_t expected_geometry_revision;
+    uint64_t resulting_geometry_revision;
+    uint32_t range_offset;
+    uint32_t range_count;
+    double old_changed_min_x;
+    double old_changed_min_y;
+    double old_changed_max_x;
+    double old_changed_max_y;
+    double new_changed_min_x;
+    double new_changed_min_y;
+    double new_changed_max_x;
+    double new_changed_max_y;
+    uint8_t closed;
+    uint8_t full_reset;
+    uint8_t element_removed;
+    uint8_t role;
+    uint8_t reserved0[4];
+} SnowPathGeometryPatch;
+
+typedef struct SnowPathChunkRange {
+    uint32_t start;
+    uint32_t delete_count;
+    uint32_t insert_chunk_offset;
+    uint32_t insert_chunk_count;
+} SnowPathChunkRange;
+
+typedef struct SnowPathChunk {
+    uint64_t stable_id;
+    uint32_t command_start;
+    uint32_t command_offset;
+    uint32_t command_count;
+    uint32_t reserved0;
+    double start_x;
+    double start_y;
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+    double cumulative_start_length;
+} SnowPathChunk;
+
+#define SNOW_WATERMARK_TEXT_CAPACITY 256
+#define SNOW_WATERMARK_FONT_FAMILY_CAPACITY 128
+
+typedef struct SnowPatchInfo {
+    uint64_t scene_base_revision;
+    uint64_t scene_revision;
+    uint64_t decoration_base_revision;
+    uint64_t decoration_revision;
+    uint64_t overlay_base_revision;
+    uint64_t overlay_revision;
+    uint8_t scene_reset;
+    uint8_t decoration_reset;
+    uint8_t overlay_reset;
+    uint8_t reserved0[5];
+    uint32_t scene_op_count;
+    uint32_t overlay_op_count;
+    uint32_t spotlight_op_count;
+    uint32_t scene_item_count;
+    uint32_t overlay_item_count;
+    uint32_t spotlight_item_count;
+    uint32_t scene_dirty_rect_count;
+    uint32_t decoration_dirty_rect_count;
+    uint32_t overlay_dirty_rect_count;
+    uint32_t surface_width;
+    uint32_t surface_height;
+    double camera_center_x;
+    double camera_center_y;
+    double camera_zoom;
+    SnowColorRgba8 clear_color;
+    SnowColorRgba8 watermark_color;
+    uint16_t watermark_text_len;
+    uint16_t watermark_font_family_len;
+    uint8_t watermark_text[SNOW_WATERMARK_TEXT_CAPACITY];
+    double watermark_font_size;
+    uint8_t watermark_font_family[SNOW_WATERMARK_FONT_FAMILY_CAPACITY];
+    double watermark_angle;
+    double watermark_gap;
+    double watermark_opacity;
+    SnowColorRgba8 spotlight_color;
+    double spotlight_opacity;
+    uint8_t spotlight_active;
+    uint8_t reserved1[7];
+} SnowPatchInfo;
+
+typedef struct SnowDirtyRect {
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+} SnowDirtyRect;
+
+typedef struct SnowSpotlightCutout {
+    double center_x;
+    double center_y;
+    double width;
+    double height;
+    double rotation;
+    uint8_t shape;
+    uint8_t reserved[7];
+    SnowCornerRadii corner_radii;
+} SnowSpotlightCutout;
+
+#define SNOW_ARROW_POINT_CAPACITY 64
+
+typedef struct SnowArrowPoint {
+    double x;
+    double y;
+} SnowArrowPoint;
+
+typedef struct SnowArrowheadPrimitive {
+    SnowArrowheadPrimitiveKind kind;
+    SnowArrowheadFillMode fill_mode;
+    SnowArrowheadDashMode dash_mode;
+    uint32_t point_count;
+    SnowArrowPoint points[SNOW_ARROWHEAD_PRIMITIVE_POINT_CAPACITY];
+    SnowArrowPoint center;
+    double diameter;
+    // Negative values mean no primitive-specific roughness cap.
+    double roughness_cap;
+} SnowArrowheadPrimitive;
+
+typedef struct SnowArrowPathCommand {
+    SnowArrowPathCommandKind kind;
+    uint32_t reserved0;
+    SnowArrowPoint point;
+    SnowArrowPoint control1;
+    SnowArrowPoint control2;
+} SnowArrowPathCommand;
+
+/*
+ * Compact borrowed display view. Pointer fields are valid only while the
+ * SnowPatchHandle that returned this item remains alive. A pointer may be
+ * null only when its corresponding count or UTF-8 length is zero.
+ */
+/* Filter runs use stable uncropped identities; start/count index the resulting scene.
+   Replacement flag 0 retains the plan; 1 replaces it (including an empty plan). */
+typedef struct SnowSceneRenderRun {
+    SnowElementId source_pass;
+    SnowElementId effect_run;
+    uint32_t start;
+    uint32_t count;
+} SnowSceneRenderRun;
+
+typedef struct SnowFilterRenderSpec {
+    uint32_t filter_type;
+    uint32_t render_phase;
+    double strength;
+    double mosaic_block_size;
+    double blur_sigma;
+    double sampling_radius;
+} SnowFilterRenderSpec;
+
+SnowFilterRenderSpec snow_filter_render_spec_resolve(uint32_t filter_type, double strength);
+
+typedef struct SnowTextPaintOutset {
+    double x;
+    double y;
+} SnowTextPaintOutset;
+
+/* Conservative document-space ink bounds of a text item: the aligned content
+   box expanded by the fill padding and the text stroke halo. Dirty regions and
+   visibility culling must consume this instead of reconstructing the
+   arithmetic. */
+typedef struct SnowTextPaintBounds {
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+} SnowTextPaintBounds;
+
+typedef struct SnowMagnifierPaintBounds {
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+} SnowMagnifierPaintBounds;
+
+typedef struct SnowSerialTextConnection {
+    double start_x;
+    double start_y;
+    double end_x;
+    double end_y;
+    double baseline_start_x;
+    double baseline_start_y;
+    double baseline_end_x;
+    double baseline_end_y;
+    uint8_t has_baseline;
+    uint8_t reserved[7];
+} SnowSerialTextConnection;
+
+typedef struct SnowMagnifierGeometry {
+    double source_center_x;
+    double source_center_y;
+    double source_width;
+    double source_height;
+    double magnification_factor;
+    SnowMagnifierConnectionType connection_type;
+    uint8_t source_outline;
+    uint8_t reserved[3];
+} SnowMagnifierGeometry;
+
+typedef struct SnowSceneDisplayItem {
+    SnowSceneDisplayItemKind kind;
+    SnowBlendMode blend_mode;
+    SnowElementId element_id;
+    double center_x;
+    double center_y;
+    double width;
+    double height;
+    double rotation;
+    SnowColorRgba8 fill;
+    SnowColorRgba8 stroke;
+    SnowColorRgba8 text_color;
+    double stroke_width;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+    uint32_t stroke_rendering_seed;
+    SnowCornerRadii corner_radii;
+    uint32_t arrow_point_count;
+    SnowArrowType arrow_type;
+    SnowArrowShaftType arrow_shaft_type;
+    double arrow_ratio;
+    uint8_t is_free_draw;
+    uint8_t text_bold;
+    uint8_t text_italic;
+    uint8_t brush_mode;
+    SnowArrowhead arrow_start_head;
+    SnowArrowhead arrow_end_head;
+    SnowStrokeStyle arrow_stroke_style;
+    uint32_t bound_text_element_index;
+    const SnowArrowPoint* arrow_points;
+    uint32_t arrow_path_command_count;
+    uint32_t arrowhead_primitive_count;
+    const SnowArrowPathCommand* arrow_path_commands;
+    const SnowArrowheadPrimitive* arrowhead_primitives;
+    double font_size;
+    double opacity;
+    /* Text items: painted ink box (widest line x laid-out height), resolved to
+       at least the item size. Serial connectors anchor to this box aligned
+       inside the item rectangle, never to the wrap rectangle. */
+    double content_width;
+    double content_height;
+    int64_t serial_number;
+    uint32_t text_utf8_len;
+    SnowTextHorizontalAlign text_horizontal_align;
+    SnowTextVerticalAlign text_vertical_align;
+    SnowFillStyle fill_style;
+    SnowStrokeStyle stroke_style;
+    uint8_t has_bound_text_element;
+    uint8_t rect_shape;
+    uint8_t serial_number_type;
+    /* Angle labels overlay uninterrupted geometry; zero retains label clipping. */
+    uint8_t arrow_text_overlay;
+    uint32_t bound_text_element_generation;
+    /* Canvas-space label exclusion rectangle, used only by arrows. */
+    double arrow_text_bounds[4];
+    SnowFilterRenderSpec filter;
+    const char* text_utf8;
+    uint32_t font_family_utf8_len;
+    const char* font_family_utf8;
+    SnowMagnifierGeometry magnifier;
+    double text_ink_reserve;
+    SnowColorRgba8 arrow_outline_color;
+    double arrow_outline_width;
+} SnowSceneDisplayItem;
+
+/* Conservative ink (fill padding plus text stroke halo) for dirty regions. */
+SnowTextPaintOutset snow_scene_text_paint_outset(const SnowSceneDisplayItem* item);
+/* Fill-pill padding only. The host text painter must consume this instead of
+   measuring its own padding so the painted edge matches the dirty regions. */
+SnowTextPaintOutset snow_scene_text_fill_outset(const SnowSceneDisplayItem* item);
+/* Conservative document-space ink bounds (aligned content box + fill padding +
+   stroke halo) for dirty regions and culling. */
+SnowTextPaintBounds snow_scene_text_paint_bounds(const SnowSceneDisplayItem* item);
+
+/* Document-space bounds of the lens, source outline and Gradient connection.
+ * The leader path is bounded separately. */
+SnowMagnifierPaintBounds snow_scene_magnifier_body_paint_bounds(const SnowSceneDisplayItem* item);
+uint8_t snow_scene_resolve_serial_text_connection(const SnowSceneDisplayItem* serial,
+                                                  const SnowSceneDisplayItem* text,
+                                                  SnowSerialTextConnection* out_connection);
+uint8_t snow_scene_resolve_shape_text_connection(const SnowSceneDisplayItem* shape,
+                                                 const SnowSceneDisplayItem* text,
+                                                 SnowSerialTextConnection* out_connection);
+
+/* Pointer fields follow the same SnowPatchHandle lifetime as scene items. */
+/* The visitor borrows each item for the duration of the call and must not reenter runtime. */
+SnowError snow_runtime_visit_smart_erase(SnowRuntime runtime,
+                                         void (*visitor)(void* context,
+                                                         const SnowSceneDisplayItem* item),
+                                         void* context);
+
+typedef struct SnowOverlayDisplayItem {
+    SnowOverlayDisplayItemKind kind;
+    SnowOverlayRectKind rect_kind;
+    SnowSnapGuideKind snap_guide_kind;
+    SnowSnapGuideAxis snap_guide_axis;
+    uint8_t snap_marker_count;
+    uint8_t snap_has_label;
+    uint16_t reserved0;
+    double center_x;
+    double center_y;
+    double width;
+    double height;
+    double rotation;
+    SnowColorRgba8 fill;
+    SnowColorRgba8 stroke;
+    double stroke_width;
+    SnowStrokeRenderingStyle stroke_rendering_style;
+    uint32_t stroke_rendering_seed;
+    SnowCornerRadii corner_radii;
+    uint32_t arrow_point_count;
+    SnowArrowType arrow_type;
+    SnowArrowShaftType arrow_shaft_type;
+    double arrow_ratio;
+    uint8_t reserved1[3];
+    SnowArrowhead arrow_start_head;
+    SnowArrowhead arrow_end_head;
+    SnowStrokeStyle arrow_stroke_style;
+    SnowFillStyle fill_style;
+    const SnowArrowPoint* arrow_points;
+    uint32_t arrow_path_command_count;
+    uint32_t arrowhead_primitive_count;
+    const SnowArrowPathCommand* arrow_path_commands;
+    const SnowArrowheadPrimitive* arrowhead_primitives;
+    double snap_start_x;
+    double snap_start_y;
+    double snap_end_x;
+    double snap_end_y;
+    double snap_marker0_x;
+    double snap_marker0_y;
+    double snap_marker1_x;
+    double snap_marker1_y;
+    double snap_label;
+    SnowColorRgba8 snap_color;
+    double snap_line_width;
+    double snap_marker_size;
+    double snap_gap_dash_length;
+    double snap_gap_dash_gap;
+    SnowColorRgba8 arrow_outline_color;
+    double arrow_outline_width;
+} SnowOverlayDisplayItem;
+
+SnowError snow_runtime_create(SnowRuntime* out_runtime);
+
+SnowError snow_runtime_create_with_config(const SnowRuntimeConfig* config,
+                                          SnowRuntime* out_runtime);
+
+SnowError snow_runtime_style_defaults_default(SnowStyleDefaults* out_defaults);
+
+SnowError snow_runtime_clone_document_session_with_config(SnowRuntime source,
+                                                          const SnowRuntimeConfig* config,
+                                                          SnowRuntime* out_runtime);
+
+void snow_runtime_destroy(SnowRuntime runtime);
+
+/* Nestable presentation scope: mutations and host text metrics remain queryable,
+ * but patches and changed-viewport lists are published only at the outermost end.
+ * Balance every successful begin, even after a failed mutation. This does not
+ * group document history or roll back mutations. Destroy the returned list. */
+SnowError snow_runtime_begin_presentation_update(SnowRuntime runtime);
+SnowError snow_runtime_end_presentation_update_ex(SnowRuntime runtime,
+                                                  SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_set_automatically_select_newly_created_elements_ex(
+    SnowRuntime runtime, uint8_t enabled, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_set_automatic_selection_excluded_tools_ex(
+    SnowRuntime runtime, uint64_t tools, SnowChangedViewportList* out_changed_viewports);
+SnowError
+snow_runtime_set_quick_selection_disabled_tools_ex(SnowRuntime runtime, uint64_t tools,
+                                                   SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_create(SnowRuntime runtime, const SnowEngineConfig* config,
+                               SnowViewport* out_viewport);
+
+void snow_viewport_destroy(SnowRuntime runtime, SnowViewport viewport);
+
+SnowError snow_viewport_set_surface_size(SnowRuntime runtime, SnowViewport viewport, uint32_t width,
+                                         uint32_t height);
+
+SnowError snow_viewport_set_camera(SnowRuntime runtime, SnowViewport viewport, double center_x,
+                                   double center_y, double zoom);
+
+SnowError snow_viewport_get_id(SnowViewport viewport, uint64_t* out_id);
+
+SnowError snow_viewport_set_active_tool_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           SnowActiveTool tool,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_get_active_tool(SnowRuntime runtime, SnowViewport viewport,
+                                        SnowActiveTool* out_tool);
+
+SnowError snow_viewport_get_snap_config(SnowRuntime runtime, SnowViewport viewport,
+                                        SnowSnapConfig* out_config);
+
+SnowError snow_viewport_set_snap_config_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           const SnowSnapConfig* config,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+/* Transient canvas-coordinate targets; each axis accepts at most two positions. */
+SnowError snow_viewport_set_snap_guide_targets_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                  const double* vertical_xs, size_t vertical_count,
+                                                  const double* horizontal_ys,
+                                                  size_t horizontal_count,
+                                                  SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_get_grid_config(SnowRuntime runtime, SnowViewport viewport,
+                                        SnowGridConfig* out_config);
+
+SnowError snow_viewport_set_grid_config_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           const SnowGridConfig* config,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_get_auto_filter_regions(SnowRuntime runtime, uint64_t* generation,
+                                               uint8_t* identified, SnowAutoFilterBounds* bounds,
+                                               SnowAutoFilterRegion* regions, size_t capacity,
+                                               size_t* count);
+SnowError snow_viewport_set_auto_filter_regions(SnowRuntime runtime, SnowViewport viewport,
+                                                const SnowAutoFilterBounds* bounds,
+                                                const SnowAutoFilterRegion* regions, size_t count,
+                                                SnowChangedViewportList* changed);
+SnowError snow_viewport_fill_auto_filter_category(SnowRuntime runtime, SnowViewport viewport,
+                                                  const uint8_t* category, size_t length,
+                                                  SnowChangedViewportList* changed);
+
+SnowError snow_runtime_get_history_state(SnowRuntime runtime, SnowHistoryState* out_state);
+/* Runtime-only host edits share annotation undo ordering, but are not serialized. */
+SnowError snow_runtime_host_history_state(SnowRuntime runtime, int32_t direction,
+                                          uint64_t* out_state);
+SnowError snow_runtime_commit_host_history_state(SnowRuntime runtime, uint64_t state,
+                                                 SnowChangedViewportList* out_changed_viewports);
+/* Reports current capture ownership after input, cancellation, and document mutations. */
+SnowError snow_runtime_has_pointer_capture(SnowRuntime runtime, uint8_t* out_active);
+
+/* Apply one validated versioned annotation batch as one history entry. Output bytes are
+   owned by
+ * the caller and released with snow_annotation_result_destroy, even on empty result. */
+SnowError snow_runtime_apply_annotation_json(SnowRuntime runtime, const uint8_t* bytes, size_t size,
+                                             uint8_t** out_json, size_t* out_size,
+                                             SnowChangedViewportList* out_changed);
+void snow_annotation_result_destroy(uint8_t* bytes, size_t size);
+uint64_t snow_runtime_document_revision(SnowRuntime runtime);
+/* Opaque equality token for tool/selection/draft target changes. Null runtime returns 0. */
+uint64_t snow_runtime_angle_adjustment_target_revision(SnowRuntime runtime);
+// Returns nonzero for invalid handles, elements (including hidden ones), or watermark content.
+uint8_t snow_runtime_has_document_content(SnowRuntime runtime);
+
+SnowError
+snow_runtime_clear_document_preserving_viewports(SnowRuntime runtime,
+                                                 SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_restore_document_history_preserving_editor_styles(
+    SnowRuntime runtime, const uint8_t* bytes, size_t size,
+    SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_undo_ex(SnowRuntime runtime, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_runtime_redo_ex(SnowRuntime runtime, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_get_style_toolbar_state(SnowRuntime runtime, SnowViewport viewport,
+                                                SnowStyleToolbarState* out_state);
+
+SnowError snow_viewport_get_serial_number_toolbar_state(SnowRuntime runtime, SnowViewport viewport,
+                                                        SnowSerialNumberToolbarState* out_state);
+
+SnowError snow_viewport_set_distance_style_patch_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    const SnowDistanceStyle* style,
+                                                    uint32_t properties,
+                                                    SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_set_distance_pixel_scale_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    double scale_x, double scale_y,
+                                                    SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_magnifier_style_patch_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowMagnifierStyle* style,
+    uint32_t properties, uint8_t creation_defaults, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_angle_style_patch_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                 const SnowAngleStyle* style, uint32_t properties,
+                                                 SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_set_bracket_style_patch_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                   const SnowBracketStyle* style,
+                                                   uint32_t properties,
+                                                   SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_adjust_angle_value_ex(SnowRuntime runtime, SnowViewport viewport,
+                                              double delta_radians,
+                                              SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_shape_style_patch_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                 const SnowShapeStyle* style, uint32_t properties,
+                                                 SnowShapeKind kind,
+                                                 SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_set_filter_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                            const SnowFilterStyle* style, uint32_t properties,
+                                            SnowChangedViewportList* out_changed_viewports);
+/* Patches creation defaults without changing the tool, selection, or document.
+ * tool must be
+ * RectangleFilter or PenFilter. Strength remains shared by both families. */
+SnowError snow_viewport_set_brush_eraser_creation_style_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowBrushEraserStyle* style,
+    uint32_t properties, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_filter_creation_style_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowFilterStyle* style, uint32_t properties,
+    SnowActiveTool tool, SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_get_watermark_config(SnowRuntime runtime, SnowViewport viewport,
+                                             SnowWatermarkConfig* out_config);
+SnowError snow_viewport_set_watermark_config_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                const SnowWatermarkConfig* config,
+                                                SnowChangedViewportList* out_changed_viewports);
+
+SnowError
+snow_viewport_set_rectangle_shape_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           const SnowRectangleShapeStyle* style,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_text_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                          const SnowTextStyle* style,
+                                          const SnowTextLayoutOverride* layouts,
+                                          uint32_t layout_count,
+                                          SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_patch_text_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                            const SnowTextStyle* style, uint32_t properties,
+                                            const SnowTextLayoutOverride* layouts,
+                                            uint32_t layout_count,
+                                            SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_text_creation_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                   const SnowTextStyle* style, uint32_t properties,
+                                                   SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_set_serial_number_style_patch_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowSerialNumberStyle* style,
+    uint32_t properties, SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_set_serial_number_style_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                   const SnowSerialNumberStyle* style,
+                                                   SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_create_text(SnowRuntime runtime, SnowViewport viewport, double center_x,
+                                    double center_y, const char* text_utf8, uint32_t text_utf8_len,
+                                    double measured_width, double measured_height);
+
+SnowError snow_viewport_hit_text(SnowRuntime runtime, SnowViewport viewport, double canvas_x,
+                                 double canvas_y, SnowElementId* out_id, uint8_t* out_hit);
+
+// Body selection only. Uses the viewport zoom and active tool scope; secondary
+// selection ignores the disabled-tools policy. Misses return out_hit = 0.
+SnowError snow_viewport_hit_quick_selection(SnowRuntime runtime, SnowViewport viewport,
+                                            double canvas_x, double canvas_y,
+                                            SnowPointerButton button, SnowElementId* out_id,
+                                            uint8_t* out_hit);
+
+SnowError snow_viewport_is_element_selected(SnowRuntime runtime, SnowViewport viewport,
+                                            SnowElementId id, uint8_t* out_selected);
+
+SnowError snow_viewport_selected_text_count(SnowRuntime runtime, SnowViewport viewport,
+                                            uint32_t* out_count);
+
+SnowError snow_viewport_get_selected_text_elements(SnowRuntime runtime, SnowViewport viewport,
+                                                   SnowTextElementInfo* out_items,
+                                                   uint32_t capacity, uint32_t* out_count);
+
+SnowError snow_viewport_get_active_text_resize_measurement(SnowRuntime runtime,
+                                                           SnowViewport viewport,
+                                                           SnowTextElementInfo* out_info,
+                                                           uint8_t* out_active);
+
+SnowError snow_viewport_apply_active_text_resize_measurement_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowTextLayoutSize* layout,
+    SnowChangedViewportList* out_changed_viewports);
+
+SnowError
+snow_viewport_set_active_text_draft_presentation_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                    const SnowActiveTextDraftPresentation* draft,
+                                                    SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_clear_active_text_draft_presentation_ex(
+    SnowRuntime runtime, SnowViewport viewport, SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_get_active_text_draft_presentation(SnowRuntime runtime,
+                                                           SnowViewport viewport,
+                                                           SnowTextElementInfo* out_info,
+                                                           SnowTextStyle* out_style,
+                                                           uint8_t* out_active);
+
+SnowError snow_viewport_is_text_bound_to_serial_number(SnowRuntime runtime, SnowViewport viewport,
+                                                       SnowElementId id, uint8_t* out_bound);
+
+/* Resolves a point hit or a single selected arrow without creating document content. */
+SnowError snow_viewport_get_arrow_text_target(SnowRuntime runtime, SnowViewport viewport,
+                                              uint8_t use_point, double x, double y,
+                                              SnowTextElementInfo* out_info,
+                                              SnowTextStyle* out_style, uint8_t* out_found);
+SnowError snow_runtime_get_text_utf8(SnowRuntime runtime, SnowElementId element, uint8_t* buffer,
+                                     uint32_t capacity, uint32_t* out_length);
+
+SnowError snow_runtime_get_text_element(SnowRuntime runtime, SnowElementId id,
+                                        SnowTextElementInfo* out_info);
+
+/* Typed draft commit path. Persists text content, exact host layout, auto-resize
+   state, and full SnowTextStyle from SnowTextCommitDraft. */
+SnowError
+snow_viewport_commit_text_draft_payload_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           const SnowTextCommitDraft* draft,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_select_element_ex(SnowRuntime runtime, SnowViewport viewport,
+                                          SnowElementId id,
+                                          SnowChangedViewportList* out_changed_viewports);
+
+/* Clears selection without changing the active tool or document history. */
+SnowError snow_viewport_clear_selection_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_reset_editing_state_ex(SnowRuntime runtime, SnowViewport viewport,
+                                               SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_delete_selected_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_delete_all_elements_ex(SnowRuntime runtime, SnowViewport viewport,
+                                               SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_duplicate_selected_ex(SnowRuntime runtime, SnowViewport viewport,
+                                              double offset_x, double offset_y,
+                                              SnowChangedViewportList* out_changed_viewports);
+SnowError snow_viewport_insert_draw_template_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                const uint8_t* bytes, size_t size, double center_x,
+                                                double center_y,
+                                                SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_reorder_selected_ex(SnowRuntime runtime, SnowViewport viewport,
+                                            uint32_t action,
+                                            SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_align_selected_ex(SnowRuntime runtime, SnowViewport viewport,
+                                          uint32_t alignment,
+                                          SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_set_selected_opacity_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                double opacity,
+                                                SnowChangedViewportList* out_changed_viewports);
+
+SnowError
+snow_viewport_adjust_selected_serial_numbers_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                int64_t delta,
+                                                SnowChangedViewportList* out_changed_viewports);
+
+SnowError
+snow_viewport_create_serial_number_text_ex(SnowRuntime runtime, SnowViewport viewport,
+                                           double measured_width, double measured_height,
+                                           SnowElementId* out_text_id, uint8_t* out_has_text_id,
+                                           SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_viewport_take_text_edit_request(SnowRuntime runtime, SnowViewport viewport,
+                                               SnowElementId* out_text_id,
+                                               uint8_t* out_has_text_id);
+
+SnowError snow_viewport_take_new_text_draft_request(SnowRuntime runtime, SnowViewport viewport,
+                                                    uint8_t* out_requested);
+
+SnowError snow_viewport_process_input_ex(SnowRuntime runtime, SnowViewport viewport,
+                                         const SnowInputEvent* event,
+                                         SnowInteractionOutput* out_output,
+                                         SnowChangedViewportList* out_changed_viewports);
+
+/* Processes an ordered, non-empty batch of pointer-move events and refreshes
+   viewport presentation once after the final event. */
+SnowError snow_viewport_process_pointer_move_batch_ex(
+    SnowRuntime runtime, SnowViewport viewport, const SnowInputEvent* events, uint32_t event_count,
+    SnowInteractionOutput* out_output, SnowChangedViewportList* out_changed_viewports);
+
+void snow_changed_viewports_destroy(SnowChangedViewportList changed_viewports);
+
+uint32_t snow_changed_viewports_count(SnowChangedViewportList changed_viewports);
+
+SnowError snow_changed_viewports_get(SnowChangedViewportList changed_viewports, uint32_t index,
+                                     uint64_t* out_viewport_id);
+
+SnowError snow_viewport_acquire_patch(SnowRuntime runtime, SnowViewport viewport,
+                                      const SnowPatchCursor* cursor, SnowPatchHandle* out_patch);
+
+void snow_patch_destroy(SnowPatchHandle patch);
+
+SnowError snow_patch_get_info(SnowPatchHandle patch, SnowPatchInfo* out_info);
+
+SnowError snow_patch_get_scene_ops(SnowPatchHandle patch, const SnowPatchOp** out_ops,
+                                   uint32_t* out_count);
+
+SnowError snow_patch_get_pen_filter_geometry_ops(SnowPatchHandle patch,
+                                                 const SnowPenFilterGeometryPatch** out_ops,
+                                                 uint32_t* out_count);
+
+SnowError snow_patch_get_pen_filter_geometry_points(SnowPatchHandle patch,
+                                                    const SnowArrowPoint** out_points,
+                                                    uint32_t* out_count);
+
+SnowError snow_patch_get_path_geometry_ops(SnowPatchHandle patch,
+                                           const SnowPathGeometryPatch** out_ops,
+                                           uint32_t* out_count);
+
+SnowError snow_patch_get_path_geometry_ranges(SnowPatchHandle patch,
+                                              const SnowPathChunkRange** out_ranges,
+                                              uint32_t* out_count);
+
+SnowError snow_patch_get_path_geometry_chunks(SnowPatchHandle patch,
+                                              const SnowPathChunk** out_chunks,
+                                              uint32_t* out_count);
+
+SnowError snow_patch_get_path_geometry_commands(SnowPatchHandle patch,
+                                                const SnowArrowPathCommand** out_commands,
+                                                uint32_t* out_count);
+
+SnowError snow_patch_get_overlay_ops(SnowPatchHandle patch, const SnowPatchOp** out_ops,
+                                     uint32_t* out_count);
+
+SnowError snow_patch_get_spotlight_ops(SnowPatchHandle patch, const SnowPatchOp** out_ops,
+                                       uint32_t* out_count);
+
+/* Returned items and all nested pointer fields borrow from `patch`. */
+SnowError snow_patch_get_scene_render_plan(SnowPatchHandle patch, uint8_t* out_replace,
+                                           const SnowSceneRenderRun** out_runs,
+                                           uint32_t* out_count);
+
+SnowError snow_patch_get_scene_items(SnowPatchHandle patch, const SnowSceneDisplayItem** out_items,
+                                     uint32_t* out_count);
+
+/* Returned items and all nested pointer fields borrow from `patch`. */
+SnowError snow_patch_get_overlay_items(SnowPatchHandle patch,
+                                       const SnowOverlayDisplayItem** out_items,
+                                       uint32_t* out_count);
+
+/* Returned cutouts borrow from `patch`. */
+SnowError snow_patch_get_spotlight_cutouts(SnowPatchHandle patch,
+                                           const SnowSpotlightCutout** out_cutouts,
+                                           uint32_t* out_count);
+
+SnowError snow_patch_get_scene_dirty_rects(SnowPatchHandle patch, const SnowDirtyRect** out_rects,
+                                           uint32_t* out_count);
+
+SnowError snow_patch_get_overlay_dirty_rects(SnowPatchHandle patch, const SnowDirtyRect** out_rects,
+                                             uint32_t* out_count);
+SnowError snow_viewport_get_spotlight_config(SnowRuntime runtime, SnowViewport viewport,
+                                             SnowSpotlightConfig* out_config);
+SnowError snow_viewport_set_spotlight_config_ex(SnowRuntime runtime, SnowViewport viewport,
+                                                const SnowSpotlightConfig* config,
+                                                SnowChangedViewportList* out_changed_viewports);
+
+SnowError snow_patch_get_decoration_dirty_rects(SnowPatchHandle patch,
+                                                const SnowDirtyRect** out_rects,
+                                                uint32_t* out_count);
+
+// Stateful shared freehand stabilization. Input batches contain only new points.
+typedef struct SnowStrokeFilter SnowStrokeFilter;
+SnowError snow_stroke_filter_create(SnowArrowPoint start, double sample_spacing,
+                                    double response_distance, SnowStrokeFilter** output);
+void snow_stroke_filter_free(SnowStrokeFilter* filter);
+// Each batch is limited to 65536 input points and 65536 resampled points of work.
+// Invalid batches leave filter state unchanged.
+// Output borrows from filter until its next append/free; copy before another call.
+// finish recovers the exact endpoint. An empty finish-only batch is valid.
+SnowError snow_stroke_filter_append(SnowStrokeFilter* filter, const SnowArrowPoint* points,
+                                    size_t count, uint8_t finish, const SnowArrowPoint** output,
+                                    size_t* output_count);
+
+typedef struct SnowSnapRect {
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+} SnowSnapRect;
+
+typedef struct SnowSnapMoveConstraints {
+    SnowSnapRect bounds;
+    double position_step;
+} SnowSnapMoveConstraints;
+
+typedef struct SnowMoveSnap SnowMoveSnap;
+
+// Explicit object snapping; config.enabled is ignored. Null constraints keeps continuous geometry.
+// On success output owns a result that must be released with snow_move_snap_free.
+SnowError snow_snap_move(const SnowSnapRect* target, const SnowSnapRect* references,
+                         size_t reference_count, const SnowSnapConfig* config,
+                         double canvas_to_view_scale, const SnowSnapMoveConstraints* constraints,
+                         SnowMoveSnap** output);
+// Immutable guides are borrowed until the result is freed. Reading never repeats snapping.
+SnowError snow_move_snap_read(const SnowMoveSnap* result, SnowArrowPoint* correction,
+                              const SnowOverlayDisplayItem** guides, size_t* count);
+void snow_move_snap_free(SnowMoveSnap* result);
+
+// Stateless curve construction; null commands queries the required count.
+SnowError snow_build_catmull_rom_path(const SnowArrowPoint* vertices, size_t vertex_count,
+                                      uint8_t closed, SnowArrowPathCommand* commands,
+                                      size_t capacity, size_t* count);
+
+#ifdef __cplusplus
+}
+#endif

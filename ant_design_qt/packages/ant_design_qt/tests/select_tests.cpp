@@ -1,0 +1,620 @@
+#include <QAbstractItemModel>
+#include <QColor>
+#include <QCoreApplication>
+#include <QEvent>
+#include <QListView>
+#include <QLineEdit>
+#include <QLayout>
+#include <QMouseEvent>
+#include <QPointer>
+#include <QSignalSpy>
+#include <QStandardItemModel>
+#include <QToolButton>
+#include <QStringList>
+#include <QTest>
+#include <QWidget>
+
+#include "widgets/select.h"
+#include "widgets/control_scale.h"
+#include "theme/theme_manager.h"
+
+using adqt::widgets::AdControlScaleContext;
+using adqt::widgets::AdSelect;
+
+namespace {
+
+AdSelect::Option makeOption(const QString& value, const QString& label) {
+  AdSelect::Option option;
+  option.value = value;
+  option.label = label;
+  return option;
+}
+
+QStringList popupLabels(AdSelect& select) {
+  const QListView* view = select.view();
+  const QAbstractItemModel* model = view ? view->model() : nullptr;
+  QStringList labels;
+  if (!model) {
+    return labels;
+  }
+
+  labels.reserve(model->rowCount());
+  for (int row = 0; row < model->rowCount(); ++row) {
+    labels.append(model->index(row, 0).data(Qt::DisplayRole).toString());
+  }
+  return labels;
+}
+
+QWidget* popupSurface(AdSelect& select) {
+  QWidget* candidate = select.view();
+  while (candidate && candidate->objectName() != QStringLiteral("adselect-popup")) {
+    candidate = candidate->parentWidget();
+  }
+  return candidate;
+}
+
+int horizontalCenterIn(const QWidget* widget, const QWidget* ancestor) {
+  return widget->mapTo(ancestor, widget->rect().center()).x();
+}
+
+class SelectPressHost final : public QWidget {
+ public:
+  int pressCount = 0;
+
+ protected:
+  void mousePressEvent(QMouseEvent* event) override {
+    ++pressCount;
+    QWidget::mousePressEvent(event);
+  }
+};
+
+}  // namespace
+
+class SelectTest final : public QObject {
+  Q_OBJECT
+
+ private slots:
+  void optionReplacementReleasesOwnedModels() {
+    for (const auto mode :
+         {AdSelect::Mode::Single, AdSelect::Mode::Multiple, AdSelect::Mode::Tags}) {
+      AdSelect select;
+      select.setMode(mode);
+      select.setOptions({makeOption(QStringLiteral("a"), QStringLiteral("Alpha"))});
+      select.setCurrentValues({QStringLiteral("a")});
+      for (int replacement = 0; replacement < 20; ++replacement) {
+        QPointer<QAbstractItemModel> previousModel(select.model());
+        select.setModel(select.model());
+        const QString label = QStringLiteral("Alpha %1").arg(replacement);
+        select.setOptions({makeOption(QStringLiteral("a"), label)});
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(previousModel.isNull());
+        QVERIFY(select.model());
+        QCOMPARE(select.currentValues(), QVariantList({QStringLiteral("a")}));
+        QCOMPARE(popupLabels(select), QStringList({label}));
+      }
+      QPointer<QAbstractItemModel> previousModel(select.model());
+      select.appendOption(makeOption(QStringLiteral("b"), QStringLiteral("Beta")));
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+      QVERIFY(previousModel.isNull());
+      QCOMPARE(select.options().size(), 2);
+      QCOMPARE(select.currentValues(), QVariantList({QStringLiteral("a")}));
+    }
+  }
+
+  void clearingOptionsReleasesOwnedModel() {
+    AdSelect select;
+    select.setOptions({makeOption(QStringLiteral("a"), QStringLiteral("Alpha"))});
+    QPointer<QAbstractItemModel> ownedModel(select.model());
+    select.clearOptions();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(ownedModel.isNull());
+    QVERIFY(!select.model());
+    QVERIFY(select.options().isEmpty());
+    select.clearOptions();
+    QVERIFY(!select.model());
+  }
+
+  void modelTransitionsPreserveExternalOwnership() {
+    QObject owner;
+    auto* externalModel = new QStandardItemModel(&owner);
+    QPointer<QAbstractItemModel> externalGuard(externalModel);
+    auto* row = new QStandardItem(QStringLiteral("External"));
+    row->setData(QStringLiteral("external"), AdSelect::DefaultValueRole);
+    externalModel->appendRow(row);
+    {
+      AdSelect select;
+      select.setOptions({makeOption(QStringLiteral("a"), QStringLiteral("Alpha"))});
+      QPointer<QAbstractItemModel> ownedModel(select.model());
+      select.setModel(externalModel);
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+      QVERIFY(ownedModel.isNull());
+      QCOMPARE(select.model(), externalGuard.data());
+
+      select.setOptions({makeOption(QStringLiteral("b"), QStringLiteral("Beta"))});
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+      QVERIFY(externalGuard);
+      ownedModel = select.model();
+      select.clearOptions();
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+      QVERIFY(ownedModel.isNull());
+      QVERIFY(externalGuard);
+
+      select.setModel(externalModel);
+      select.clearOptions();
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+      QVERIFY(externalGuard);
+      QCOMPARE(externalGuard->rowCount(), 1);
+      select.setModel(externalModel);
+    }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(externalGuard);
+    QCOMPARE(externalGuard->parent(), &owner);
+  }
+
+  void reentrantOptionReplacementKeepsFinalModelOwned() {
+    AdSelect select;
+    QPointer<QAbstractItemModel> intermediateModel;
+    connect(&select, &AdSelect::modelChanged, &select, [&](QAbstractItemModel* model) {
+      if (model && model->index(0, 0).data().toString() == QStringLiteral("First")) {
+        intermediateModel = model;
+        select.setOptions({makeOption(QStringLiteral("second"), QStringLiteral("Second"))});
+      }
+    });
+    select.setOptions({makeOption(QStringLiteral("first"), QStringLiteral("First"))});
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(intermediateModel.isNull());
+    QCOMPARE(popupLabels(select), QStringList({QStringLiteral("Second")}));
+    QPointer<QAbstractItemModel> finalModel(select.model());
+    select.clearOptions();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(finalModel.isNull());
+  }
+
+  void selectedDisabledOptionRetainsValueAndLabel() {
+    for (const auto mode :
+         {AdSelect::Mode::Single, AdSelect::Mode::Multiple, AdSelect::Mode::Tags}) {
+      for (const bool externalModel : {false, true}) {
+        QStandardItemModel model;
+        AdSelect select;
+        select.setMode(mode);
+        auto option = makeOption(QStringLiteral("ratio"), QStringLiteral("16:9"));
+        if (externalModel) {
+          auto* item = new QStandardItem(option.label);
+          item->setData(option.value, AdSelect::DefaultValueRole);
+          model.appendRow(item);
+          select.setModel(&model);
+        } else {
+          select.setOptions({option});
+        }
+        select.setCurrentValues({option.value});
+        option.disabled = true;
+        if (externalModel) {
+          model.item(0)->setEnabled(false);
+        } else {
+          select.setOptions({option});
+        }
+        QCOMPARE(select.currentValues(), QVariantList({option.value}));
+        QCOMPARE(select.currentItems().constFirst().label, option.label);
+        QCOMPARE(select.selectedModelIndexes().size(), 1);
+        if (mode == AdSelect::Mode::Single) {
+          QCOMPARE(select.lineEdit()->text(), option.label);
+        }
+        select.setCurrentValues({});
+        select.setCurrentValues({option.value});
+        QCOMPARE(select.currentValues(), QVariantList({option.value}));
+        QSignalSpy selectedSpy(&select, &AdSelect::selected);
+        select.showPopup();
+        auto* view = select.view();
+        view->selectionModel()->setCurrentIndex(view->model()->index(0, 0),
+                                                QItemSelectionModel::NoUpdate);
+        QTest::keyClick(view, Qt::Key_Return);
+        QCOMPARE(selectedSpy.count(), 0);
+        QCOMPARE(select.currentValues(), QVariantList({option.value}));
+        select.hidePopup();
+        option.disabled = false;
+        if (externalModel) {
+          model.item(0)->setEnabled(true);
+        } else {
+          select.setOptions({option});
+        }
+        QCOMPARE(select.currentValues(), QVariantList({option.value}));
+        select.setCurrentValues({});
+        QVERIFY(select.currentValues().isEmpty());
+      }
+    }
+  }
+
+  void disabledSelectionStillRequiresACompleteModelRow() {
+    QStandardItemModel model(1, 2);
+    QItemSelectionModel externalSelection(&model);
+    for (int column = 0; column < 2; ++column) {
+      auto* item = new QStandardItem(QStringLiteral("Disabled"));
+      item->setData(QStringLiteral("disabled"), AdSelect::DefaultValueRole);
+      item->setEnabled(false);
+      model.setItem(0, column, item);
+    }
+    AdSelect select;
+    select.setModel(&model);
+    select.setModelColumn(1);
+    auto* selection = select.selectionModel();
+    selection->select(model.index(0, 1), QItemSelectionModel::Select);
+    QVERIFY(select.currentValues().isEmpty());
+    selection->select(model.index(0, 0), QItemSelectionModel::Select);
+    QCOMPARE(select.currentValues(), QVariantList({QStringLiteral("disabled")}));
+    QCOMPARE(select.selectedModelIndexes(), QModelIndexList({model.index(0, 1)}));
+    selection->clearSelection();
+    QVERIFY(select.currentValues().isEmpty());
+    externalSelection.select(model.index(0, 1),
+                             QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    select.setSelectionModel(&externalSelection);
+    QCOMPARE(select.currentValues(), QVariantList({QStringLiteral("disabled")}));
+  }
+
+  void disabledTextTokenPreservesSelectorAndSuffixColors() {
+    AdSelect select;
+    select.setOptions({makeOption(QStringLiteral("ratio"), QStringLiteral("16:9"))});
+    select.setCurrentValue(QStringLiteral("ratio"));
+    select.setDisabled(true);
+    const QColor defaultDisabledText =
+        select.lineEdit()->palette().color(QPalette::Disabled, QPalette::Text);
+    const QColor textColor(230, 240, 250);
+    AdSelect::ComponentTokens tokens;
+    tokens.colors.selectorText = textColor;
+    tokens.colors.suffix = textColor;
+    tokens.colors.disabledText = textColor;
+    select.setComponentTokens(tokens);
+    auto* suffix = select.findChild<QToolButton*>(QStringLiteral("adselect-suffix"));
+    QVERIFY(suffix);
+    QCOMPARE(select.lineEdit()->palette().color(QPalette::Disabled, QPalette::Text), textColor);
+    QCOMPARE(suffix->palette().color(QPalette::Disabled, QPalette::ButtonText), textColor);
+    select.setDisabled(false);
+    QCOMPARE(select.lineEdit()->palette().color(QPalette::Active, QPalette::Text), textColor);
+    select.setVariant(AdSelect::Variant::Borderless);
+    select.setDisabled(true);
+    QCOMPARE(select.lineEdit()->palette().color(QPalette::Disabled, QPalette::Text), textColor);
+    QCOMPARE(suffix->palette().color(QPalette::Disabled, QPalette::ButtonText), textColor);
+    select.resetComponentTokens();
+    QCOMPARE(select.lineEdit()->palette().color(QPalette::Disabled, QPalette::Text),
+             defaultDisabledText);
+  }
+
+  void emptyStringValuesSelectTheirLabel() {
+    const QString label = QStringLiteral("System default");
+    const QStringList emptyValues{QString(), QStringLiteral(""), QStringLiteral(" \t ")};
+    for (const bool externalModel : {false, true}) {
+      for (const QString& optionValue : emptyValues) {
+        for (const QString& selectedValue : emptyValues) {
+          QStandardItemModel model;
+          AdSelect select;
+          select.setSearchEnabled(true);
+          if (externalModel) {
+            auto* row = new QStandardItem(label);
+            row->setData(optionValue, AdSelect::DefaultValueRole);
+            model.appendRow(row);
+            select.setModel(&model);
+          } else {
+            select.setOptions({makeOption(optionValue, label)});
+          }
+          select.setCurrentValue(selectedValue);
+          QVERIFY(select.currentValue().isValid());
+          QVERIFY(select.currentValue().toString().isEmpty());
+          QCOMPARE(select.currentModelIndex().row(), 0);
+          QCOMPARE(select.currentText(), label);
+          QCOMPARE(select.lineEdit()->text(), label);
+
+          select.setCurrentValue(QVariant());
+          QVERIFY(!select.currentValue().isValid());
+          QVERIFY(!select.currentModelIndex().isValid());
+          QVERIFY(select.currentText().isEmpty());
+        }
+      }
+    }
+  }
+
+  void controlHeightTokenSurvivesVisualRefreshAndScaling() {
+    AdSelect select;
+    select.setControlSize(AdSelect::ControlSize::Small);
+    AdSelect::ComponentTokens tokens;
+    tokens.metrics.controlHeight = 28;
+    select.setComponentTokens(tokens);
+    QCOMPARE(select.height(), 28);
+    QCOMPARE(select.sizeHint().height(), 28);
+    select.setVariant(AdSelect::Variant::Borderless);
+    QCOMPARE(select.height(), 28);
+    select.commitControlScale(AdControlScaleContext::fromDprsAndContentScale(1.0, 1.0, 1.5));
+    QCOMPARE(select.height(), 42);
+    QCOMPARE(select.sizeHint().height(), 42);
+    select.setVariant(AdSelect::Variant::Outlined);
+    QCOMPARE(select.height(), 42);
+    select.commitControlScale(AdControlScaleContext::fromDprsAndContentScale(1.0, 1.0, 1.0));
+    QCOMPARE(select.height(), 28);
+    select.resetComponentTokens();
+    QCOMPARE(select.height(), select.sizeHint().height());
+    QVERIFY(select.height() != 28);
+  }
+
+  void compactControlHeightTokenSurvivesSelectionThemeAndStyleRefresh() {
+    auto& theme = adqt::theme::ThemeManager::instance();
+    const auto originalConfig = theme.config();
+    AdSelect select;
+    select.setControlSize(AdSelect::ControlSize::Small);
+    const int defaultHeight = select.height();
+    QVERIFY(defaultHeight >= 24);
+    select.setOptions({makeOption(QStringLiteral("free"), QStringLiteral("Free")),
+                       makeOption(QStringLiteral("square"), QStringLiteral("1:1"))});
+    AdSelect::ComponentTokens tokens;
+    tokens.metrics.controlHeight = 22;
+    select.setComponentTokens(tokens);
+    select.show();
+    QCoreApplication::processEvents();
+    for (const qreal scale : {1.0, 1.5, 2.0}) {
+      select.commitControlScale(AdControlScaleContext::fromDprsAndContentScale(1, 1, scale));
+      const int expectedHeight = qRound(22 * scale);
+      for (const auto scheme : {adqt::theme::ThemeScheme::Light, adqt::theme::ThemeScheme::Dark}) {
+        theme.setColorScheme(scheme);
+        select.setCurrentValue(QStringLiteral("square"));
+        select.setVariant(AdSelect::Variant::Borderless);
+        AdSelect::SemanticStyles styles;
+        styles.selector.backgroundColor = QColor(22, 119, 255, 107);
+        select.setSemanticStyles(styles);
+        select.setCurrentValue(QStringLiteral("free"));
+        QCoreApplication::processEvents();
+        QCOMPARE(select.height(), expectedHeight);
+        QCOMPARE(select.sizeHint().height(), expectedHeight);
+        QCOMPARE(select.minimumHeight(), expectedHeight);
+        QCOMPARE(select.maximumHeight(), expectedHeight);
+      }
+    }
+    theme.setConfig(originalConfig);
+    select.commitControlScale(AdControlScaleContext::fromDprsAndContentScale(1, 1, 1));
+    select.resetComponentTokens();
+    QCOMPARE(select.height(), defaultHeight);
+  }
+
+  void selectorShellClickConsumesPressAndIgnoresHiddenClearGeometry() {
+    SelectPressHost host;
+    host.resize(240, 140);
+    AdSelect select(&host);
+    select.setOptions({makeOption(QStringLiteral("free"), QStringLiteral("Free"))});
+    select.setCurrentValue(QStringLiteral("free"));
+    select.setAllowClear(false);
+    select.setFixedWidth(68);
+    select.move(20, 20);
+    host.show();
+    select.show();
+    QCoreApplication::processEvents();
+    auto* clear = select.findChild<QToolButton*>(QStringLiteral("adselect-clear"));
+    QVERIFY(clear);
+    QVERIFY(!clear->isVisible());
+    clear->setGeometry(select.rect());
+    QTest::mouseClick(&select, Qt::LeftButton, Qt::NoModifier, select.rect().center());
+    QVERIFY(select.popupVisible());
+    QCOMPARE(host.pressCount, 0);
+    QTest::mouseClick(&select, Qt::LeftButton, Qt::NoModifier, select.rect().center());
+    QVERIFY(!select.popupVisible());
+    QCOMPARE(host.pressCount, 0);
+  }
+
+  void popupCanBeDestroyedBeforeItsSelectDuringHostTeardown() {
+    auto* host = new QWidget;
+    auto* toolbar = new QWidget(host);
+    auto* select = new AdSelect(toolbar);
+    select->setOptions({makeOption(QStringLiteral("mosaic"), QStringLiteral("Mosaic"))});
+    select->setPopupFooterWidget(new QWidget);
+    QWidget* popup = popupSurface(*select);
+    QVERIFY(popup);
+    QCOMPARE(popup->parentWidget(), host);
+    // Stacking changes reorder QObject children: the host can delete the popup first.
+    popup->lower();
+    QPointer<AdSelect> guardedSelect(select);
+    QPointer<QWidget> guardedPopup(popup);
+    delete host;
+    QVERIFY(guardedSelect.isNull());
+    QVERIFY(guardedPopup.isNull());
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  }
+
+  void controlScaleAppliesToContentAndSurvivesStyleRefresh() {
+    for (const auto size : {AdSelect::ControlSize::Small, AdSelect::ControlSize::Middle,
+                            AdSelect::ControlSize::Large}) {
+      AdSelect select;
+      select.setControlSize(size);
+      select.setVariant(AdSelect::Variant::Borderless);
+      select.setOptions({makeOption(QStringLiteral("a"), QStringLiteral("Alpha"))});
+      select.setCurrentValue(QStringLiteral("a"));
+      select.show();
+      QCoreApplication::processEvents();
+      auto* input = select.findChild<QLineEdit*>(QStringLiteral("adselect-input"));
+      auto* suffix = select.findChild<QToolButton*>(QStringLiteral("adselect-suffix"));
+      QVERIFY(input);
+      QVERIFY(suffix);
+      const int fontSize = input->font().pixelSize();
+      const int height = select.height();
+      const int iconSize = suffix->iconSize().height();
+      const int padding = select.layout()->contentsMargins().left();
+      const int rowHeight = select.view()->sizeHintForRow(0);
+      adqt::widgets::AdControlScaleScope scope(&select);
+      for (const qreal scale : {0.8, 0.64, 0.8 / 1.5, 1.25, 0.8, 1.0}) {
+        scope.publishScale(
+            adqt::widgets::AdControlScaleContext::fromDprsAndContentScale(1, 1, scale));
+        // Hover, selection and theme changes all refresh the resolved style.
+        select.setStatus(AdSelect::Status::Warning);
+        select.setStatus(AdSelect::Status::None);
+        QCoreApplication::processEvents();
+        QCOMPARE(input->font().pixelSize(), qRound(fontSize * scale));
+        QCOMPARE(select.height(), qRound(height * scale));
+        QCOMPARE(select.sizeHint().height(), select.height());
+        QCOMPARE(select.minimumSizeHint().height(), select.height());
+        QCOMPARE(suffix->iconSize().height(), qRound(iconSize * scale));
+        QVERIFY(qAbs(select.layout()->contentsMargins().left() - qRound(padding * scale)) <= 1);
+        QCOMPARE(select.view()->sizeHintForRow(0), qRound(rowHeight * scale));
+      }
+    }
+  }
+
+  void scaledMultipleModesKeepTagsAndHintsConsistent() {
+    for (const auto mode : {AdSelect::Mode::Multiple, AdSelect::Mode::Tags}) {
+      AdSelect select;
+      select.setMode(mode);
+      select.setOptions({makeOption(QStringLiteral("a"), QStringLiteral("Alpha"))});
+      select.setCurrentValues({QStringLiteral("a")});
+      select.resize(300, select.sizeHint().height());
+      select.show();
+      QCoreApplication::processEvents();
+      const int height = select.height();
+      auto* input = select.findChild<QLineEdit*>(QStringLiteral("adselect-input"));
+      QVERIFY(input);
+      const int fontSize = input->font().pixelSize();
+      adqt::widgets::AdControlScaleScope scope(&select);
+      for (const qreal scale : {0.8, 0.64, 1.0}) {
+        scope.publishScale(
+            adqt::widgets::AdControlScaleContext::fromDprsAndContentScale(1, 1, scale));
+        QCoreApplication::processEvents();
+        QCOMPARE(input->font().pixelSize(), qRound(fontSize * scale));
+        QCOMPARE(select.height(), qRound(height * scale));
+        QCOMPARE(select.sizeHint().height(), select.height());
+      }
+    }
+  }
+
+  void defaultPopupOrderMatchesInputOrder() {
+    AdSelect select;
+    select.setOptions({makeOption(QStringLiteral("z"), QStringLiteral("Zulu")),
+                       makeOption(QStringLiteral("a"), QStringLiteral("Alpha")),
+                       makeOption(QStringLiteral("m"), QStringLiteral("Middle"))});
+
+    QCOMPARE(popupLabels(select), QStringList({QStringLiteral("Zulu"), QStringLiteral("Alpha"),
+                                               QStringLiteral("Middle")}));
+  }
+
+  void filteringPreservesInputOrderWithoutSortComparator() {
+    AdSelect select;
+    select.setOptions({makeOption(QStringLiteral("g"), QStringLiteral("Gamma")),
+                       makeOption(QStringLiteral("a"), QStringLiteral("Alpha")),
+                       makeOption(QStringLiteral("b"), QStringLiteral("Beta")),
+                       makeOption(QStringLiteral("z"), QStringLiteral("Zulu"))});
+    select.setSearchEnabled(true);
+    select.setSearchText(QStringLiteral("a"));
+
+    QCOMPARE(popupLabels(select), QStringList({QStringLiteral("Gamma"), QStringLiteral("Alpha"),
+                                               QStringLiteral("Beta")}));
+  }
+
+  void customSortComparatorStillControlsPopupOrder() {
+    AdSelect select;
+    select.setOptions({makeOption(QStringLiteral("z"), QStringLiteral("Zulu")),
+                       makeOption(QStringLiteral("a"), QStringLiteral("Alpha")),
+                       makeOption(QStringLiteral("m"), QStringLiteral("Middle"))});
+    select.setSortComparator([](const AdSelect::Option& lhs, const AdSelect::Option& rhs) {
+      return lhs.label < rhs.label;
+    });
+
+    QCOMPARE(popupLabels(select), QStringList({QStringLiteral("Alpha"), QStringLiteral("Middle"),
+                                               QStringLiteral("Zulu")}));
+
+    select.setSortComparator(AdSelect::SortComparator{});
+    QCOMPARE(popupLabels(select), QStringList({QStringLiteral("Zulu"), QStringLiteral("Alpha"),
+                                               QStringLiteral("Middle")}));
+  }
+
+  void groupedOptionHeadersUseDescriptionColor() {
+    AdSelect select;
+    AdSelect::Option general = makeOption(QStringLiteral("general"), QStringLiteral("General"));
+    general.group = QStringLiteral("General Models");
+    AdSelect::Option translation =
+        makeOption(QStringLiteral("translation"), QStringLiteral("Translation"));
+    translation.group = QStringLiteral("Translation Models");
+    select.setOptions({general, translation});
+
+    const QAbstractItemModel* model = select.view()->model();
+    QVERIFY(model != nullptr);
+    QCOMPARE(model->index(0, 0).data(Qt::DisplayRole).toString(), QStringLiteral("General Models"));
+    const QColor headerColor = model->index(0, 0).data(Qt::ForegroundRole).value<QColor>();
+    const QColor optionColor = model->index(1, 0).data(Qt::ForegroundRole).value<QColor>();
+    QVERIFY(headerColor.isValid());
+    QVERIFY(optionColor.isValid());
+    QVERIFY(headerColor != optionColor);
+  }
+
+  void customNotFoundContentReplacesEmptyRow() {
+    for (const auto mode : {AdSelect::PopupLayerMode::InWindow, AdSelect::PopupLayerMode::QtTool}) {
+      QWidget host;
+      host.resize(800, 480);
+      AdSelect select(&host);
+      select.setGeometry(40, 40, 300, 32);
+      select.setPopupLayerMode(mode);
+      select.setSearchEnabled(true);
+      auto* content = new QWidget(&select);
+      content->setFixedHeight(32);
+      select.setNotFoundContentWidget(content);
+      host.show();
+      select.showPopup();
+      QCoreApplication::processEvents();
+      QVERIFY(content->isVisible());
+      QVERIFY(!select.view()->isVisible());
+      const int customHeight = popupSurface(select)->height();
+      select.setNotFoundContentWidget(nullptr);
+      QCoreApplication::processEvents();
+      QVERIFY(content->isHidden());
+      QVERIFY(select.view()->isVisible());
+      QVERIFY(popupSurface(select)->height() > customHeight);
+      select.setNotFoundContentWidget(content);
+      select.setOptions({makeOption(QStringLiteral("alpha"), QStringLiteral("Alpha"))});
+      QCoreApplication::processEvents();
+      QVERIFY(content->isHidden());
+      QVERIFY(select.view()->isVisible());
+      select.setSearchText(QStringLiteral("missing"));
+      QCoreApplication::processEvents();
+      QVERIFY(content->isVisible());
+      QVERIFY(!select.view()->isVisible());
+      QCOMPARE(popupSurface(select)->height(), customHeight);
+      select.hidePopup();
+      // Closing clears the transient search, so existing options are visible on reopen.
+      select.showPopup();
+      QCoreApplication::processEvents();
+      QVERIFY(content->isHidden());
+      QVERIFY(select.view()->isVisible());
+      select.hidePopup();
+      select.clearOptions();
+      select.showPopup();
+      QCoreApplication::processEvents();
+      QVERIFY(content->isVisible());
+      QCOMPARE(popupSurface(select)->height(), customHeight);
+    }
+  }
+
+  void centeredPlacementSurvivesPopupGeometryRefreshes() {
+    QWidget host;
+    host.resize(800, 480);
+
+    AdSelect select(&host);
+    select.setGeometry(220, 80, 360, 32);
+    select.setSearchEnabled(true);
+    select.setPopupMatchSelectWidth(false);
+    select.setPopupWidth(390);
+    select.setPlacement(AdSelect::Placement::BottomCenter);
+    select.setOptions({makeOption(QStringLiteral("alpha"), QStringLiteral("Alpha")),
+                       makeOption(QStringLiteral("beta"), QStringLiteral("Beta"))});
+
+    host.show();
+    select.showPopup();
+    QCoreApplication::processEvents();
+
+    QWidget* popup = popupSurface(select);
+    QVERIFY(popup != nullptr);
+    QCOMPARE(select.placement(), AdSelect::Placement::BottomCenter);
+    QCOMPARE(horizontalCenterIn(popup, &host), horizontalCenterIn(&select, &host));
+
+    select.setSearchText(QStringLiteral("a"));
+    QCoreApplication::processEvents();
+    QCOMPARE(horizontalCenterIn(popup, &host), horizontalCenterIn(&select, &host));
+
+    host.resize(900, 480);
+    QCoreApplication::processEvents();
+    QCOMPARE(horizontalCenterIn(popup, &host), horizontalCenterIn(&select, &host));
+  }
+};
+
+QTEST_MAIN(SelectTest)
+
+#include "select_tests.moc"

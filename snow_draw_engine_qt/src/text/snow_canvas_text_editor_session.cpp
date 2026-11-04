@@ -1,0 +1,626 @@
+#include "snow_canvas_text_editor_session.h"
+
+#include "snow_canvas_element_id.h"
+#include "snow_canvas_text.h"
+#include "snow_canvas_fill_render.h"
+#include "snow_canvas_text_edit_geometry.h"
+#include "snow_canvas_text_editor_input.h"
+#include "snow_canvas_text_editor_view.h"
+#include "snow_canvas_text_layout.h"
+
+#include <QInputMethodEvent>
+#include <QKeyEvent>
+#include <QPainter>
+#include <QRegularExpression>
+
+#include <cstdint>
+#include <cmath>
+#include <limits>
+
+bool SnowCanvasTextEditorSession::FinishedEdit::shouldCommit(bool hasViewport) const {
+    return hasViewport && (hasExistingElement || snow_canvas_element_id::hasElementId(bubbleId) ||
+                           !text.trimmed().isEmpty());
+}
+
+bool SnowCanvasTextEditorSession::begin(const SnowTextElementInfo& info,
+                                        const SnowSceneDisplayItem* existingSceneItem,
+                                        const QFont& baseFont, const SnowTextStyle* newTextStyle,
+                                        const QString* completeText) {
+    cancel();
+
+    const bool hasExisting = snow_canvas_element_id::hasElementId(info.id);
+    const QString initialText =
+        completeText != nullptr ? *completeText : snow_canvas_text::textFromElementInfo(info);
+    m_arrowId = info.arrow_id;
+    m_arrowWidth = info.arrow_width;
+    m_bubbleId = info.bubble_id;
+    m_bubbleInfo = info;
+    SnowCanvasSceneItem preview = snow_canvas_text::defaultPreviewItem(info);
+    if (hasExisting) {
+        if (existingSceneItem != nullptr) {
+            preview = *existingSceneItem;
+        }
+        snow_canvas_text::copyTextToSceneItem(preview, initialText);
+        // Older saved drafts could commit the resized wrap rectangle together
+        // with pre-resize ink bounds. Resolve the ink from the current font and
+        // wrap width when opening an edit, without changing the stored frame.
+        const auto measured = snow_canvas_text_layout::measureWrappedTextLayout(
+            initialText, baseFont, preview, preview.width);
+        preview.content_width = measured.content.width();
+        preview.content_height = measured.content.height();
+    } else {
+        if (newTextStyle != nullptr) {
+            snow_canvas_text::applyTextStyleToSceneItem(preview, *newTextStyle);
+        }
+        const snow_canvas_text_layout::TextMeasuredLayout initialMeasured =
+            snow_canvas_text_layout::measureNaturalTextLayout(initialText, baseFont, preview);
+        preview.width = initialMeasured.layout.width();
+        preview.height = initialMeasured.layout.height();
+        preview.content_width = initialMeasured.content.width();
+        preview.content_height = initialMeasured.content.height();
+    }
+
+    if (newTextStyle != nullptr && (snow_canvas_element_id::hasElementId(m_arrowId) ||
+                                    snow_canvas_element_id::hasElementId(m_bubbleId))) {
+        snow_canvas_text::applyTextStyleToSceneItem(preview, *newTextStyle);
+    }
+    const QPointF creationPoint(info.center_x, info.center_y);
+    m_canvasAnchor =
+        hasExisting
+            ? snow_canvas_text_edit_geometry::topAnchorForItem(preview)
+            : snow_canvas_text_edit_geometry::topAnchorForCreationPoint(preview, creationPoint);
+    const QPointF anchoredCenter =
+        snow_canvas_text_edit_geometry::centerForTopAnchor(preview, m_canvasAnchor);
+    preview.center_x = anchoredCenter.x();
+    preview.center_y = anchoredCenter.y();
+    m_previewItem = preview;
+    m_hasPreview = true;
+    m_previewAutoResize = !hasExisting || info.auto_resize != 0;
+    m_hasExistingElement = hasExisting;
+    m_elementId = hasExisting ? info.id : SnowElementId{};
+    m_draft.begin(initialText);
+    if (snow_canvas_element_id::hasElementId(m_arrowId) ||
+        snow_canvas_element_id::hasElementId(m_bubbleId)) {
+        m_canvasAnchor = creationPoint;
+        updatePreviewLayout(baseFont, true);
+    }
+    return true;
+}
+
+void SnowCanvasTextEditorSession::beginDistanceValue(const QFont& baseFont) {
+    const QString label = m_draft.text();
+    const qsizetype separator = label.lastIndexOf(QLatin1Char(' '));
+    if (separator <= 0)
+        return;
+    m_distanceSuffix = label.mid(separator);
+    m_initialDistanceValue = label.left(separator);
+    m_draft.begin(m_initialDistanceValue, [](const QString& text) {
+        static const QRegularExpression partial(QStringLiteral("\\A[0-9]*(?:\\.[0-9]{0,3})?\\z"));
+        return partial.match(text).hasMatch();
+    });
+    updatePreviewLayout(baseFont, true);
+}
+
+std::optional<double> SnowCanvasTextEditorSession::parsedDistanceValue() const {
+    static const QRegularExpression number(
+        QStringLiteral("\\A(?:[0-9]+(?:\\.[0-9]{0,3})?|\\.[0-9]{1,3})\\z"));
+    if (!number.match(m_draft.text()).hasMatch())
+        return std::nullopt;
+    bool ok = false;
+    const double value = m_draft.text().toDouble(&ok);
+    return ok && std::isfinite(value) ? std::optional<double>(value) : std::nullopt;
+}
+
+SnowCanvasSceneItem SnowCanvasTextEditorSession::editableItem(const QFont& baseFont) const {
+    auto item = m_previewItem;
+    if (!isDistanceValue())
+        return item;
+    const auto measured =
+        snow_canvas_text_layout::measureNaturalTextLayout(m_draft.displayText(), baseFont, item);
+    const double width = qMax(1.0, measured.layout.width());
+    item.center_x += (width - item.width) / 2.0;
+    item.width = width;
+    item.content_width = measured.content.width();
+    snow_canvas_text::copyTextToSceneItem(item, m_draft.displayText());
+    return item;
+}
+
+SnowCanvasTextEditorSession::FinishedEdit
+SnowCanvasTextEditorSession::finish(const QFont& baseFont) {
+    FinishedEdit result;
+    if (!m_hasPreview) {
+        resetState();
+        return result;
+    }
+
+    m_draft.clearPreedit();
+    updatePreviewFromState(baseFont);
+    result.text = m_draft.text();
+    result.distanceValue = isDistanceValue();
+    result.distanceValueChanged = m_draft.text() != m_initialDistanceValue;
+    result.parsedDistanceValue = isDistanceValue() ? parsedDistanceValue() : std::nullopt;
+    result.canvasCenter = QPointF(m_previewItem.center_x, m_previewItem.center_y);
+    result.elementId = m_elementId;
+    result.arrowId = m_arrowId;
+    result.bubbleId = m_bubbleId;
+    result.minimumGraphemeWidth = m_minimumGraphemeWidth;
+    result.textInkReserve = m_textInkReserve;
+    result.hasExistingElement = m_hasExistingElement;
+    result.measuredLayout = SnowTextLayoutSize{
+        m_previewItem.width,
+        m_previewItem.height,
+        m_previewItem.content_width,
+        m_previewItem.content_height,
+    };
+    result.style = snow_canvas_text::textStyleFromSceneItem(m_previewItem);
+    result.autoResize = m_previewAutoResize;
+    result.styleChanged = m_styleChanged;
+    resetState();
+    return result;
+}
+
+void SnowCanvasTextEditorSession::cancel() {
+    resetState();
+}
+
+std::optional<QRectF> SnowCanvasTextEditorSession::textEditingBounds() const {
+    return m_textEditingBounds;
+}
+
+bool SnowCanvasTextEditorSession::setTextEditingBounds(const std::optional<QRectF>& bounds,
+                                                       const QFont& baseFont) {
+    const auto normalizedBounds =
+        snow_canvas_text_edit_geometry::normalizedTextEditingBounds(bounds);
+    if (m_textEditingBounds == normalizedBounds) {
+        return false;
+    }
+
+    m_textEditingBounds = normalizedBounds;
+    if (!canConstrainAutomaticWidth()) {
+        return false;
+    }
+    updatePreviewLayout(baseFont, true);
+    return true;
+}
+
+bool SnowCanvasTextEditorSession::isActive() const {
+    return m_hasPreview;
+}
+
+bool SnowCanvasTextEditorSession::containsViewPosition(const SceneDisplayInfo& sceneInfo,
+                                                       const QPointF& viewPosition,
+                                                       const QFont& baseFont) const {
+    if (!m_hasPreview) {
+        return false;
+    }
+    return snow_canvas_text_editor_view::itemContainsViewPosition(editableItem(baseFont), sceneInfo,
+                                                                  viewPosition);
+}
+
+const SnowSceneDisplayItem* SnowCanvasTextEditorSession::previewItem() const {
+    return m_hasPreview ? &m_previewItem : nullptr;
+}
+
+QString SnowCanvasTextEditorSession::presentationText() const {
+    return m_hasPreview ? m_draft.displayText() + m_distanceSuffix : QString();
+}
+
+bool SnowCanvasTextEditorSession::activeDraftHasExistingElement() const {
+    return m_hasPreview && m_hasExistingElement;
+}
+
+bool SnowCanvasTextEditorSession::activeDraftAutoResize() const {
+    return m_hasPreview && m_previewAutoResize;
+}
+
+SnowTextStyle SnowCanvasTextEditorSession::currentTextStyle() const {
+    return m_hasPreview ? snow_canvas_text::textStyleFromSceneItem(m_previewItem) : SnowTextStyle{};
+}
+
+bool SnowCanvasTextEditorSession::applyActiveDraftPresentation(const SnowTextElementInfo& info,
+                                                               const SnowTextStyle& style) {
+    if (!m_hasPreview) {
+        return false;
+    }
+    const bool infoHasElement = snow_canvas_element_id::hasElementId(info.id);
+    if (m_hasExistingElement != infoHasElement) {
+        return false;
+    }
+    if (m_hasExistingElement && !snow_canvas_element_id::sameElementId(m_elementId, info.id)) {
+        return false;
+    }
+
+    m_arrowId = info.arrow_id;
+    m_arrowWidth = info.arrow_width;
+    m_bubbleId = info.bubble_id;
+    m_bubbleInfo = info;
+    m_previewItem.center_x = info.center_x;
+    m_previewItem.center_y = info.center_y;
+    m_previewItem.width = qMax(1.0, info.width);
+    m_previewItem.height = qMax(1.0, info.height);
+    m_previewItem.content_width = info.content_width;
+    m_previewItem.content_height = info.content_height;
+    m_previewItem.text_ink_reserve = info.text_ink_reserve;
+    m_previewItem.rotation = info.rotation;
+    snow_canvas_text::applyTextStyleToSceneItem(m_previewItem, style);
+    snow_canvas_text::copyTextToSceneItem(m_previewItem, presentationText());
+    m_previewAutoResize = info.auto_resize != 0;
+    m_canvasAnchor = (snow_canvas_element_id::hasElementId(m_arrowId) ||
+                      snow_canvas_element_id::hasElementId(m_bubbleId))
+                         ? QPointF(m_previewItem.center_x, m_previewItem.center_y)
+                         : snow_canvas_text_edit_geometry::topAnchorForItem(m_previewItem);
+    return true;
+}
+
+bool SnowCanvasTextEditorSession::syncActiveDraftPresentation(SnowRuntime runtime,
+                                                              SnowViewport viewport,
+                                                              const QFont& baseFont,
+                                                              const SceneDisplayInfo& sceneInfo,
+                                                              QRegion* outUpdateRegion) {
+    if (!m_hasPreview || runtime == nullptr || viewport == nullptr) {
+        return false;
+    }
+
+    SnowTextElementInfo info{};
+    SnowTextStyle style{};
+    std::uint8_t active = 0;
+    if (snow_viewport_get_active_text_draft_presentation(runtime, viewport, &info, &style,
+                                                         &active) != SNOW_OK ||
+        active == 0) {
+        return false;
+    }
+
+    QRegion updateRegion = editingRegion(baseFont, sceneInfo);
+    if (!applyActiveDraftPresentation(info, style)) {
+        return false;
+    }
+    updateRegion += editingRegion(baseFont, sceneInfo);
+    if (outUpdateRegion != nullptr) {
+        *outUpdateRegion += updateRegion;
+    }
+    return true;
+}
+
+QRegion SnowCanvasTextEditorSession::previewRegion(const SceneDisplayInfo& sceneInfo,
+                                                   int paddingPx) const {
+    if (!m_hasPreview) {
+        return {};
+    }
+    return snow_canvas_text_editor_view::previewRegion(m_previewItem, sceneInfo, paddingPx);
+}
+
+QRegion SnowCanvasTextEditorSession::editingRegion(const QFont& baseFont,
+                                                   const SceneDisplayInfo& sceneInfo) const {
+    if (!m_hasPreview) {
+        return {};
+    }
+    return snow_canvas_text_editor_view::editingRegion(editableItem(baseFont), m_draft, baseFont,
+                                                       sceneInfo) +
+           previewRegion(sceneInfo);
+}
+
+QRegion SnowCanvasTextEditorSession::caretRegion(const QFont& baseFont,
+                                                 const SceneDisplayInfo& sceneInfo) const {
+    if (!m_hasPreview) {
+        return {};
+    }
+    return snow_canvas_text_editor_view::caretRegion(editableItem(baseFont), m_draft, baseFont,
+                                                     sceneInfo);
+}
+
+void SnowCanvasTextEditorSession::updatePreviewFromState(const QFont& baseFont) {
+    updatePreviewLayout(baseFont, false);
+}
+
+QRegion SnowCanvasTextEditorSession::updatePreviewFromState(const QFont& baseFont,
+                                                            const SceneDisplayInfo& sceneInfo) {
+    if (!m_hasPreview) {
+        return {};
+    }
+
+    QRegion updateRegion = editingRegion(baseFont, sceneInfo);
+    updatePreviewFromState(baseFont);
+    updateRegion += editingRegion(baseFont, sceneInfo);
+    return updateRegion;
+}
+
+QRegion SnowCanvasTextEditorSession::applyTextStyle(const SnowTextStyle& style,
+                                                    const QFont& baseFont,
+                                                    const SceneDisplayInfo& sceneInfo) {
+    if (!m_hasPreview) {
+        return {};
+    }
+
+    QRegion updateRegion = editingRegion(baseFont, sceneInfo);
+    const auto previousBold = m_previewItem.text_bold;
+    const auto previousItalic = m_previewItem.text_italic;
+    const double previousFontSize = m_previewItem.font_size;
+    const QString previousFontFamily = snow_canvas_text::fontFamilyFromSceneItem(m_previewItem);
+    const auto previousHorizontalAlign = m_previewItem.text_horizontal_align;
+    const bool previousFillVisible =
+        snow_canvas_fill_render::hasVisibleFill(m_previewItem.fill, m_previewItem.fill_style);
+    const auto previousStrokeAlpha = m_previewItem.stroke.a;
+    const double previousStrokeWidth = m_previewItem.stroke_width;
+    snow_canvas_text::applyTextStyleToSceneItem(m_previewItem, style);
+    m_styleChanged = true;
+    m_canvasAnchor = (snow_canvas_element_id::hasElementId(m_arrowId) ||
+                      snow_canvas_element_id::hasElementId(m_bubbleId))
+                         ? QPointF(m_previewItem.center_x, m_previewItem.center_y)
+                         : snow_canvas_text_edit_geometry::topAnchorForItem(m_previewItem);
+    const bool textLayoutChanged =
+        previousBold != m_previewItem.text_bold || previousItalic != m_previewItem.text_italic ||
+        previousFontSize != m_previewItem.font_size ||
+        previousFontFamily != snow_canvas_text::fontFamilyFromSceneItem(m_previewItem) ||
+        (snow_canvas_element_id::hasElementId(m_bubbleId) &&
+         (previousFillVisible != snow_canvas_fill_render::hasVisibleFill(
+                                     m_previewItem.fill, m_previewItem.fill_style) ||
+          previousStrokeAlpha != m_previewItem.stroke.a ||
+          previousStrokeWidth != m_previewItem.stroke_width ||
+          previousHorizontalAlign != m_previewItem.text_horizontal_align)) ||
+        (m_textEditingBounds.has_value() && canConstrainAutomaticWidth() &&
+         previousHorizontalAlign != m_previewItem.text_horizontal_align);
+    updatePreviewLayout(baseFont, textLayoutChanged);
+    updateRegion += editingRegion(baseFont, sceneInfo);
+    return updateRegion;
+}
+
+void SnowCanvasTextEditorSession::updateGeometry(const QFont& baseFont,
+                                                 const SceneDisplayInfo& sceneInfo) {
+    Q_UNUSED(sceneInfo);
+    updatePreviewFromState(baseFont);
+}
+
+bool SnowCanvasTextEditorSession::setCursorFromViewPosition(const QFont& baseFont,
+                                                            const SceneDisplayInfo& sceneInfo,
+                                                            const QPointF& viewPosition,
+                                                            bool keepSelection) {
+    if (!m_hasPreview) {
+        return false;
+    }
+
+    const bool clearedPreedit = m_draft.ensureNoPreeditForDirectEdit();
+    const int position = snow_canvas_text_editor_view::cursorPositionForViewPosition(
+        editableItem(baseFont), baseFont, sceneInfo, viewPosition, m_draft.text());
+    const bool cursorChanged = m_draft.setCursorPosition(position, keepSelection);
+    if (clearedPreedit) {
+        updatePreviewFromState(baseFont);
+    }
+    return clearedPreedit || cursorChanged;
+}
+
+SnowCanvasTextEditorSession::KeyResult
+SnowCanvasTextEditorSession::handleKeyPress(QKeyEvent* event, const QFont& baseFont,
+                                            const SceneDisplayInfo& sceneInfo,
+                                            bool deleteTextAfterCursor) {
+    KeyResult result;
+    if (!m_hasPreview || event == nullptr) {
+        return result;
+    }
+
+    if (isDistanceValue()) {
+        if (event->key() == Qt::Key_Escape) {
+            result.handled = true;
+            result.command = EventCommand::Cancel;
+            return result;
+        }
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            result.handled = true;
+            result.command = EventCommand::Commit;
+            return result;
+        }
+    }
+    const snow_canvas_text_editor_input::KeyResult commandResult =
+        snow_canvas_text_editor_input::handleKeyPress(
+            event, m_draft,
+            [this, &baseFont, &sceneInfo](QTextCursor::MoveOperation operation,
+                                          QTextCursor::MoveMode mode) {
+                return moveCursor(operation, mode, baseFont, sceneInfo);
+            },
+            deleteTextAfterCursor || isDistanceValue());
+    result.handled = commandResult.handled;
+    result.changed = commandResult.changed;
+    switch (commandResult.command) {
+    case snow_canvas_text_editor_input::EventCommand::Commit:
+        result.command = EventCommand::Commit;
+        break;
+    case snow_canvas_text_editor_input::EventCommand::DeleteElement:
+        result.command = EventCommand::DeleteElement;
+        break;
+    case snow_canvas_text_editor_input::EventCommand::None:
+    default:
+        break;
+    }
+
+    if (result.changed) {
+        updatePreviewFromState(baseFont);
+    }
+    return result;
+}
+
+bool SnowCanvasTextEditorSession::handleInputMethodEvent(QInputMethodEvent* event,
+                                                         const QFont& baseFont) {
+    if (!m_hasPreview || event == nullptr) {
+        return false;
+    }
+
+    const bool changed = m_draft.handleInputMethodEvent(*event);
+    if (changed) {
+        updatePreviewFromState(baseFont);
+    }
+    return changed;
+}
+
+QVariant SnowCanvasTextEditorSession::inputMethodQuery(Qt::InputMethodQuery query,
+                                                       const QFont& baseFont,
+                                                       const SceneDisplayInfo& sceneInfo) const {
+    if (!m_hasPreview) {
+        return {};
+    }
+
+    switch (query) {
+    case Qt::ImEnabled:
+        return true;
+    case Qt::ImHints:
+        return static_cast<int>(isDistanceValue() ? Qt::ImhFormattedNumbersOnly : Qt::ImhMultiLine);
+    case Qt::ImCursorRectangle:
+        return snow_canvas_text_editor_view::cursorRect(editableItem(baseFont), baseFont, sceneInfo,
+                                                        m_draft.displayText(),
+                                                        m_draft.inputMethodCursorPosition());
+    case Qt::ImCursorPosition:
+        return m_draft.inputMethodCursorPosition();
+    case Qt::ImAnchorPosition:
+        return m_draft.inputMethodAnchorPosition();
+    case Qt::ImSurroundingText:
+        return m_draft.displayText();
+    case Qt::ImCurrentSelection:
+        return m_draft.inputMethodCurrentSelection();
+    case Qt::ImFont:
+        return snow_canvas_text_editor_view::inputMethodFont(m_previewItem, baseFont, sceneInfo);
+    default:
+        return {};
+    }
+}
+
+void SnowCanvasTextEditorSession::renderEditorOverlay(QPainter& painter, const QFont& baseFont,
+                                                      const SceneDisplayInfo& sceneInfo,
+                                                      bool caretVisible) const {
+    if (!m_hasPreview) {
+        return;
+    }
+
+    snow_canvas_text_editor_view::renderOverlay(painter, editableItem(baseFont), m_draft, baseFont,
+                                                sceneInfo, caretVisible);
+}
+
+void SnowCanvasTextEditorSession::resetState() {
+    m_canvasAnchor = {};
+    m_elementId = {};
+    m_arrowId = {};
+    m_bubbleId = {};
+    m_bubbleInfo = {};
+    m_minimumGraphemeWidth = 1.0;
+    m_textInkReserve = 0.0;
+    m_arrowWidth = 0.0;
+    m_hasExistingElement = false;
+    m_previewItem = SnowCanvasSceneItem{};
+    m_hasPreview = false;
+    m_previewAutoResize = false;
+    m_styleChanged = false;
+    m_draft.reset();
+    m_distanceSuffix.clear();
+    m_initialDistanceValue.clear();
+}
+
+void SnowCanvasTextEditorSession::releaseRetainedState() {
+    resetState();
+    m_draft.releaseRetainedState();
+    m_bubbleLayouts.clear();
+}
+
+void SnowCanvasTextEditorSession::invalidateFontMetrics(const QFont& baseFont) {
+    m_bubbleLayouts.clear();
+    updatePreviewLayout(baseFont, true);
+}
+
+void SnowCanvasTextEditorSession::updatePreviewLayout(const QFont& baseFont, bool forceLayout) {
+    if (!m_hasPreview) {
+        return;
+    }
+
+    const QString text = presentationText();
+    // Persisted engine geometry remains authoritative until a text or font input changes.
+    if (!forceLayout && snow_canvas_text::textFromSceneItem(m_previewItem) == text) {
+        return;
+    }
+
+    if (snow_canvas_element_id::hasElementId(m_bubbleId)) {
+        snow_canvas_text::copyTextToSceneItem(m_previewItem, text);
+        const auto metrics = m_bubbleLayouts.graphemes(text, baseFont, m_previewItem);
+        m_minimumGraphemeWidth = metrics.minimumWidth;
+        m_textInkReserve = metrics.inkReserve;
+        double bodyWidth = 0.0;
+        double bodyHeight = 0.0;
+        double contentWidth = 0.0;
+        double contentHeight = 0.0;
+        if (snow_speech_bubble_resolve_text_layout(&m_bubbleInfo, m_minimumGraphemeWidth,
+                                                   m_textInkReserve, 0.0, &bodyWidth, &bodyHeight,
+                                                   &contentWidth, &contentHeight) != SNOW_OK) {
+            return;
+        }
+        const auto wrapped = m_bubbleLayouts.wrapped(text, baseFont, m_previewItem, contentWidth);
+        if (snow_speech_bubble_resolve_text_layout(
+                &m_bubbleInfo, m_minimumGraphemeWidth, m_textInkReserve, wrapped.layout.height(),
+                &bodyWidth, &bodyHeight, &contentWidth, &contentHeight) != SNOW_OK) {
+            return;
+        }
+        const double dx = (bodyWidth - m_bubbleInfo.bubble_body_width) / 2.0;
+        const double dy = (bodyHeight - m_bubbleInfo.bubble_body_height) / 2.0;
+        const double cos = std::cos(m_bubbleInfo.rotation);
+        const double sin = std::sin(m_bubbleInfo.rotation);
+        m_previewItem.center_x = m_bubbleInfo.center_x + dx * cos - dy * sin;
+        m_previewItem.center_y = m_bubbleInfo.center_y + dx * sin + dy * cos;
+        m_previewItem.width = contentWidth;
+        m_previewItem.height = contentHeight;
+        m_previewItem.content_width = wrapped.content.width();
+        m_previewItem.content_height = wrapped.layout.height();
+        m_previewItem.rotation = m_bubbleInfo.rotation;
+        m_previewItem.text_ink_reserve = m_textInkReserve;
+        m_bubbleInfo.bubble_body_width = bodyWidth;
+        m_bubbleInfo.bubble_body_height = bodyHeight;
+        m_bubbleInfo.center_x = m_previewItem.center_x;
+        m_bubbleInfo.center_y = m_previewItem.center_y;
+        m_canvasAnchor = QPointF(m_previewItem.center_x, m_previewItem.center_y);
+        return;
+    }
+    if (snow_canvas_element_id::hasElementId(m_arrowId)) {
+        snow_canvas_text::copyTextToSceneItem(m_previewItem, text);
+        const snow_canvas_text_layout::TextMeasuredLayout natural =
+            snow_canvas_text_layout::measureNaturalTextLayout(text, baseFont, m_previewItem);
+        const double maximum = qMax(m_arrowWidth * 0.7, m_previewItem.font_size * 11.0);
+        m_previewItem.width =
+            isDistanceValue() ? natural.layout.width() : qMin(natural.layout.width(), maximum);
+        const snow_canvas_text_layout::TextMeasuredLayout wrapped =
+            snow_canvas_text_layout::measureWrappedTextLayout(text, baseFont, m_previewItem,
+                                                              m_previewItem.width);
+        m_previewItem.height = wrapped.layout.height();
+        m_previewItem.content_width = wrapped.content.width();
+        m_previewItem.content_height = wrapped.content.height();
+        m_previewItem.rotation = 0.0;
+        m_previewItem.center_x = m_canvasAnchor.x();
+        m_previewItem.center_y = m_canvasAnchor.y();
+        return;
+    }
+    const auto maximumWidth = snow_canvas_text_edit_geometry::automaticTextWidthLimit(
+        m_previewItem, m_canvasAnchor, m_textEditingBounds);
+    snow_canvas_text::updatePreviewFromEditorText(m_previewItem, text, m_previewAutoResize,
+                                                  baseFont, maximumWidth);
+    updatePreviewAnchor();
+}
+
+bool SnowCanvasTextEditorSession::canConstrainAutomaticWidth() const {
+    return m_hasPreview && m_previewAutoResize &&
+           !snow_canvas_element_id::hasElementId(m_arrowId) &&
+           !snow_canvas_element_id::hasElementId(m_bubbleId) &&
+           std::abs(m_previewItem.rotation) <= std::numeric_limits<double>::epsilon();
+}
+
+void SnowCanvasTextEditorSession::updatePreviewAnchor() {
+    if (!m_hasPreview) {
+        return;
+    }
+
+    const QPointF center =
+        snow_canvas_text_edit_geometry::centerForTopAnchor(m_previewItem, m_canvasAnchor);
+    m_previewItem.center_x = center.x();
+    m_previewItem.center_y = center.y();
+}
+
+bool SnowCanvasTextEditorSession::moveCursor(QTextCursor::MoveOperation operation,
+                                             QTextCursor::MoveMode mode, const QFont& baseFont,
+                                             const SceneDisplayInfo& sceneInfo) {
+    const bool clearedPreedit = m_draft.ensureNoPreeditForDirectEdit();
+    const int position = snow_canvas_text_editor_view::movedCursorPosition(
+        editableItem(baseFont), baseFont, sceneInfo, m_draft.text(), m_draft.cursorPosition(),
+        operation, mode);
+    return m_draft.setCursorPosition(position, mode == QTextCursor::KeepAnchor) || clearedPreedit;
+}

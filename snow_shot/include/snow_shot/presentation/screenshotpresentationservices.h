@@ -1,0 +1,112 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTPRESENTATIONSERVICES_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTPRESENTATIONSERVICES_H
+
+#include "snow_shot/presentation/screenshotsmartselectiontransition.h"
+#include "snow_shot/presentation/screenshotpresentationframescheduler.h"
+#include "snow_draw_engine_qt/snow_canvas_types.h"
+#include "snow_shot/presentation/screenshotuipreferences.h"
+#include "snow_shot/shortcuts/shortcutbinding.h"
+
+#include <QPoint>
+#include <QPointF>
+#include <QMap>
+#include <QSet>
+#include <QRect>
+#include <QRectF>
+#include <QStringList>
+
+#include <optional>
+#include <functional>
+#include <memory>
+
+struct ScreenshotCaptureState;
+struct ScreenshotColorPickerContext;
+class ScreenshotDisplaySession;
+class ScreenshotGeometryMapper;
+class ScreenshotInteractionState;
+class ScreenshotIntelligentSelectionModel;
+class ScreenshotOverlayCoordinator;
+class ScreenshotOverlayWindow;
+class ScreenshotSelectionModel;
+class ScreenshotToolbarPresenter;
+struct ScreenshotToolbarPresentationState;
+
+struct ScreenshotPresentationServicesContext {
+    ScreenshotCaptureState& captureState;
+    ScreenshotOverlayCoordinator& overlayCoordinator;
+    ScreenshotToolbarPresenter& toolbarPresenter;
+    const ScreenshotGeometryMapper& geometry;
+    ScreenshotDisplaySession& displaySession;
+    ScreenshotInteractionState& interaction;
+    ScreenshotSelectionModel& selection;
+    ScreenshotIntelligentSelectionModel& intelligentSelection;
+    QSet<SnowCanvasTool> quickSelectionDisabledTools;
+    std::function<void()> stateChanged = [] {};
+    // Optional monotonic clock for deterministic frame scheduling tests.
+    std::function<qint64()> monotonicNanoseconds = {};
+    std::function<void(ScreenshotOverlayWindow*, const QPointF&)> presentColorPicker = {};
+    ScreenshotPresentationFrameScheduler::Backend frameSchedulerBackend =
+        ScreenshotPresentationFrameScheduler::Backend::Automatic;
+    std::function<void(const QPointF&)> presentSelectionDragColorPicker = {};
+};
+
+class ScreenshotPresentationServices final {
+  public:
+    explicit ScreenshotPresentationServices(ScreenshotPresentationServicesContext context);
+    ~ScreenshotPresentationServices();
+
+    void hideToolbar();
+    void hideMainToolbar();
+    void showToolbar();
+    void showSelectionToolbar();
+    void moveToolbar();
+    void repositionToolbarForContentChange();
+    void raiseToolbarForCanvasInteraction();
+    void setSelectionToolbarHovered(bool hovered);
+    void setUiPreferences(const ScreenshotUiPreferences& preferences);
+    void setGuideLinesVisible(bool visible);
+    void setQuickSelectionDisabledTools(const QSet<SnowCanvasTool>& tools);
+    void reloadConfiguredShortcuts();
+
+    void setSelectionMovementActive(bool active);
+    // Release capture-owned snapshots and pending frames while retaining the scheduler.
+    void resetPresentation();
+    void updateOverlayState();
+    // Continuous drags mutate the model immediately and prepare presentation at the frame boundary.
+    void requestSelectionDragPresentation();
+    // Wheel edits retain every model delta; only their presentation is coalesced.
+    void requestSelectionEffectPresentation();
+    void updatePointerPresentation(ScreenshotOverlayWindow* overlay, const QPointF& localPosition);
+    void requestColorPickerPresentation(ScreenshotOverlayWindow* overlay,
+                                        const QPointF& localPosition);
+    void requestSelectionDragColorPickerPresentation(const QPointF& canvasPosition);
+    void flushColorPickerPresentation();
+    void discardColorPickerPresentation();
+    void flushPendingFrame();
+    void updateOverlayCursors() const;
+#ifdef SNOW_SHOT_BENCH_INTERNALS
+    [[nodiscard]] const ScreenshotPresentationFrameScheduler& frameSchedulerForTesting() const;
+#endif
+
+    [[nodiscard]] ScreenshotColorPickerContext colorPickerContext() const;
+
+  private:
+    enum class Preparation { Unchanged, Frame, Immediate };
+    struct State;
+    [[nodiscard]] Preparation prepareOverlayState();
+    void scheduleFrame();
+    [[nodiscard]] qint64 nowNanoseconds() const;
+    void presentOverlayState(const QRectF& selection, bool semanticChanged, bool geometryChanged);
+    [[nodiscard]] ScreenshotToolbarPresentationState toolbarPresentationState() const;
+
+    ScreenshotPresentationServicesContext m_context;
+    std::unique_ptr<State> m_state;
+    ScreenshotSmartSelectionTransition m_smartSelectionTransition;
+    ScreenshotUiPreferences m_uiPreferences;
+    bool m_guideLinesVisible = false;
+    std::optional<snow_shot::shortcuts::ShortcutBindingMap> m_configuredShortcuts;
+    bool m_selectionToolbarHovered = false;
+    bool m_selectionMovementActive = false;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTPRESENTATIONSERVICES_H

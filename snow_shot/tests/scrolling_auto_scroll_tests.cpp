@@ -1,0 +1,229 @@
+#include "presentation/capture/screenshotscrollingautoscroller.h"
+#include "presentation/capture/scrollingstepinput.h"
+#include "snow_shot/platform/windows/scrollinput.h"
+
+#include <QCoreApplication>
+#include <QMetaObject>
+#include <QProcess>
+
+#if defined(Q_OS_WIN)
+#include <qt_windows.h>
+#include <windowsx.h>
+#endif
+
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+#if defined(Q_OS_WIN)
+const QRect nativeSelection(-30000, -30000, 200, 200);
+
+LRESULT CALLBACK scrollTargetProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    static int steps = 0;
+    if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL) {
+        const bool expectedAxis = steps == 0 ? message == WM_MOUSEWHEEL : message == WM_MOUSEHWHEEL;
+        const int expectedDelta = steps == 0 ? -120 : 120;
+        const QPoint position(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        if (!expectedAxis || GET_WHEEL_DELTA_WPARAM(wParam) != expectedDelta ||
+            position != nativeSelection.center() || GET_KEYSTATE_WPARAM(wParam) != 0 ||
+            GetParent(window) == nullptr) {
+            PostQuitMessage(1);
+        } else if (++steps == 2) {
+            PostQuitMessage(0);
+        }
+        return 0;
+    }
+    if (message == WM_TIMER) {
+        PostQuitMessage(2);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int runNativeTarget(bool withTransparentOverlay, bool transparentTarget, bool layeredTarget) {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = scrollTargetProcedure;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = L"SnowAutoScrollTestTarget";
+    require(RegisterClassW(&windowClass) != 0, "native target class must register");
+    const DWORD targetStyles = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                               (transparentTarget ? WS_EX_TRANSPARENT : 0) |
+                               (layeredTarget ? WS_EX_LAYERED : 0);
+    const HWND window =
+        CreateWindowExW(targetStyles, windowClass.lpszClassName, L"", WS_POPUP, nativeSelection.x(),
+                        nativeSelection.y(), nativeSelection.width(), nativeSelection.height(),
+                        nullptr, nullptr, instance, nullptr);
+    require(window != nullptr, "offscreen native target must be created");
+    if (layeredTarget)
+        require(SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA),
+                "layered input target must be opaque");
+    const HWND child = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_CHILD | WS_VISIBLE, 0,
+                                       0, 200, 200, window, nullptr, instance, nullptr);
+    require(child != nullptr, "native scrollable child must be created");
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    // Reproduce system overlays such as Shell Handwriting Canvas: visible and enabled,
+    // covering the target in Z order, but transparent to real mouse input.
+    HWND overlay = nullptr;
+    if (withTransparentOverlay) {
+        overlay = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            windowClass.lpszClassName, L"", WS_POPUP, nativeSelection.x(), nativeSelection.y(),
+            nativeSelection.width(), nativeSelection.height(), nullptr, nullptr, instance, nullptr);
+        require(overlay != nullptr, "input-transparent overlay must be created");
+        require(SetLayeredWindowAttributes(overlay, 0, 1, LWA_ALPHA),
+                "input-transparent overlay must be layered");
+        ShowWindow(overlay, SW_SHOWNOACTIVATE);
+    }
+    SetTimer(window, 1, 10000, nullptr);
+    std::cout << "ready" << std::endl;
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    if (overlay != nullptr)
+        DestroyWindow(overlay);
+    DestroyWindow(window);
+    return static_cast<int>(message.wParam);
+}
+
+void nativeWheelMessagesReachTheSelection(bool withTransparentOverlay, bool transparentTarget,
+                                          bool layeredTarget) {
+    QProcess target;
+    QStringList arguments{QStringLiteral("--native-target")};
+    if (withTransparentOverlay)
+        arguments.append(QStringLiteral("--transparent-overlay"));
+    if (transparentTarget)
+        arguments.append(QStringLiteral("--transparent-target"));
+    if (layeredTarget)
+        arguments.append(QStringLiteral("--layered-target"));
+    target.start(QCoreApplication::applicationFilePath(), arguments);
+    require(target.waitForStarted(10000), "native target process must start");
+    require(target.waitForReadyRead(10000) && target.readAllStandardOutput().contains("ready"),
+            "native target must be ready before scrolling");
+    using namespace snow_shot::platform::windows;
+    require(sendScrollingWheelStep({}, QPoint(0, -120)).status ==
+                ScrollInputResult::Status::InvalidRequest,
+            "invalid automatic scroll requests must be distinguishable from delivery failures");
+    require(sendScrollingWheelStep(nativeSelection, QPoint(0, -120)).status ==
+                ScrollInputResult::Status::Posted,
+            "successful wheel posting must be reported");
+    snow_shot::platform::windows::sendScrollingWheelStep(nativeSelection, QPoint(120, 0));
+    require(target.waitForFinished(10000) && target.exitStatus() == QProcess::NormalExit &&
+                target.exitCode() == 0,
+            "native child must receive vertical/down and horizontal/right with signed coordinates");
+}
+#endif
+} // namespace
+
+int main(int argc, char** argv) {
+    QCoreApplication application(argc, argv);
+#if defined(Q_OS_WIN)
+    if (application.arguments().contains(QStringLiteral("--native-target"))) {
+        return runNativeTarget(
+            application.arguments().contains(QStringLiteral("--transparent-overlay")),
+            application.arguments().contains(QStringLiteral("--transparent-target")),
+            application.arguments().contains(QStringLiteral("--layered-target")));
+    }
+    for (const bool withOverlay : {false, true}) {
+        nativeWheelMessagesReachTheSelection(withOverlay, false, false);
+        nativeWheelMessagesReachTheSelection(withOverlay, true, false);
+        nativeWheelMessagesReachTheSelection(withOverlay, false, true);
+    }
+#endif
+    using snow_shot::capture_detail::scrollingStepDelta;
+    require(scrollingStepDelta(QStringLiteral("up")) == QPoint(0, 120) &&
+                scrollingStepDelta(QStringLiteral("down")) == QPoint(0, -120) &&
+                scrollingStepDelta(QStringLiteral("left")) == QPoint(-120, 0) &&
+                scrollingStepDelta(QStringLiteral("right")) == QPoint(120, 0),
+            "four directions each map to exactly one native notch");
+    require(!scrollingStepDelta(QStringLiteral("diagonal")),
+            "unknown directions cannot dispatch input");
+    using Mode = ScreenshotScrollingRecognitionMode;
+    int steps = 0;
+    QRect target;
+    QPoint delta;
+    snow_shot::capture_detail::ScreenshotScrollingAutoScroller scroller(
+        [&](const QRect& selection, const QPoint& wheelDelta) {
+            ++steps;
+            target = selection;
+            delta = wheelDelta;
+        });
+    auto* timer = scroller.findChild<QTimer*>();
+    require(timer && timer->interval() == 200 && timer->timerType() == Qt::PreciseTimer,
+            "auto-scroll must use a precise 200 ms timer");
+    scroller.setIntervalMs(1);
+    require(timer->interval() == 128 && !timer->isActive(),
+            "interval changes must clamp the minimum without starting an inactive timer");
+    scroller.setIntervalMs(2000);
+    require(timer->interval() == 1000 && !timer->isActive(),
+            "interval changes must clamp the maximum without starting an inactive timer");
+    scroller.setIntervalMs(350);
+    const auto tick = [&]() {
+        require(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection),
+                "timer timeout must be invokable without wall-clock waits");
+    };
+    scroller.setEnabled(true);
+    tick();
+    require(steps == 0 && !timer->isActive(), "inactive captures must not scroll");
+    const QRect selection(-1400, -300, 800, 600);
+    scroller.start(selection, Mode::Vertical);
+    tick();
+    require(steps == 0, "new sessions must start disabled");
+    scroller.setEnabled(true);
+    require(steps == 0 && timer->isActive() && timer->interval() == 350,
+            "first step must wait for the configured interval");
+    scroller.setIntervalMs(450);
+    require(steps == 0 && timer->isActive() && timer->interval() == 450,
+            "changing an active interval must restart timing without an immediate scroll");
+    tick();
+    require(steps == 1 && target == selection && delta == QPoint(0, -120),
+            "vertical ticks must send one downward wheel notch to the physical selection");
+    tick();
+    require(steps == 2, "each timeout must scroll exactly once");
+    scroller.setMode(Mode::Horizontal);
+    tick();
+    require(steps == 3 && delta == QPoint(120, 0),
+            "horizontal ticks must send one rightward horizontal wheel notch");
+    scroller.setEnabled(false);
+    tick();
+    require(steps == 3 && !timer->isActive(), "deactivation must stop pending ticks");
+    scroller.setEnabled(true);
+    scroller.setPaused(true);
+    scroller.setIntervalMs(550);
+    require(timer->interval() == 550 && !timer->isActive(),
+            "changing a paused interval must preserve the pause");
+    tick();
+    require(steps == 3 && !timer->isActive(), "export pause must suppress scrolling");
+    const QRect movedSelection(1200, 400, 800, 600);
+    scroller.setSelection(movedSelection);
+    tick();
+    require(steps == 3 && !timer->isActive(),
+            "moving the selection must not resume paused scrolling");
+    scroller.setPaused(false);
+    tick();
+    require(steps == 4 && target == movedSelection,
+            "resume must preserve activation and target the moved selection");
+    scroller.setPaused(true);
+    scroller.setEnabled(false);
+    scroller.setPaused(false);
+    tick();
+    require(steps == 4, "resuming must not reactivate a disabled toggle");
+    scroller.setEnabled(true);
+    scroller.stop();
+    tick();
+    require(steps == 4 && !timer->isActive(), "capture termination must stop scrolling");
+    scroller.start(selection, Mode::Horizontal);
+    tick();
+    require(steps == 4 && timer->interval() == 550,
+            "capture restart must retain the interval without restoring activation");
+    return 0;
+}

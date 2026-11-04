@@ -1,0 +1,103 @@
+#include "snow_shot/platform/focusedfullscreenwindow.h"
+#include "snow_shot/platform/gamewindowclassification.h"
+
+#import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
+
+#include <vector>
+#include <QScreen>
+
+namespace snow_shot::platform {
+
+static bool focusedFullscreenWindowMatches(QScreen* target, bool gamesOnly = false) {
+    NSRunningApplication* frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (frontmost == nil || !isExternalFocusedWindowProcess(frontmost.processIdentifier)) {
+        return false;
+    }
+    const pid_t processId = frontmost.processIdentifier;
+    if (gamesOnly) {
+        NSBundle* bundle = frontmost.bundleURL ? [NSBundle bundleWithURL:frontmost.bundleURL] : nil;
+        QJsonObject metadata;
+        NSString* category = [bundle objectForInfoDictionaryKey:@"LSApplicationCategoryType"];
+        if ([category isKindOfClass:[NSString class]])
+            metadata.insert(QStringLiteral("LSApplicationCategoryType"),
+                            QString::fromNSString(category));
+        for (NSString* key in @[ @"LSSupportsGameMode", @"GCSupportsGameMode" ]) {
+            id value = [bundle objectForInfoDictionaryKey:key];
+            // Only plist Booleans count: NSNumber integers and strings are not opt-ins.
+            if (value != nil && CFGetTypeID(static_cast<CFTypeRef>(value)) == CFBooleanGetTypeID())
+                metadata.insert(QString::fromNSString(key), [value boolValue] == YES);
+        }
+        if (!isMacOSGameApplication(metadata))
+            return false;
+    }
+
+    CFArrayRef rawWindows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (rawWindows == nullptr) {
+        return false;
+    }
+    QVector<FocusedWindowSnapshot> snapshots;
+    const CFIndex windowCount = CFArrayGetCount(rawWindows);
+    snapshots.reserve(static_cast<qsizetype>(windowCount));
+    for (CFIndex index = 0; index < windowCount; ++index) {
+        const auto window = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(rawWindows, index));
+        CGRect bounds = CGRectNull;
+        const auto rectangle =
+            static_cast<CFDictionaryRef>(CFDictionaryGetValue(window, kCGWindowBounds));
+        if (rectangle == nullptr || !CGRectMakeWithDictionaryRepresentation(rectangle, &bounds) ||
+            CGRectIsEmpty(bounds) || CGRectIsNull(bounds)) {
+            continue;
+        }
+        const auto number = [window](CFStringRef key, CFNumberType type, void* value) {
+            const auto entry = static_cast<CFNumberRef>(CFDictionaryGetValue(window, key));
+            return entry != nullptr && CFNumberGetValue(entry, type, value);
+        };
+        long long owner = 0;
+        int layer = 0;
+        double alpha = 0;
+        if (!number(kCGWindowOwnerPID, kCFNumberLongLongType, &owner) ||
+            !number(kCGWindowLayer, kCFNumberIntType, &layer) ||
+            !number(kCGWindowAlpha, kCFNumberDoubleType, &alpha)) {
+            continue;
+        }
+        snapshots.push_back(
+            {owner, layer, alpha,
+             QRectF(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height)});
+    }
+    CFRelease(rawWindows);
+
+    const auto stillFocused = [processId] {
+        return NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == processId;
+    };
+    if (target)
+        return focusedWindowCoversDisplay(processId, snapshots, {QRectF(target->geometry())}) &&
+               stillFocused();
+    uint32_t displayCount = 0;
+    if (CGGetActiveDisplayList(0, nullptr, &displayCount) != kCGErrorSuccess || displayCount == 0) {
+        return false;
+    }
+    std::vector<CGDirectDisplayID> displays(displayCount);
+    if (CGGetActiveDisplayList(displayCount, displays.data(), &displayCount) != kCGErrorSuccess) {
+        return false;
+    }
+    displays.resize(displayCount);
+    QVector<QRectF> bounds;
+    bounds.reserve(static_cast<qsizetype>(displayCount));
+    for (CGDirectDisplayID display : displays) {
+        const CGRect rect = CGDisplayBounds(display);
+        bounds.push_back(QRectF(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height));
+    }
+    return focusedWindowCoversDisplay(processId, snapshots, bounds) && stillFocused();
+}
+
+bool focusedFullscreenWindowExists() {
+    return focusedFullscreenWindowMatches(nullptr);
+}
+bool focusedFullscreenGameWindowExists() {
+    return focusedFullscreenWindowMatches(nullptr, true);
+}
+bool focusedFullscreenWindowOnScreen(QScreen* screen) {
+    return screen && focusedFullscreenWindowMatches(screen);
+}
+} // namespace snow_shot::platform

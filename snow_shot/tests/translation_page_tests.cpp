@@ -1,0 +1,1498 @@
+#include "physical_key_test_support.h"
+#include "translation_test_support.h"
+#include "snow_shot/presentation/components/screenshottranslationsettingsdialog.h"
+#include "snow_shot/presentation/components/formfields.h"
+#include "widgets/modal.h"
+
+#include "snow_shot/presentation/components/contentcardwidget.h"
+#include "snow_shot/presentation/components/applicationsearchwidget.h"
+#include "snow_shot/presentation/components/maincontentheaderwidget.h"
+#include "snow_shot/presentation/components/sidebarwidget.h"
+#include "snow_shot/presentation/components/translationpagewidget.h"
+#include "snow_shot/presentation/globalshortcutmanager.h"
+#include "snow_shot/presentation/mainwindow.h"
+#include "snow_shot/presentation/languagemanager.h"
+#include "snow_shot/presentation/settings/settingsbackend.h"
+#include "snow_shot/presentation/settings/settingsruntimesession.h"
+#include "snow_shot/presentation/components/settingspagewidget.h"
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/presentation/translationpagecontroller.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/storage/settingsadapters.h"
+#include "snow_shot/shortcuts/shortcutdisplayservice.h"
+#include "snow_shot/translation/translationlanguages.h"
+#include "widgets/button.h"
+#include "widgets/input_text_edit.h"
+#include "widgets/input_number.h"
+#include "widgets/navigation_menu.h"
+#include "widgets/context_menu.h"
+#include "widgets/scroll_area.h"
+#include "widgets/select.h"
+#include "widgets/spin.h"
+#include "widgets/tabs.h"
+
+#include <QApplication>
+#include <QClipboard>
+#include <QCloseEvent>
+#include <QCursor>
+#include <QDir>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QEnterEvent>
+#include <QFileInfo>
+#include <QFontDatabase>
+#include <QInputMethodEvent>
+#include <QKeyEvent>
+#include <QMimeData>
+#include <QLayout>
+#include <QLabel>
+#include <QSet>
+#include <QScrollBar>
+#include <QTemporaryDir>
+#include <QTranslator>
+#include <algorithm>
+#include <memory>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+using namespace translation_tests;
+using namespace adqt::widgets;
+namespace settings = snow_shot::presentation::settings;
+namespace styles = snow_shot::presentation::styles;
+namespace form_fields = snow_shot::presentation::components::form_fields;
+
+namespace {
+template <typename T> T* child(QObject& owner, const char* name) {
+    auto* widget = owner.findChild<T*>(QString::fromLatin1(name));
+    require(widget != nullptr, name);
+    return widget;
+}
+
+AdContextMenu* visibleTranslationActionsMenu(QObject& owner) {
+    for (auto* menu :
+         owner.findChildren<AdContextMenu*>(QStringLiteral("translationActionsMenu"))) {
+        if (menu->isPopupVisible() && !menu->isRetiring()) {
+            return menu;
+        }
+    }
+    return nullptr;
+}
+
+void key(QWidget* widget, int value, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    PhysicalKeyEvent press(QEvent::KeyPress, value, modifiers);
+    QApplication::sendEvent(widget, &press);
+    PhysicalKeyEvent release(QEvent::KeyRelease, value, modifiers);
+    QApplication::sendEvent(widget, &release);
+    flushEvents();
+}
+
+void additionalLanguageSelectors() {
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    Server server;
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    auto& service = snow_shot::translation::TranslationService::forClient(client, configuration,
+                                                                          QLocale::English);
+    const auto previous = service.preferences();
+    snow_shot::presentation::GlobalShortcutManager shortcuts;
+    settings::BuiltInSettingsBackend backend(shortcuts);
+    backend.setTranslationService(&service);
+    settings::SettingsRuntimeSession runtime(settings::builtInSettingsRegistry(), backend);
+    auto* modal = snow_shot::presentation::createScreenshotTranslationSettingsDialog(service, &page,
+                                                                                     &page, {});
+    const QList<AdSelect*> selectors{
+        child<AdSelect>(page, "translationSourceLanguage"),
+        child<AdSelect>(page, "translationTargetLanguage"),
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationSourceLanguage"),
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationTargetLanguage"),
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationSecondaryTargetLanguage")};
+    struct Language {
+        QString code;
+        QStringList labels;
+    };
+    const QList<Language> languages{
+        {QStringLiteral("hi"),
+         {QStringLiteral("Hindi"), QStringLiteral("印地语"), QStringLiteral("印地語")}},
+        {QStringLiteral("th"),
+         {QStringLiteral("Thai"), QStringLiteral("泰语"), QStringLiteral("泰語")}},
+        {QStringLiteral("vi"),
+         {QStringLiteral("Vietnamese"), QStringLiteral("越南语"), QStringLiteral("越南語")}}};
+    const QStringList locales{QStringLiteral("en_US"), QStringLiteral("zh_CN"),
+                              QStringLiteral("zh_TW")};
+    for (const auto& language : languages) {
+        auto preferences = service.preferences();
+        preferences.sourceLanguage = language.code;
+        preferences.targetLanguage = language.code;
+        preferences.secondaryTargetLanguage = language.code;
+        require(service.savePreferences(preferences), "select additional languages in shared UI");
+        for (int index = 0; index < locales.size(); ++index) {
+            QTranslator translator;
+            require(translator.load(QStringLiteral("snow_shot_%1.qm").arg(locales[index]),
+                                    QStringLiteral(SNOW_SHOT_TEST_TRANSLATIONS_DIR)),
+                    "load localized additional language names");
+            QCoreApplication::installTranslator(&translator);
+            QEvent languageChange(QEvent::LanguageChange);
+            QApplication::sendEvent(&page, &languageChange);
+            QApplication::sendEvent(modal->contentWidget(), &languageChange);
+            flushEvents();
+            const QStringList freeLabels{QStringLiteral("Free Translation"),
+                                         QStringLiteral("免费翻译"), QStringLiteral("免費翻譯")};
+            const auto checkFreeLabel = [&](const auto& options) {
+                require(std::count_if(options.cbegin(), options.cend(),
+                                      [&](const auto& option) {
+                                          return option.value ==
+                                                     QStringLiteral("free-translation") &&
+                                                 option.label == freeLabels[index];
+                                      }) == 1,
+                        "Free Translation retranslates in every shared service selector");
+            };
+            checkFreeLabel(child<AdSelect>(page, "translationService")->options());
+            checkFreeLabel(child<AdSelect>(*modal->contentWidget(), "screenshotTranslationService")
+                               ->options());
+            checkFreeLabel(
+                runtime.dynamicSelectOptions(settings::SettingsSelectBinding::TranslationService));
+            const auto checkOptions = [&](const auto& options) {
+                require(std::count_if(options.cbegin(), options.cend(),
+                                      [&](const auto& option) {
+                                          return option.value == language.code &&
+                                                 option.label == language.labels[index];
+                                      }) == 1,
+                        "all translation selectors expose localized additional language names");
+            };
+            for (auto* selector : selectors) {
+                checkOptions(selector->options());
+                require(selector->currentValue() == language.code,
+                        "language changes preserve additional language selections");
+            }
+            for (const auto& id : {QStringLiteral("translation.source-language"),
+                                   QStringLiteral("translation.primary-target-language"),
+                                   QStringLiteral("translation.secondary-target-language")})
+                checkOptions(runtime.options(id).values);
+            QCoreApplication::removeTranslator(&translator);
+            flushEvents();
+        }
+    }
+    require(service.savePreferences(previous), "restore shared translation preferences");
+}
+
+void sharedServiceSelectors() {
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    const QString customKey = QStringLiteral("api_configuration/custom_models");
+    const auto previousModels = configuration.value(customKey);
+    auto previousPreferences = snow_shot::storage::ScreenshotTranslationSettings().configuration();
+    // The schema's unset default target is not a valid explicit selection to restore.
+    if (previousPreferences.targetLanguage.isEmpty())
+        previousPreferences.targetLanguage =
+            snow_shot::translation::defaultTranslationTargetLanguage(
+                snow_shot::presentation::LanguageManager::instance().currentLocale());
+    Server server;
+    server.holdModels = true;
+    snow_shot::CustomAiModelConfiguration model{
+        QStringLiteral("22222222-2222-4222-8222-222222222222"),
+        QStringLiteral("Custom vision translator"),
+        server.url() + QStringLiteral("/v1"),
+        {},
+        QStringLiteral("provider-model"),
+        true};
+    require(configuration.setValue(customKey, snow_shot::customAiModelsToJson({model})),
+            "configure custom vision model");
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    auto& service = snow_shot::translation::TranslationService::forClient(client, configuration,
+                                                                          QLocale::English);
+    require(service.savePreferences(
+                {QStringLiteral("auto"), QStringLiteral("ja"), model.selectionId()}),
+            "select shared custom model");
+    snow_shot::presentation::GlobalShortcutManager shortcuts;
+    settings::BuiltInSettingsBackend backend(shortcuts);
+    backend.setTranslationService(&service);
+    const auto& registry = settings::builtInSettingsRegistry();
+    settings::SettingsRuntimeSession runtime(registry, backend);
+    SettingsPageWidget settingsPage(registry, QStringLiteral("text-recognition-translation"),
+                                    runtime);
+    const auto* definition =
+        registry.catalog().page(QStringLiteral("text-recognition-translation"));
+    require(definition->sections[1].id == QStringLiteral("interface-text-recognition") &&
+                definition->sections[2].id == QStringLiteral("translation-settings") &&
+                definition->sections[2].items.size() == 8 &&
+                definition->sections[2].items[0].id ==
+                    QStringLiteral("translation.source-language") &&
+                definition->sections[2].items[1].id ==
+                    QStringLiteral("translation.primary-target-language") &&
+                definition->sections[2].items[2].id ==
+                    QStringLiteral("translation.secondary-target-language") &&
+                definition->sections[2].items[3].id ==
+                    QStringLiteral("translation.language-detection-confidence-threshold") &&
+                definition->sections[2].items[4].id == QStringLiteral("translation.service"),
+            "expanded Translation Settings follows Text background in the requested order");
+    require(runtime.state(QStringLiteral("translation.secondary-target-language")).acceptedValue ==
+                QStringLiteral("en"),
+            "generated settings shows shared secondary default");
+    auto* modal = snow_shot::presentation::createScreenshotTranslationSettingsDialog(service, &page,
+                                                                                     &page, {});
+    int sharedEdits = 0;
+    int sharedCommits = 0;
+    const auto watchSharedFields = [&](AdModal* editor) {
+        const auto fields = editor->contentWidget()->findChildren<form_fields::FormField*>();
+        require(fields.size() == 6, "screenshot settings uses six shared fields");
+        for (auto* field : fields) {
+            require(!field->item()->isTouched() && !field->item()->isDirty(),
+                    "screenshot settings initializes a clean AdForm baseline");
+            QObject::connect(field, &form_fields::FormField::valueEdited, editor,
+                             [&sharedEdits] { ++sharedEdits; });
+            QObject::connect(field, &form_fields::FormField::valueCommitted, editor,
+                             [&sharedCommits] { ++sharedCommits; });
+        }
+    };
+    watchSharedFields(modal);
+    auto* primaryTarget =
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationTargetLanguage");
+    auto* secondaryTarget =
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationSecondaryTargetLanguage");
+    auto* confidenceThreshold = child<adqt::widgets::AdInputNumber>(
+        *modal->contentWidget(), "screenshotTranslationLanguageDetectionConfidenceThreshold");
+    const QString confidenceId =
+        QStringLiteral("translation.language-detection-confidence-threshold");
+    settingsPage.reveal({QStringLiteral("text-recognition-translation"),
+                         QStringLiteral("translation-settings"), confidenceId});
+    auto* generatedConfidence = settingsPage.findChild<adqt::widgets::AdInputNumber*>(
+        settings::generatedObjectName(QStringLiteral("settings-control"), confidenceId));
+    require(generatedConfidence != nullptr && generatedConfidence->minimum() == 30 &&
+                generatedConfidence->maximum() == 100 && generatedConfidence->singleStep() == 1 &&
+                confidenceThreshold->minimum() == 30 && confidenceThreshold->maximum() == 100 &&
+                confidenceThreshold->singleStep() == 1 && confidenceThreshold->value() == 60 &&
+                runtime.state(confidenceId).acceptedValue.toInt() == 60,
+            "both confidence editors expose the shared default and percentage bounds");
+    const auto primaryOptions = primaryTarget->options();
+    const auto secondaryOptions = secondaryTarget->options();
+    require(primaryOptions.size() == secondaryOptions.size() &&
+                secondaryTarget->currentValue() == QStringLiteral("en"),
+            "dialog target options match and secondary defaults to English");
+    for (int index = 0; index < primaryOptions.size(); ++index) {
+        const auto& primary = primaryOptions[index];
+        const auto& secondary = secondaryOptions[index];
+        require(primary.value == secondary.value && primary.label == secondary.label &&
+                    primary.group == secondary.group,
+                "dialog targets share values, translated labels, and grouping");
+    }
+    auto* pageSelect = child<AdSelect>(page, "translationService");
+    auto* screenshotSelect =
+        child<AdSelect>(*modal->contentWidget(), "screenshotTranslationService");
+    const auto compare = [&] {
+        const auto first = pageSelect->options();
+        const auto second = screenshotSelect->options();
+        require(first.size() == second.size(), "both translation views expose the same catalog");
+        for (int i = 0; i < first.size(); ++i)
+            require(first[i].value == second[i].value && first[i].label == second[i].label &&
+                        first[i].group == second[i].group,
+                    "service identity, label, and group match across views");
+        const auto mainOptions =
+            runtime.dynamicSelectOptions(settings::SettingsSelectBinding::TranslationService);
+        require(mainOptions.size() == first.size(),
+                "main settings exposes the shared service catalog");
+        for (int i = 0; i < first.size(); ++i)
+            require(mainOptions[i].value == first[i].value &&
+                        mainOptions[i].label == first[i].label,
+                    "main settings shares service identities, labels, and ordering");
+    };
+    compare();
+    require(pageSelect->isEnabled() && screenshotSelect->isEnabled() &&
+                pageSelect->currentValue().toString() == model.selectionId() &&
+                screenshotSelect->currentValue().toString() == model.selectionId(),
+            "custom vision service is selectable in both views during builtin discovery");
+    model.name = QStringLiteral("Renamed custom translator");
+    require(configuration.setValue(customKey, snow_shot::customAiModelsToJson({model})),
+            "rename configured model");
+    compare();
+    require(pageSelect->options().first().label == model.name,
+            "open selectors reflect model edits");
+    waitUntil([&] { return server.modelRequests == 1; }, "both views share one pending discovery");
+    require(runtime.options(QStringLiteral("translation.service")).loading,
+            "main settings tracks shared service discovery");
+    server.respondModels();
+    waitUntil([&] { return !service.loadingModels(); }, "finish discovery for both views");
+    require(!runtime.options(QStringLiteral("translation.service")).loading &&
+                runtime.options(QStringLiteral("translation.service")).error.isEmpty(),
+            "completed catalog clears loading and feedback in main settings");
+    compare();
+    QSet<QString> completedGroups;
+    QString currentGroup;
+    for (const auto& option : pageSelect->options()) {
+        if (option.group != currentGroup) {
+            require(!completedGroups.contains(option.group),
+                    "each translation model group appears only once");
+            completedGroups.insert(currentGroup);
+            currentGroup = option.group;
+        }
+    }
+    const auto options = pageSelect->options();
+    require(options.size() == 5 && options[0].value == QStringLiteral("general") &&
+                options[1].value == QStringLiteral("vision") &&
+                options[2].value == model.selectionId() && options[0].group == options[1].group &&
+                options[1].group == options[2].group &&
+                options[3].value == QStringLiteral("free-translation") &&
+                options[4].value == QStringLiteral("specialist"),
+            "both selectors show server vision-capable general models alongside custom models");
+    require(service.savePreferences({QStringLiteral("en"), QStringLiteral("fr"),
+                                     QStringLiteral("specialist"), QStringLiteral("en"), 85}),
+            "change shared preferences while the settings dialog is open");
+    flushEvents();
+    require(pageSelect->currentValue() == screenshotSelect->currentValue() &&
+                child<AdSelect>(*modal->contentWidget(), "screenshotTranslationTargetLanguage")
+                        ->currentValue()
+                        .toString() == QStringLiteral("fr") &&
+                confidenceThreshold->value() == 85 &&
+                runtime.state(confidenceId).acceptedValue.toInt() == 85,
+            "unedited dialog fields follow committed shared preferences");
+    require(service.savePreferences(
+                {QStringLiteral("auto"), QStringLiteral("ja"), model.selectionId()}),
+            "restore selected custom model before deletion");
+    require(configuration.setValue(customKey, QJsonArray{}), "remove selected model");
+    compare();
+    require(pageSelect->currentValue() == screenshotSelect->currentValue() &&
+                pageSelect->currentValue().toString() == QStringLiteral("free-translation"),
+            "both views resolve the same fallback after deletion");
+    require(
+        sharedEdits == 0 && sharedCommits == 0,
+        "catalog changes and external preferences must not report shared user edits or commits");
+    screenshotSelect->setCurrentValue(QStringLiteral("specialist"));
+    secondaryTarget->setCurrentValue(QStringLiteral("pt"));
+    confidenceThreshold->setValue(70);
+    require(service.savePreferences({QStringLiteral("en"), QStringLiteral("de"),
+                                     QStringLiteral("general"), QStringLiteral("en"), 80}),
+            "commit preferences while the screenshot dialog has a model draft");
+    require(screenshotSelect->currentValue().toString() == QStringLiteral("specialist") &&
+                pageSelect->currentValue().toString() == QStringLiteral("general") &&
+                secondaryTarget->currentValue() == QStringLiteral("pt") &&
+                confidenceThreshold->value() == 70,
+            "an uncommitted dialog edit remains local until OK");
+    QEvent languageChange(QEvent::LanguageChange);
+    QApplication::sendEvent(modal->contentWidget(), &languageChange);
+    require(confidenceThreshold->value() == 70 &&
+                service.preferences().languageDetectionConfidenceThreshold == 80,
+            "dialog retranslation preserves the confidence draft without committing it");
+    modal->reject();
+    flushEvents();
+    require(sharedEdits == 3 && sharedCommits == 0 &&
+                service.preferences().modelId == QStringLiteral("general") &&
+                service.preferences().secondaryTargetLanguage == QStringLiteral("en") &&
+                service.preferences().languageDetectionConfidenceThreshold == 80,
+            "cancelling a model draft must not commit it or replace shared preferences");
+    sharedEdits = 0;
+    modal = snow_shot::presentation::createScreenshotTranslationSettingsDialog(service, &page,
+                                                                               &page, {});
+    watchSharedFields(modal);
+    child<AdSelect>(*modal->contentWidget(), "screenshotTranslationService")
+        ->setCurrentValue(QStringLiteral("specialist"));
+    child<AdSelect>(*modal->contentWidget(), "screenshotTranslationTargetLanguage")
+        ->setCurrentValue(QStringLiteral("ja"));
+    child<AdSelect>(*modal->contentWidget(), "screenshotTranslationSecondaryTargetLanguage")
+        ->setCurrentValue(QStringLiteral("ko"));
+    child<adqt::widgets::AdInputNumber>(*modal->contentWidget(),
+                                        "screenshotTranslationLanguageDetectionConfidenceThreshold")
+        ->setValue(95);
+    require(sharedEdits == 4 && sharedCommits == 0,
+            "screenshot preference edits remain local until OK");
+    modal->acceptButton()->click();
+    flushEvents();
+    require(sharedCommits == 4 && service.preferences().modelId == QStringLiteral("specialist") &&
+                service.preferences().targetLanguage == QStringLiteral("ja") &&
+                service.preferences().secondaryTargetLanguage == QStringLiteral("ko") &&
+                service.preferences().languageDetectionConfidenceThreshold == 95,
+            "successful screenshot save commits only changed shared fields once");
+    require(
+        runtime.state(QStringLiteral("translation.secondary-target-language")).acceptedValue ==
+                QStringLiteral("ko") &&
+            runtime.applySelectValue(
+                settings::SettingsSelectBinding::TranslationPrimaryTargetLanguage,
+                QStringLiteral("zh-Hant")) &&
+            service.preferences().targetLanguage == QStringLiteral("zh-Hant") &&
+            service.preferences().secondaryTargetLanguage == QStringLiteral("ko") &&
+            service.preferences().languageDetectionConfidenceThreshold == 95 &&
+            runtime.state(confidenceId).acceptedValue.toInt() == 95 &&
+            runtime.applyIntegerValue(
+                settings::SettingsIntegerBinding::TranslationLanguageDetectionConfidenceThreshold,
+                30) &&
+            service.preferences().languageDetectionConfidenceThreshold == 30,
+        "main settings and dialog synchronize without resetting the secondary target");
+    require(configuration.setValue(customKey, previousModels), "restore custom models");
+    require(
+        snow_shot::storage::ScreenshotTranslationSettings().setConfiguration(previousPreferences),
+        "restore shared preferences");
+}
+
+class SettingsGeometryObserver final : public QObject {
+  public:
+    QList<QRect> frames;
+
+  protected:
+    bool eventFilter(QObject* object, QEvent* event) override {
+        auto* widget = qobject_cast<QWidget*>(object);
+        if (widget != nullptr && event->type() == QEvent::Paint &&
+            widget->objectName() == QStringLiteral("screenshotTranslationSourceLanguage")) {
+            const QRect frame(widget->mapToGlobal(QPoint()), widget->size());
+            if (frames.isEmpty() || frames.last() != frame)
+                frames.append(frame);
+        }
+        return false;
+    }
+};
+
+void screenshotSettingsGeometry() {
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    const snow_shot::storage::ScreenshotTranslationSettings settings;
+    const bool copyResultsAsImage = settings.copyTranslationResultsAsImage();
+    require(settings.setCopyTranslationResultsAsImage(true),
+            "enable image copying in main settings");
+    Server server;
+    server.holdModels = true;
+    SnowShotApiClient client(server.url());
+    auto& service = snow_shot::translation::TranslationService::forClient(client, configuration,
+                                                                          QLocale::English);
+    QWidget owner;
+    owner.resize(1000, 700);
+    owner.show();
+    flushEvents();
+    for (const bool cached : {false, true}) {
+        SettingsGeometryObserver observer;
+        qApp->installEventFilter(&observer);
+        auto* modal = snow_shot::presentation::createScreenshotTranslationSettingsDialog(
+            service, &owner, &owner, {});
+        // Drain successive layout and paint requests, including requests posted by a first paint.
+        for (int i = 0; i < 8; ++i)
+            flushEvents();
+        auto* body = modal->contentWidget();
+        const int expectedHeight = body->hasHeightForWidth() ? body->heightForWidth(body->width())
+                                                             : body->sizeHint().height();
+        require(qAbs(body->height() - expectedHeight) <= 1,
+                "screenshot settings body fits its content without vertical blank space");
+        const auto labels = body->findChildren<QLabel*>(QStringLiteral("ad-form-item-label"));
+        require(labels.size() == 6 &&
+                    labels.at(5)->text() == QStringLiteral("Original Image Translation") &&
+                    !body->findChild<QWidget*>(
+                        QStringLiteral("screenshotTranslationCopyResultsAsImage")),
+                "screenshot settings excludes the main-settings-only image copy option");
+        for (auto* label : labels) {
+            require(label->width() >= label->fontMetrics().horizontalAdvance(label->text()) &&
+                        label->height() >= label->fontMetrics().height(),
+                    "screenshot settings labels fit on one line without clipping");
+        }
+        require(modal->acceptButton()->isEnabled(),
+                "local free translation keeps OK available during model discovery");
+        if (!cached) {
+            waitUntil([&] { return server.modelRequests == 1; }, "request translation models");
+            server.respondModels();
+            waitUntil([&] { return !service.loadingModels(); }, "load translation models");
+            for (int i = 0; i < 8; ++i)
+                flushEvents();
+            require(modal->acceptButton()->isEnabled(), "model discovery enables OK");
+        }
+        qApp->removeEventFilter(&observer);
+        require(observer.frames.size() == 1,
+                "screenshot settings geometry is stable from first paint through model discovery");
+        const QString output = qEnvironmentVariable("SNOW_TRANSLATION_QA_DIR");
+        if (!output.isEmpty()) {
+            require(QDir().mkpath(output), "create screenshot settings preview directory");
+            require(body->window()->grab().save(
+                        QDir(output).filePath(cached ? QStringLiteral("settings-cached.png")
+                                                     : QStringLiteral("settings-discovered.png"))),
+                    "save screenshot settings preview");
+        }
+        if (cached) {
+            modal->closeRequested(adqt::widgets::AdModal::CloseReason::OkAction);
+        } else {
+            modal->reject();
+        }
+        require(settings.copyTranslationResultsAsImage(),
+                "accepting or cancelling the dialog preserves the main image copy preference");
+        flushEvents();
+    }
+    require(settings.setCopyTranslationResultsAsImage(copyResultsAsImage),
+            "restore main image copy preference");
+}
+
+void screenshotSettingsProviderLifetime() {
+    auto& configuration = snow_shot::storage::ApplicationStorage::instance().configuration();
+    Server server;
+    auto client = std::make_unique<SnowShotApiClient>(server.url());
+    auto& service = snow_shot::translation::TranslationService::forClient(*client, configuration,
+                                                                          QLocale::English);
+    QWidget owner;
+    const QPointer<adqt::widgets::AdModal> modal =
+        snow_shot::presentation::createScreenshotTranslationSettingsDialog(service, &owner, &owner,
+                                                                           {});
+    auto* body = modal->contentWidget();
+    auto* retry = child<AdButton>(*body, "screenshotTranslationSettingsRetry");
+    client.reset();
+    QEvent languageChange(QEvent::LanguageChange);
+    QApplication::sendEvent(body, &languageChange);
+    retry->clicked();
+    modal->closeRequested(adqt::widgets::AdModal::CloseReason::OkAction);
+    flushEvents();
+    require(modal == nullptr,
+            "provider destruction safely disposes the screenshot settings dialog");
+}
+
+void snapshot(QWidget& window, const QString& name) {
+    const QString output = qEnvironmentVariable("SNOW_TRANSLATION_QA_DIR");
+    if (!output.isEmpty()) {
+        require(QDir().mkpath(output), "create visual verification directory");
+        flushEvents();
+        require(window.grab().save(QDir(output).filePath(name + QStringLiteral(".png"))),
+                "save translation page rendering");
+    }
+}
+
+class CloseTrackingWindow final : public QWidget {
+  public:
+    int closeCount = 0;
+
+  protected:
+    void closeEvent(QCloseEvent* event) override {
+        ++closeCount;
+        QWidget::closeEvent(event);
+    }
+};
+
+void editorContentGeometry() {
+    Server server;
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    page.deactivate();
+    page.resize(900, 650);
+    page.show();
+    flushEvents();
+    auto* source = child<AdTextEdit>(page, "translationSourceText");
+    auto* result = child<AdTextEdit>(page, "translationResultText");
+    for (auto* editor : {source, result}) {
+        const int baseline = editor->height();
+        require(baseline == editor->minimumSizeHint().height(),
+                "empty editor uses its minimum rows without filling spare page space");
+        editor->setPlainText(QStringLiteral("A line of text.\n").repeated(80));
+        waitUntil(
+            [&] {
+                return editor->height() > baseline && editor->verticalScrollBar()->maximum() == 0;
+            },
+            "multiline text expands the editor without internal scrolling");
+        editor->clear();
+        waitUntil([&] { return editor->height() == baseline; },
+                  "clearing text restores the minimum height");
+        editor->setPlainText(QString(4500, u'W'));
+        flushEvents();
+        const int wideHeight = editor->height();
+        page.resize(300, 650);
+        waitUntil(
+            [&] {
+                return editor->height() > wideHeight && editor->verticalScrollBar()->maximum() == 0;
+            },
+            "narrow layouts grow to fit wrapped text");
+        editor->clear();
+        page.resize(900, 650);
+        flushEvents();
+    }
+}
+
+void selectedTextHandoff() {
+    Server server;
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    auto* source = child<AdTextEdit>(page, "translationSourceText");
+    auto* controller = page.findChild<snow_shot::presentation::TranslationPageController*>();
+    waitUntil([&]() { return !controller->loadingModels(); },
+              "load selected text translation models");
+    const auto preferences = controller->preferences();
+    const QString selected =
+        QString::fromUtf8("  selected \xe4\xb8\xad\xe6\x96\x87 \xf0\x9f\x8c\x8d\r\nsecond line  ");
+    controller->setComposing(true);
+    page.setSourceText(selected);
+    const QString normalized =
+        QString(selected).replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    require(source->toPlainText() == normalized && controller->sourceText() == normalized,
+            "handoff fills source and controller using the editor newline policy");
+    waitUntil([&]() { return server.streams.size() == 1; },
+              "handoff ends previous composition and automatically translates");
+    require(QJsonDocument(server.streams.first().body).toJson().contains("selected"),
+            "translation request contains captured source");
+    server.delta(0, QStringLiteral("old result"));
+    waitUntil([&]() { return controller->resultText() == QStringLiteral("old result"); },
+              "first request streams a result");
+    page.setSourceText(QStringLiteral("replacement"));
+    require(controller->resultText().isEmpty(), "replacing source clears obsolete translation");
+    server.delta(0, QStringLiteral("stale"));
+    waitUntil([&]() { return server.streams.size() == 2 && server.disconnected(0); },
+              "replacement cancels the old stream and starts one new translation");
+    server.delta(1, QStringLiteral("new result"));
+    waitUntil([&]() { return controller->resultText() == QStringLiteral("new result"); },
+              "cancelled request cannot replace the new result");
+    page.setSourceText(QStringLiteral("replacement"));
+    flushEvents();
+    require(server.streams.size() == 2 &&
+                controller->resultText() == QStringLiteral("new result") &&
+                controller->preferences().sourceLanguage == preferences.sourceLanguage &&
+                controller->preferences().targetLanguage == preferences.targetLanguage &&
+                controller->preferences().modelId == preferences.modelId,
+            "identical handoff is a no-op and language/model preferences are preserved");
+    const QString boundary = QString(4999, u'a') + QString::fromUcs4(U"\U0001f30d");
+    page.setSourceText(boundary + QStringLiteral("overflow"));
+    require(source->toPlainText() == boundary && controller->sourceText() == boundary,
+            "selected text observes the same 5000-code-point limit as pasted text");
+    page.deactivate();
+    page.setSourceText(QStringLiteral("late"));
+    require(controller->sourceText().isEmpty(), "deactivated page rejects a late handoff");
+}
+
+void selectedTextNavigation() {
+    Server server;
+    qputenv("SNOW_SHOT_API_BASE_URL", server.url().toUtf8());
+    snow_shot::presentation::GlobalShortcutManager shortcuts;
+    settings::BuiltInSettingsBackend backend(shortcuts);
+    settings::SettingsRuntimeSession runtime(settings::builtInSettingsRegistry(), backend);
+    MainWindow window(settings::builtInSettingsRegistry(), runtime);
+    window.setAttribute(Qt::WA_DeleteOnClose, false);
+    auto* card = window.findChild<ContentCardWidget*>();
+    auto* sidebar = window.findChild<SidebarWidget*>();
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(false),
+            "disable translation page");
+    window.showTranslation(QStringLiteral("blocked selection"));
+    auto* search = window.findChild<ApplicationSearchWidget*>();
+    require(search != nullptr, "main window exposes application search");
+    auto* searchSelect = search->findChild<AdSelect*>();
+    const auto hasSearchLabel = [&](const QString& label) {
+        for (const auto& option : searchSelect->options()) {
+            if (option.label == label)
+                return true;
+        }
+        return false;
+    };
+    searchSelect->setSearchText(QStringLiteral("Translation"));
+    require(!hasSearchLabel(QStringLiteral("Translate Selected Text")) &&
+                hasSearchLabel(QStringLiteral("Translation Page")),
+            "disabled search hides shortcut but exposes the opt-in toggle");
+    require(card->currentRoute() == QStringLiteral("/settings/text-recognition-translation") &&
+                window.findChild<TranslationPageWidget*>() == nullptr,
+            "disabled direct handoff redirects to feature settings");
+    card->setCurrentRoute(QStringLiteral("/tools/translation"));
+    require(card->currentRoute() == QStringLiteral("/settings/text-recognition-translation"),
+            "disabled direct route is guarded");
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(true),
+            "enable translation page");
+    require(hasSearchLabel(QStringLiteral("Translate Selected Text")),
+            "live enable restores selected text search result");
+    window.showTranslation(QStringLiteral("first selection"));
+    auto* page = window.findChild<TranslationPageWidget*>();
+    require(window.isVisible() && page != nullptr &&
+                sidebar->currentRoute() == QStringLiteral("/tools/translation") &&
+                card->currentRoute() == QStringLiteral("/tools/translation") &&
+                child<AdTextEdit>(*page, "translationSourceText")->toPlainText() ==
+                    QStringLiteral("first selection"),
+            "hidden main window opens Translation and synchronizes navigation and source");
+    window.showTranslation(QString());
+    require(window.findChild<TranslationPageWidget*>() == page &&
+                child<AdTextEdit>(*page, "translationSourceText")->toPlainText().isEmpty(),
+            "empty handoff keeps the translation page open with an empty source");
+    auto* emptyWarning = window.findChild<QLabel*>(QStringLiteral("ad-message-content"));
+    require(emptyWarning != nullptr && emptyWarning->isVisible() &&
+                emptyWarning->text() == QStringLiteral("Failed to retrieve selected text"),
+            "empty handoff warns inside the window instead of a system prompt");
+    QPointer<TranslationPageWidget> oldPage(page);
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(false),
+            "disable active page");
+    flushEvents();
+    require(oldPage.isNull() &&
+                card->currentRoute() == QStringLiteral("/settings/text-recognition-translation"),
+            "disabling active page disposes it and redirects");
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(true),
+            "restore page");
+    window.showTranslation(QStringLiteral("first selection"));
+    page = window.findChild<TranslationPageWidget*>();
+    window.showMinimized();
+    window.showTranslation(QStringLiteral("second selection"));
+    require(!window.isMinimized() && window.findChild<TranslationPageWidget*>() == page &&
+                child<AdTextEdit>(*page, "translationSourceText")->toPlainText() ==
+                    QStringLiteral("second selection"),
+            "handoff restores minimized window and reuses an active translation page");
+    card->setCurrentRoute(QStringLiteral("/global-hotkeys"));
+    flushEvents();
+    window.hide();
+    window.showTranslation(QStringLiteral("third selection"));
+    page = window.findChild<TranslationPageWidget*>();
+    require(window.isVisible() && page != nullptr &&
+                child<AdTextEdit>(*page, "translationSourceText")->toPlainText() ==
+                    QStringLiteral("third selection"),
+            "handoff creates a new translation page after navigation disposed the previous one");
+    window.close();
+    qunsetenv("SNOW_SHOT_API_BASE_URL");
+}
+
+void editorAndShortcutBehavior() {
+    Server server;
+    SnowShotApiClient client(server.url());
+    CloseTrackingWindow owner;
+    owner.resize(700, 650);
+    auto* page = new TranslationPageWidget(&owner, &client, 0);
+    page->setGeometry(owner.rect());
+    QObject::connect(page, &TranslationPageWidget::closeWindowRequested, &owner, &QWidget::close);
+    owner.show();
+    auto* source = child<AdTextEdit>(*page, "translationSourceText");
+    auto* result = child<AdTextEdit>(*page, "translationResultText");
+    auto* spin = child<AdSpin>(*page, "translationResultSpin");
+    require(!spin->spinning() && spin->isHidden(), "idle translation has no loading indicator");
+    auto* floating = child<AdButton>(*page, "translationActions");
+    require(page->findChild<AdContextMenu*>(QStringLiteral("translationActionsMenu")) == nullptr,
+            "translation actions allocate no menu before opening");
+    QPointer<AdContextMenu> menu;
+    QPointer<QAction> copy, copyClose;
+    const auto refreshActions = [&]() {
+        menu = visibleTranslationActionsMenu(*page);
+        if (menu) {
+            copy = child<QAction>(*menu, "translationCopy");
+            copyClose = child<QAction>(*menu, "translationCopyAndClose");
+        }
+    };
+    const auto openActions = [&]() {
+        floating->click();
+        refreshActions();
+        require(menu != nullptr, "the action trigger creates a fresh menu session");
+    };
+    openActions();
+    require(!menu->actionIcon(copy).isValid() && !menu->actionIcon(copyClose).isValid() &&
+                !copy->isEnabled(),
+            "an empty translation menu has unadorned disabled copy actions");
+    menu->dismissPopup();
+    flushEvents();
+    flushEvents();
+    require(!menu && !copy && !copyClose, "hiding translation actions releases the complete menu");
+    auto* controller = page->findChild<snow_shot::presentation::TranslationPageController*>();
+    require(controller != nullptr && result->isReadOnly() &&
+                !child<AdButton>(*page, "translationResultCopy")->isEnabled(),
+            "empty page has read-only result and disabled copy actions");
+    QApplication::clipboard()->setText(QStringLiteral("sentinel"));
+    key(source, Qt::Key_Q, Qt::ControlModifier);
+    require(owner.closeCount == 0 && owner.isVisible() &&
+                QApplication::clipboard()->text() == QStringLiteral("sentinel"),
+            "empty Copy and Close leaves clipboard and window intact");
+
+    const QString emoji = QString::fromUcs4(U"😀");
+    const QString boundary = QString(4999, u'a') + emoji;
+    source->setPlainText(boundary + QStringLiteral("overflow"));
+    require(source->toPlainText() == boundary, "limit counts code points without splitting emoji");
+    source->moveCursor(QTextCursor::End);
+    PhysicalKeyEvent typed(QEvent::KeyPress, Qt::Key_X, Qt::NoModifier, QStringLiteral("x"));
+    QApplication::sendEvent(source, &typed);
+    require(source->toPlainText() == boundary, "typing cannot exceed the Unicode limit");
+    source->selectAll();
+    QApplication::clipboard()->setText(boundary + QStringLiteral("paste overflow"));
+    source->paste();
+    require(source->toPlainText() == boundary, "paste obeys the Unicode limit");
+    source->clear();
+    QInputMethodEvent preedit(QStringLiteral("正在输入"), {});
+    QApplication::sendEvent(source, &preedit);
+    source->insertPlainText(QStringLiteral("not committed yet"));
+    flushEvents();
+    require(server.streams.isEmpty(), "composition blocks automatic translation");
+    source->clear();
+    QInputMethodEvent commit;
+    commit.setCommitString(boundary + QStringLiteral("extra"));
+    QApplication::sendEvent(source, &commit);
+    require(source->toPlainText() == boundary, "committed IME text obeys the Unicode limit");
+    source->clear();
+    QMimeData dropText;
+    dropText.setText(boundary + QStringLiteral("drop overflow"));
+    QDragEnterEvent enter(QPointF(10, 10), Qt::CopyAction, &dropText, Qt::LeftButton,
+                          Qt::NoModifier);
+    QApplication::sendEvent(source->viewport(), &enter);
+    QDropEvent drop(QPointF(10, 10), Qt::CopyAction, &dropText, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(source->viewport(), &drop);
+    require(source->toPlainText() == boundary, "drop obeys the Unicode limit");
+    source->setPlainText(QStringLiteral("Hello, world!"));
+    waitUntil([&]() { return server.streams.size() == 1; }, "source starts one translation");
+    require(spin->spinning() && spin->isVisible(),
+            "Spin appears while waiting for the first token");
+    server.delta(0, QStringLiteral("你好，"));
+    waitUntil([&]() { return result->toPlainText() == QStringLiteral("你好，"); },
+              "show partial result");
+    openActions();
+    require(copy->isEnabled() && copyClose->isEnabled(), "partial results are copyable");
+    menu->dismissPopup();
+    flushEvents();
+    require(spin->spinning() && spin->isVisible(), "Spin stays visible while tokens stream");
+    source->setFocus();
+    source->selectAll();
+    key(source, Qt::Key_C, Qt::ControlModifier);
+    require(QApplication::clipboard()->text() == source->toPlainText(),
+            "Ctrl+C copies selected source text");
+    QTextCursor cursor = source->textCursor();
+    cursor.clearSelection();
+    source->setTextCursor(cursor);
+    key(source, Qt::Key_C, Qt::ControlModifier);
+    require(QApplication::clipboard()->text() == result->toPlainText(),
+            "Ctrl+C with no selection copies the partial result");
+    QApplication::clipboard()->setText(QStringLiteral("before owner shortcut"));
+    key(&owner, Qt::Key_C, Qt::ControlModifier);
+    require(QApplication::clipboard()->text() == result->toPlainText(),
+            "active page shortcuts also work with focus outside its editors");
+#ifdef Q_OS_MACOS
+    QApplication::clipboard()->setText(QStringLiteral("physical copy sentinel"));
+    QKeyEvent wrongCopy(QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier, 1, 9, 0);
+    QApplication::sendEvent(&owner, &wrongCopy);
+    require(QApplication::clipboard()->text() == QStringLiteral("physical copy sentinel"),
+            "a C legend at physical V must not trigger result copy");
+    QKeyEvent physicalCopy(QEvent::KeyPress, Qt::Key_Q, Qt::ControlModifier, 1, 8, 0);
+    QApplication::sendEvent(&owner, &physicalCopy);
+    require(QApplication::clipboard()->text() == result->toPlainText(),
+            "physical C must copy the result across layout changes");
+#endif
+    result->selectAll();
+    const QString selected = result->textCursor().selectedText();
+    server.delta(0, QStringLiteral("世界！\n\nSecond paragraph."));
+    waitUntil([&]() { return result->toPlainText().contains(QStringLiteral("Second")); },
+              "append additional streamed text");
+    require(result->textCursor().selectedText() == selected,
+            "streaming preserves output selection");
+    key(result, Qt::Key_C, Qt::ControlModifier);
+    require(QApplication::clipboard()->text() == selected, "Ctrl+C copies the selected output");
+    openActions();
+    copy->trigger();
+    require(QApplication::clipboard()->text() == result->toPlainText(),
+            "floating Copy always copies the whole result despite a selection");
+
+    const QPointF local = floating->rect().center();
+    QCursor::setPos(floating->mapToGlobal(local.toPoint()));
+    QEnterEvent hover(local, local, floating->mapToGlobal(local.toPoint()));
+    QApplication::sendEvent(floating, &hover);
+#ifdef Q_OS_MACOS
+    require(!menu || !menu->isPopupVisible(), "macOS action menus do not open on hover");
+    floating->click();
+#endif
+    refreshActions();
+    waitUntil([&]() { return menu && menu->isPopupVisible(); }, "trigger reveals actions");
+    require(menu->geometry().bottom() < floating->mapToGlobal(QPoint()).y(),
+            "translation actions open above the floating trigger");
+    require(menu->triggerWidget() == floating && menu->actions().size() == 2,
+            "translation uses the shared two-action context menu");
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(floating, &leave);
+    QCursor::setPos(menu->mapToGlobal(menu->actionGeometry(copy).center()));
+    QEnterEvent actionHover(QPointF(5, 5), QPointF(5, 5),
+                            menu->mapToGlobal(menu->actionGeometry(copy).center()));
+    QApplication::sendEvent(menu, &actionHover);
+    flushEvents();
+    require(menu->isVisible(), "pointer can travel from floating button to action");
+    key(menu, Qt::Key_Escape);
+    require((!menu || !menu->isVisible()) && owner.focusWidget() == floating,
+            "Escape dismisses the action popup and restores trigger focus");
+    QCursor::setPos(owner.mapToGlobal(QPoint(2, 2)));
+    flushEvents();
+    key(floating, Qt::Key_Return);
+    refreshActions();
+    require(menu && menu->isVisible() && menu->activeAction() == copy,
+            "keyboard activation reveals actions and selects Copy");
+    QApplication::sendEvent(menu, &leave);
+    QEventLoop settle;
+    QTimer::singleShot(200, &settle, &QEventLoop::quit);
+    settle.exec();
+    require(menu->isVisible(), "keyboard navigation does not require pointer hover");
+    key(menu, Qt::Key_Escape);
+    key(floating, Qt::Key_Space);
+    refreshActions();
+    require(menu && menu->isVisible(), "Space also reveals the actions");
+    QApplication::clipboard()->setText(QStringLiteral("before keyboard action"));
+    key(menu, Qt::Key_Return);
+    require((!menu || !menu->isVisible()) &&
+                QApplication::clipboard()->text() == result->toPlainText(),
+            "Enter activates a focused popup action");
+    openActions();
+    require(menu->isVisible(), "click opens the same action menu");
+    key(menu, Qt::Key_C, Qt::ControlModifier);
+    require((!menu || !menu->isVisible()) &&
+                QApplication::clipboard()->text() == result->toPlainText(),
+            "Ctrl+C works while the context menu owns focus");
+    openActions();
+    owner.hide();
+    require(!menu || !menu->isVisible(), "hiding the owner dismisses the action menu");
+    owner.show();
+    const int shortResultHeight = result->height();
+    server.delta(0, QStringLiteral("\nA line of translated text.").repeated(80));
+    waitUntil(
+        [&]() {
+            return result->height() > shortResultHeight &&
+                   result->verticalScrollBar()->maximum() == 0;
+        },
+        "long results grow without internal scrolling");
+    auto* pageScroll = page->findChild<AdScrollArea*>();
+    waitUntil([&] { return pageScroll->verticalScrollBar()->maximum() > 0; },
+              "long translations scroll at page level");
+    cursor = result->textCursor();
+    cursor.clearSelection();
+    result->setTextCursor(cursor);
+    result->verticalScrollBar()->setValue(0);
+    server.delta(0, QStringLiteral("\nLast delta."));
+    waitUntil([&]() { return result->toPlainText().endsWith(QStringLiteral("Last delta.")); },
+              "append while the reader is scrolled upward");
+    require(result->verticalScrollBar()->value() == 0,
+            "streaming does not scroll away from the reader");
+    key(source, Qt::Key_Q, Qt::ControlModifier);
+    require(owner.closeCount == 1 && !owner.isVisible() &&
+                QApplication::clipboard()->text() == result->toPlainText(),
+            "Ctrl+Q copies the partial result and closes the owning window");
+    server.finish(0);
+    waitUntil([&]() { return !controller->translating(); }, "hidden page finishes its stream");
+    require(!spin->spinning() && spin->isHidden(), "completion stops and hides Spin");
+    owner.show();
+    require(!source->toPlainText().isEmpty() && !result->toPlainText().isEmpty(),
+            "non-deleting test owner retains its draft after closing");
+    openActions();
+    require(menu->isVisible(), "actions reopen before deactivation");
+    page->deactivate();
+    require(!menu || !menu->isVisible(), "deactivation dismisses the action menu");
+    source->setPlainText(QStringLiteral("after deactivation"));
+    QApplication::clipboard()->setText(QStringLiteral("untouched"));
+    key(source, Qt::Key_Q, Qt::ControlModifier);
+    require(owner.isVisible() && QApplication::clipboard()->text() == QStringLiteral("untouched"),
+            "inactive page cannot execute translation shortcuts");
+}
+
+void languageDropdowns() {
+    Server server;
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    page.deactivate();
+    page.resize(900, 650);
+    page.show();
+    flushEvents();
+    for (const char* name : {"translationSourceLanguage", "translationTargetLanguage"}) {
+        auto* select = child<AdSelect>(page, name);
+        require(select->popupLayerMode() == AdSelect::PopupLayerMode::QtTool,
+                "language dropdowns use the screenshot settings tool layer");
+        for (const auto& option : select->options()) {
+            const QString code = option.value.toString();
+            require(option.group ==
+                        (code == QStringLiteral("auto") ? QString() : code.left(1).toUpper()),
+                    "languages use code-initial groups with auto-detect outside the groups");
+        }
+        select->setPopupVisible(true);
+        flushEvents();
+        QWidget* popup = nullptr;
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (widget->objectName() == QStringLiteral("adselect-popup") && widget->isVisible()) {
+                popup = widget;
+                break;
+            }
+        }
+        require(popup != nullptr && popup->windowType() == Qt::Tool,
+                "opening a language dropdown displays a separate tool window");
+        select->setPopupVisible(false);
+        flushEvents();
+        require(!popup->isVisible(), "closing the language dropdown hides its tool window");
+    }
+}
+
+void selectorContentGeometry() {
+    AdSelect sizing;
+    sizing.setOptions({{QStringLiteral("en"), QStringLiteral("English")},
+                       {QStringLiteral("zh"), QStringLiteral("Simplified Chinese")}});
+    sizing.setCurrentValue(QStringLiteral("en"));
+    const QSize fixedHint = sizing.sizeHint();
+    sizing.setCurrentValue(QStringLiteral("zh"));
+    require(sizing.sizeHint() == fixedHint, "default Select sizing remains compatible");
+    sizing.setSizeAdjustPolicy(AdSelect::SizeAdjustPolicy::AdjustToCurrentText);
+    const int longHint = sizing.sizeHint().width();
+    sizing.setCurrentValue(QStringLiteral("en"));
+    require(sizing.sizeHint().width() < longHint, "content policy measures the selected label");
+    const int unprefixed = sizing.sizeHint().width();
+    sizing.setPrefixText(QStringLiteral("Language"));
+    require(sizing.sizeHint().width() > unprefixed, "content sizing includes a visible prefix");
+    sizing.setPrefixText({});
+    require(sizing.sizeHint().width() == unprefixed, "removing prefix releases its width");
+    sizing.setCurrentValue({});
+    sizing.setPlaceholder(QStringLiteral("Choose"));
+    const int placeholderWidth = sizing.sizeHint().width();
+    sizing.setPlaceholder(QStringLiteral("Choose a translation language"));
+    require(sizing.sizeHint().width() > placeholderWidth, "empty select measures its placeholder");
+    sizing.setMode(AdSelect::Mode::Multiple);
+    require(sizing.sizeHint().width() == fixedHint.width(),
+            "multiple selection keeps wrapping sizing");
+
+    Server server;
+    SnowShotApiClient client(server.url());
+    TranslationPageWidget page(nullptr, &client, 0);
+    page.resize(1100, 650);
+    page.show();
+    auto* controller = page.findChild<snow_shot::presentation::TranslationPageController*>();
+    waitUntil([&]() { return !controller->loadingModels(); }, "load selector geometry fixture");
+    auto* scroll = page.findChild<AdScrollArea*>();
+    require(scroll->viewport()->mapTo(&page, scroll->viewport()->rect().bottomLeft()).y() ==
+                page.rect().bottom(),
+            "floating shortcuts do not reserve a footer below the scroll viewport");
+    auto* target = child<AdSelect>(page, "translationTargetLanguage");
+    auto* swap = child<AdButton>(page, "translationSwap");
+    target->setCurrentValue(QStringLiteral("en"));
+    flushEvents();
+    flushEvents();
+    const int shortWidth = target->width();
+    const int gap =
+        target->mapTo(&page, QPoint()).x() - swap->mapTo(&page, QPoint(swap->width(), 0)).x();
+    target->setCurrentValue(QStringLiteral("zh-Hans"));
+    flushEvents();
+    flushEvents();
+    require(target->width() > shortWidth, "selector grows to fit a longer selected label");
+    require(gap >= 0 &&
+                gap <= styles::ThemeManager::instance().themeColorScheme().metricAlias.paddingXXS,
+            "target language follows the swap button without unused column space");
+    target->setCurrentValue(QStringLiteral("en"));
+    flushEvents();
+    flushEvents();
+    require(target->width() == shortWidth, "selector shrinks when returning to a shorter label");
+    for (const char* name :
+         {"translationSourceLanguage", "translationTargetLanguage", "translationService"}) {
+        auto* select = child<AdSelect>(page, name);
+        require(select->width() == select->sizeHint().width(),
+                "all translation selectors use their content width");
+    }
+    auto* service = child<AdSelect>(page, "translationService");
+    auto* result = child<AdTextEdit>(page, "translationResultText");
+    require(service->mapTo(&page, QPoint(service->width(), 0)).x() ==
+                result->mapTo(&page, QPoint(result->width(), 0)).x(),
+            "translation service aligns with the right edge of the result pane");
+    page.resize(320, 650);
+    flushEvents();
+    flushEvents();
+    auto* source = child<AdSelect>(page, "translationSourceLanguage");
+    require(source->mapTo(&page, QPoint()).x() == target->mapTo(&page, QPoint()).x(),
+            "stacked source and target selectors share the same left edge");
+}
+
+void navigationThemesLanguagesAndGeometry() {
+    Server server;
+    qputenv("SNOW_SHOT_API_BASE_URL", server.url().toUtf8());
+    snow_shot::presentation::GlobalShortcutManager shortcuts;
+    settings::BuiltInSettingsBackend backend(shortcuts);
+    settings::SettingsRuntimeSession runtime(settings::builtInSettingsRegistry(), backend);
+    MainWindow window(settings::builtInSettingsRegistry(), runtime);
+    window.setAttribute(Qt::WA_DeleteOnClose, false);
+    window.resize(900, 640);
+    window.show();
+    auto* card = window.findChild<ContentCardWidget*>();
+    auto* sidebar = window.findChild<SidebarWidget*>();
+    require(card != nullptr && sidebar != nullptr, "main window exposes navigation and content");
+    auto* navigation = sidebar->findChild<AdNavigationMenu*>();
+    const auto* model = navigation->model();
+    const auto role = AdNavigationMenu::StableIdRole;
+    int translationRow = -1;
+    for (int row = 0; row < model->rowCount(); ++row) {
+        if (model->index(row, 0).data(role).toString() == QStringLiteral("/tools/translation")) {
+            translationRow = row;
+        }
+    }
+    require(translationRow >= 2 &&
+                model->index(translationRow - 2, 0).data(role).toString() ==
+                    QStringLiteral("/history") &&
+                model->index(translationRow - 1, 0).data(role).toString() ==
+                    QStringLiteral("/pin-to-screen-management"),
+            "Translation follows Screenshot history and Pin to Screen Management in navigation");
+    card->setCurrentRoute(QStringLiteral("/tools/translation"));
+    auto* page = window.findChild<TranslationPageWidget*>();
+    require(page != nullptr && card->currentSections().isEmpty() &&
+                sidebar->currentRoute() == QStringLiteral("/tools/translation"),
+            "Translation is a standalone route without section tabs");
+    auto* source = child<AdTextEdit>(*page, "translationSourceText");
+    auto* result = child<AdTextEdit>(*page, "translationResultText");
+    auto* controller = page->findChild<snow_shot::presentation::TranslationPageController*>();
+    waitUntil([&]() { return !controller->loadingModels(); }, "load services on main page");
+    child<AdSelect>(*page, "translationTargetLanguage")->setCurrentValue(QStringLiteral("zh-Hans"));
+    const auto inspectVariants = [&](const QString& state) {
+        const QString capturedResult = result->toPlainText();
+        const qsizetype capturedRequests = server.streams.size();
+        for (const auto appearance :
+             {styles::ThemeAppearance::Light, styles::ThemeAppearance::Dark}) {
+            styles::ThemeManager::instance().setThemeAppearance(appearance);
+            const QString theme = appearance == styles::ThemeAppearance::Light
+                                      ? QStringLiteral("light")
+                                      : QStringLiteral("dark");
+            for (const auto& locale :
+                 {QStringLiteral("en_US"), QStringLiteral("zh_CN"), QStringLiteral("zh_TW")}) {
+                QTranslator translator;
+                require(translator.load(QStringLiteral("snow_shot_%1.qm").arg(locale),
+                                        QStringLiteral(SNOW_SHOT_TEST_TRANSLATIONS_DIR)),
+                        "load complete translation catalog");
+                QCoreApplication::installTranslator(&translator);
+                flushEvents();
+                const QString copyCloseShortcut = snow_shot::shortcuts::formatShortcutDisplayText(
+                    snow_shot::shortcuts::bindingFromPortableText(QStringLiteral("Ctrl+Q")));
+                child<AdButton>(*page, "translationActions")->click();
+                auto* copyAction = child<QAction>(*page, "translationCopy");
+                auto* copyCloseAction = child<QAction>(*page, "translationCopyAndClose");
+                const auto expectedMenuText = [&](const char* sourceText) {
+                    // Release catalogs strip source-identical English entries.
+                    if (locale == QStringLiteral("en_US"))
+                        return QString::fromUtf8(sourceText);
+                    const QString translated =
+                        translator.translate("TranslationPageWidget", sourceText);
+                    require(!translated.isEmpty(),
+                            "localized menu labels must exist in the catalog");
+                    return translated;
+                };
+                require(copyCloseAction->text() ==
+                            expectedMenuText("Copy and Close (%1)").arg(copyCloseShortcut),
+                        "floating actions retranslate immediately");
+                copyAction->setText(QStringLiteral("stale copy legend"));
+                copyCloseAction->setText(QStringLiteral("stale copy-and-close legend"));
+                snow_shot::shortcuts::ShortcutDisplayService::instance().refresh();
+                const QString copyShortcut = snow_shot::shortcuts::formatShortcutDisplayText(
+                    snow_shot::shortcuts::bindingFromPortableText(QStringLiteral("Ctrl+C")));
+                require(copyAction->text() == expectedMenuText("Copy (%1)").arg(copyShortcut) &&
+                            copyCloseAction->text() ==
+                                expectedMenuText("Copy and Close (%1)").arg(copyCloseShortcut),
+                        "a keyboard-layout refresh must update fixed translation shortcuts");
+                for (const bool collapsed : {false, true}) {
+                    sidebar->setCollapsed(collapsed);
+                    for (const QSize size : {QSize(900, 640), QSize(512, 316), QSize(1200, 900)}) {
+                        window.resize(size);
+                        flushEvents();
+                        flushEvents();
+                        auto* scroll = page->findChild<AdScrollArea*>();
+                        require(scroll != nullptr && scroll->horizontalScrollBar()->maximum() == 0,
+                                "translation layout never needs horizontal scrolling");
+                        const auto* floating = child<AdButton>(*page, "translationActions");
+                        require(page->rect().contains(floating->geometry()),
+                                "floating action remains within the visible page");
+                        const QRect viewportGeometry(scroll->viewport()->mapTo(page, QPoint()),
+                                                     scroll->viewport()->size());
+                        require(viewportGeometry.contains(floating->geometry()) &&
+                                    viewportGeometry.bottom() == page->rect().bottom(),
+                                "shortcut button floats over a viewport that fills the page");
+                        require(floating->size() == QSize(32, 32),
+                                "shortcut button uses the smaller 32-pixel size");
+                        require(page->childAt(floating->geometry().center()) == floating,
+                                "shortcut button stays above the scrolling content");
+                        const auto* inlineCopy = child<AdButton>(*page, "translationResultCopy");
+                        require(source->width() > 100 && result->width() > 100,
+                                "both text panes remain usable at minimum window size");
+                        const auto* spin = child<AdSpin>(*page, "translationResultSpin");
+                        require(spin->spinning() == controller->translating() &&
+                                    spin->isHidden() != controller->translating(),
+                                "Spin follows translation state across theme and layout changes");
+                        if (controller->translating()) {
+                            const QRect spinRect(spin->pos() - result->pos(), spin->size());
+                            const auto* copy = child<AdButton>(*page, "translationResultCopy");
+                            const QRect copyRect(copy->pos() - result->pos(), copy->size());
+                            if (!result->rect().contains(spinRect)) {
+                                std::cerr << "Spin outside result: locale=" << locale.toStdString()
+                                          << " window=" << size.width() << 'x' << size.height()
+                                          << " result=" << result->width() << 'x'
+                                          << result->height() << " spin=" << spinRect.x() << ','
+                                          << spinRect.y() << ' ' << spinRect.width() << 'x'
+                                          << spinRect.height() << '\n';
+                            }
+                            require(result->rect().contains(spinRect) &&
+                                        spinRect.center().x() < result->width() / 2 &&
+                                        spinRect.center().y() > result->height() / 2,
+                                    "Spin overlays the lower-left corner of the result");
+                            require(copy->isHidden() || !spinRect.intersects(copyRect),
+                                    "streaming Spin leaves the inline copy button reachable");
+                        }
+                        require(source->height() >= source->minimumSizeHint().height() &&
+                                    result->height() >= result->minimumSizeHint().height() &&
+                                    source->minimumVisibleRows() == 10 &&
+                                    result->minimumVisibleRows() == 10,
+                                "editor geometry retains its 10-row baseline after updates");
+                        const QString snapshotName =
+                            (state == QStringLiteral("completed")
+                                 ? QStringLiteral("translation-")
+                                 : QStringLiteral("translation-") + state + u'-') +
+                            QStringLiteral("%1-%2-%3-%4x%5")
+                                .arg(theme, locale,
+                                     collapsed ? QStringLiteral("collapsed")
+                                               : QStringLiteral("expanded"))
+                                .arg(size.width())
+                                .arg(size.height());
+                        scroll->verticalScrollBar()->setValue(0);
+                        snapshot(window, snapshotName);
+                        if (scroll->verticalScrollBar()->maximum() > 0) {
+                            scroll->verticalScrollBar()->setValue(
+                                scroll->verticalScrollBar()->maximum());
+                            flushEvents();
+                            if (!result->toPlainText().isEmpty()) {
+                                const QRect copyGeometry(
+                                    inlineCopy->mapTo(scroll->viewport(), QPoint()),
+                                    inlineCopy->size());
+                                require(scroll->viewport()->rect().contains(copyGeometry),
+                                        "scrolling to the bottom makes the inline copy fully "
+                                        "reachable");
+                                require(
+                                    !QRect(inlineCopy->mapTo(page, QPoint()), inlineCopy->size())
+                                         .intersects(floating->geometry()),
+                                    "shortcut overlay does not cover copy after scrolling");
+                            }
+                            snapshot(window, snapshotName + QStringLiteral("-scrolled"));
+                            scroll->verticalScrollBar()->setValue(0);
+                        }
+                    }
+                }
+                require(result->toPlainText() == capturedResult &&
+                            server.streams.size() == capturedRequests,
+                        "theme, layout and language changes preserve draft without retranslating");
+                QCoreApplication::removeTranslator(&translator);
+            }
+        }
+        sidebar->setCollapsed(false);
+        window.resize(900, 640);
+        styles::ThemeManager::instance().setThemeAppearance(styles::ThemeAppearance::Light);
+        flushEvents();
+    };
+    snapshot(window, QStringLiteral("translation-empty"));
+    inspectVariants(QStringLiteral("empty"));
+    source->setPlainText(QStringLiteral("Hello, world!\n\nTranslate text between languages."));
+    controller->retry();
+    waitUntil([&]() { return server.streams.size() == 1; }, "translate main-window draft");
+    server.delta(0, QStringLiteral("你好，世界！"));
+    waitUntil([&]() { return !result->toPlainText().isEmpty(); }, "main-window streaming result");
+    snapshot(window, QStringLiteral("translation-streaming"));
+    inspectVariants(QStringLiteral("streaming"));
+    server.fail(0);
+    waitUntil([&]() { return !controller->errorText().isEmpty(); },
+              "main-window error presentation");
+    snapshot(window, QStringLiteral("translation-error"));
+    const auto* actions = child<AdButton>(*page, "translationActions");
+    const QRect actionGeometry = actions->geometry();
+    source->clearFocus();
+    flushEvents();
+    source->setFocus();
+    flushEvents();
+    require(actions->geometry() == actionGeometry &&
+                page->childAt(actionGeometry.center()) == actions,
+            "focusing the editor leaves the shortcut overlay fixed and reachable");
+    inspectVariants(QStringLiteral("error"));
+    child<AdButton>(*page, "translationResultCopy")->click();
+    require(QApplication::clipboard()->text() == result->toPlainText() &&
+                !QApplication::clipboard()->text().contains(QStringLiteral("test failure")),
+            "copy after failure contains only the retained partial translation");
+    controller->retry();
+    waitUntil([&]() { return server.streams.size() == 2; }, "retry main-window translation");
+    server.delta(1, QStringLiteral("你好，世界！\n\n在不同语言之间翻译文本。"));
+    server.finish(1);
+    waitUntil([&]() { return !controller->translating(); }, "main-window completed result");
+    const QString originalResult = result->toPlainText();
+    window.hide();
+    require(!window.isVisible(), "ordinary hiding leaves the main window available");
+    window.showAndActivate();
+    require(result->toPlainText() == originalResult, "main-window reopening retains the draft");
+    inspectVariants(QStringLiteral("completed"));
+    QPointer<TranslationPageWidget> oldPage(page);
+    card->setCurrentRoute(QStringLiteral("/global-mouse"));
+    require(!controller->active(), "navigation deactivates before deferred deletion");
+    flushEvents();
+    require(oldPage.isNull(), "navigation destroys the translation page");
+    card->setCurrentRoute(QStringLiteral("/tools/translation"));
+    page = window.findChild<TranslationPageWidget*>();
+    require(page != nullptr &&
+                child<AdTextEdit>(*page, "translationSourceText")->toPlainText().isEmpty(),
+            "returning to Translation starts an empty draft");
+    window.hide();
+    for (const bool useShortcut : {false, true}) {
+        QPointer<MainWindow> closing = new MainWindow(settings::builtInSettingsRegistry(), runtime);
+        closing->show();
+        closing->findChild<ContentCardWidget*>()->setCurrentRoute(
+            QStringLiteral("/tools/translation"));
+        QPointer<TranslationPageWidget> closingPage = closing->findChild<TranslationPageWidget*>();
+        require(closingPage != nullptr, "closing window owns a translation page");
+        auto* closingSource = child<AdTextEdit>(*closingPage, "translationSourceText");
+        auto* closingResult = child<AdTextEdit>(*closingPage, "translationResultText");
+        const int streamIndex = static_cast<int>(server.streams.size());
+        closingSource->setPlainText(QStringLiteral("Discard me"));
+        waitUntil([&] { return server.streams.size() == streamIndex + 1; },
+                  "start translation in the window to close");
+        server.delta(streamIndex, QStringLiteral("Copied before closing"));
+        waitUntil([&] { return !closingResult->toPlainText().isEmpty(); },
+                  "receive a partial translation before closing");
+        if (useShortcut)
+            key(closingSource, Qt::Key_Q, Qt::ControlModifier);
+        else {
+            child<AdButton>(*closingPage, "translationActions")->click();
+            child<QAction>(*closingPage, "translationCopyAndClose")->trigger();
+        }
+        flushEvents();
+        require(
+            closing.isNull() && closingPage.isNull() &&
+                QApplication::clipboard()->text() == QStringLiteral("Copied before closing"),
+            "Copy and Close and Ctrl+Q copy the result and destroy the current window and draft");
+    }
+    qunsetenv("SNOW_SHOT_API_BASE_URL");
+}
+
+#ifdef Q_OS_WIN
+void nativeWindowInteraction() {
+    Server server;
+    SnowShotApiClient client(server.url());
+    QWidget owner;
+    owner.setWindowTitle(QStringLiteral("Snow Shot Translation interaction test"));
+    owner.resize(800, 650);
+    auto* page = new TranslationPageWidget(&owner, &client, 0);
+    page->setGeometry(owner.rect());
+    QObject::connect(page, &TranslationPageWidget::closeWindowRequested, &owner, &QWidget::close);
+    // This native scenario exercises mouse and copy shortcuts. Do not inherit an unfinished
+    // composition from the user's active Windows IME when the test takes foreground focus.
+    auto* source = child<AdTextEdit>(*page, "translationSourceText");
+    source->setAttribute(Qt::WA_InputMethodEnabled, false);
+    owner.show();
+    owner.raise();
+    owner.activateWindow();
+    // Match the existing UIA driver's activation procedure: a background test process does not
+    // automatically receive foreground rights when Windows creates its first window.
+    const auto activate = [&owner]() {
+        const HWND target = reinterpret_cast<HWND>(owner.winId());
+        const DWORD currentThread = GetCurrentThreadId();
+        const DWORD foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        const bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
+                              AttachThreadInput(currentThread, foregroundThread, TRUE) != FALSE;
+        BringWindowToTop(target);
+        SetForegroundWindow(target);
+        if (attached) {
+            AttachThreadInput(currentThread, foregroundThread, FALSE);
+        }
+        return GetForegroundWindow() == target;
+    };
+    waitUntil(activate, "native translation test owns keyboard focus");
+    auto* result = child<AdTextEdit>(*page, "translationResultText");
+    source->setPlainText(QStringLiteral("Hello, world!"));
+    waitUntil([&]() { return server.streams.size() == 1; }, "native page starts translation");
+    server.delta(0, QStringLiteral("你好，世界！"));
+    waitUntil([&]() { return !result->toPlainText().isEmpty(); },
+              "native page displays streamed text");
+    auto* floating = child<AdButton>(*page, "translationActions");
+    QPointer<AdContextMenu> menu;
+    const auto openActions = [&]() {
+        QCursor::setPos(owner.mapToGlobal(QPoint(8, 8)));
+        flushEvents();
+        QCursor::setPos(floating->mapToGlobal(floating->rect().center()));
+        waitUntil(
+            [&]() {
+                menu = visibleTranslationActionsMenu(*page);
+                return menu && menu->isVisible();
+            },
+            "native pointer hover opens a fresh popup");
+    };
+    openActions();
+    snapshot(owner, QStringLiteral("translation-native-hover"));
+    auto nativeClick = [&menu](QAction* action) {
+        QPointer<QAction> actionLifetime = action;
+        require(menu && actionLifetime && menu->actions().contains(action),
+                "native clicks target an action in the current popup session");
+        QCursor::setPos(menu->mapToGlobal(menu->actionGeometry(action).center()));
+        flushEvents();
+        require(menu && menu->isVisible() && actionLifetime,
+                "the native popup and its action remain alive before mouse input");
+        INPUT input[2]{};
+        input[0].type = INPUT_MOUSE;
+        input[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        input[1].type = INPUT_MOUSE;
+        input[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        require(SendInput(2, input, sizeof(INPUT)) == 2, "send native mouse click");
+    };
+    auto nativeCopy = [&activate](WORD letter) {
+        require(activate(), "native keyboard input is confined to the test window");
+        INPUT input[4]{};
+        for (auto& item : input) {
+            item.type = INPUT_KEYBOARD;
+        }
+        input[0].ki.wVk = VK_CONTROL;
+        input[1].ki.wVk = letter;
+        input[2].ki.wVk = letter;
+        input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        input[3].ki.wVk = VK_CONTROL;
+        input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        require(SendInput(4, input, sizeof(INPUT)) == 4, "send native copy shortcut");
+    };
+    QApplication::clipboard()->setText(QStringLiteral("before native copy"));
+    nativeClick(child<QAction>(*menu, "translationCopy"));
+    waitUntil([&]() { return QApplication::clipboard()->text() == result->toPlainText(); },
+              "native hover action copies the partial translation");
+    waitUntil([&]() { return !menu; }, "native Copy retires its menu session");
+    source->setFocus();
+    source->selectAll();
+    nativeCopy('C');
+    waitUntil([&]() { return QApplication::clipboard()->text() == source->toPlainText(); },
+              "native Ctrl+C respects the source selection");
+    auto cursor = source->textCursor();
+    cursor.clearSelection();
+    source->setTextCursor(cursor);
+    nativeCopy('C');
+    waitUntil([&]() { return QApplication::clipboard()->text() == result->toPlainText(); },
+              "native Ctrl+C falls back to translation");
+    nativeCopy('Q');
+    waitUntil([&]() { return !owner.isVisible(); }, "native Ctrl+Q closes the window");
+    server.finish(0);
+    owner.show();
+    owner.raise();
+    owner.activateWindow();
+    waitUntil(activate, "reactivate the native translation test after hiding");
+    openActions();
+    nativeClick(child<QAction>(*menu, "translationCopyAndClose"));
+    waitUntil([&]() { return !owner.isVisible() && !menu; },
+              "native Copy and Close closes the window and retires its menu session");
+}
+#endif
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("translation_page_tests"));
+#ifdef Q_OS_WIN
+    const QDir fonts(qEnvironmentVariable("WINDIR") + QStringLiteral("/Fonts"));
+    for (const QString& file : {QStringLiteral("segoeui.ttf"), QStringLiteral("seguisb.ttf"),
+                                QStringLiteral("msyh.ttc"), QStringLiteral("msyhbd.ttc")}) {
+        if (QFileInfo::exists(fonts.filePath(file))) {
+            QFontDatabase::addApplicationFont(fonts.filePath(file));
+        }
+    }
+#endif
+    QTemporaryDir directory;
+    require(directory.isValid(), "create isolated translation-page storage");
+    auto& storage = snow_shot::storage::ApplicationStorage::instance();
+    require(storage.initialize({directory.path(), directory.path(), 60000}).success,
+            "initialize isolated translation-page storage");
+    require(storage.configuration().setValue(QStringLiteral("screenshot_translation/model"),
+                                             QStringLiteral("general")),
+            "select the server fixture for translation UI tests");
+    require(snow_shot::storage::ExtendedFeaturesSettings().setTranslationPageEnabled(true),
+            "enable optional translation page for translation UI tests");
+    styles::ThemeManager::instance().initialize(app);
+    if (app.arguments().contains(QStringLiteral("--screenshot-settings"))) {
+        screenshotSettingsGeometry();
+        sharedServiceSelectors();
+        additionalLanguageSelectors();
+        screenshotSettingsProviderLifetime();
+        storage.shutdown();
+        return 0;
+    }
+    if (app.arguments().contains(QStringLiteral("--language-dropdowns"))) {
+        languageDropdowns();
+        storage.shutdown();
+        return 0;
+    }
+#ifdef Q_OS_WIN
+    if (app.arguments().contains(QStringLiteral("--native-interaction"))) {
+        nativeWindowInteraction();
+    } else
+#endif
+    {
+        screenshotSettingsGeometry();
+        sharedServiceSelectors();
+        additionalLanguageSelectors();
+        screenshotSettingsProviderLifetime();
+        selectedTextHandoff();
+        selectedTextNavigation();
+        editorContentGeometry();
+        languageDropdowns();
+        selectorContentGeometry();
+        editorAndShortcutBehavior();
+        navigationThemesLanguagesAndGeometry();
+    }
+    storage.shutdown();
+    return 0;
+}

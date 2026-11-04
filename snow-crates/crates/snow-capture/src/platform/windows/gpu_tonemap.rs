@@ -1,0 +1,1683 @@
+use anyhow::Context;
+use std::sync::OnceLock;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS,
+    D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
+    ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
+    ID3D11Texture2D, ID3D11UnorderedAccessView,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_MODE_ROTATION,
+    DXGI_MODE_ROTATION_IDENTITY, DXGI_SAMPLE_DESC,
+};
+use windows::core::Interface;
+
+use crate::color_effect::ScreenColorTransform;
+use crate::convert::{
+    HDR_LUMA_LUT_SIZE, HDR_SDR_TRANSITION_INV_WIDTH, HDR_SDR_TRANSITION_START, HdrFrameContext,
+    build_bt2390_luma_lut,
+};
+use crate::error::{CaptureError, CaptureResult};
+
+/// Pre-compiled shader bytecode, embedded at build time when fxc.exe is available.
+#[cfg(has_precompiled_shader)]
+const PRECOMPILED_CSO: &[u8] = include_bytes!(env!("TONEMAP_CSO_PATH"));
+
+/// Pre-compiled 1D shader bytecode for small textures.
+#[cfg(has_precompiled_shader_1d)]
+const PRECOMPILED_1D_CSO: &[u8] = include_bytes!(env!("TONEMAP_1D_CSO_PATH"));
+
+#[cfg(has_precompiled_shader_f16)]
+const PRECOMPILED_F16_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_CSO_PATH"));
+
+#[cfg(has_precompiled_shader_f16_1d)]
+const PRECOMPILED_F16_1D_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_1D_CSO_PATH"));
+
+#[cfg(not(has_precompiled_shader))]
+fn compile_shader_runtime() -> CaptureResult<Vec<u8>> {
+    compile_shader_runtime_with_entry(b"main\0")
+}
+
+/// Returns cached shader bytecode. Prefers build-time compiled .cso
+/// (embedded via `TONEMAP_CSO_PATH` env var from build.rs), falls back
+/// to runtime D3DCompile on first call.
+fn cached_bytecode() -> &'static CaptureResult<Vec<u8>> {
+    static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
+    BYTECODE.get_or_init(|| {
+        #[cfg(has_precompiled_shader)]
+        {
+            Ok(PRECOMPILED_CSO.to_vec())
+        }
+        #[cfg(not(has_precompiled_shader))]
+        {
+            compile_shader_runtime()
+        }
+    })
+}
+
+/// Returns cached 1D shader bytecode for small-texture dispatch.
+fn cached_bytecode_1d() -> &'static CaptureResult<Vec<u8>> {
+    static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
+    BYTECODE.get_or_init(|| {
+        #[cfg(has_precompiled_shader_1d)]
+        {
+            Ok(PRECOMPILED_1D_CSO.to_vec())
+        }
+        #[cfg(not(has_precompiled_shader_1d))]
+        {
+            compile_shader_runtime_with_entry(b"main_1d\0")
+        }
+    })
+}
+
+fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
+    static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
+    BYTECODE.get_or_init(|| {
+        #[cfg(has_precompiled_shader_f16)]
+        {
+            Ok(PRECOMPILED_F16_CSO.to_vec())
+        }
+        #[cfg(not(has_precompiled_shader_f16))]
+        {
+            compile_shader_runtime_with_entry(b"main_f16\0")
+        }
+    })
+}
+
+fn cached_bytecode_f16_1d() -> &'static CaptureResult<Vec<u8>> {
+    static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
+    BYTECODE.get_or_init(|| {
+        #[cfg(has_precompiled_shader_f16_1d)]
+        {
+            Ok(PRECOMPILED_F16_1D_CSO.to_vec())
+        }
+        #[cfg(not(has_precompiled_shader_f16_1d))]
+        {
+            compile_shader_runtime_with_entry(b"main_f16_1d\0")
+        }
+    })
+}
+
+#[cfg(any(
+    not(has_precompiled_shader),
+    not(has_precompiled_shader_1d),
+    not(has_precompiled_shader_f16),
+    not(has_precompiled_shader_f16_1d),
+))]
+fn compile_shader_runtime_with_entry(entry: &[u8]) -> CaptureResult<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::core::PCSTR;
+
+    let source = include_str!("tonemap_cs.hlsl").as_bytes();
+    let entry_pcstr = PCSTR::from_raw(entry.as_ptr());
+    let target = PCSTR::from_raw(c"cs_5_0".as_ptr().cast());
+    let mut blob = None;
+    let mut errors = None;
+
+    let hr = unsafe {
+        D3DCompile(
+            source.as_ptr() as *const _,
+            source.len(),
+            None,
+            None,
+            None,
+            entry_pcstr,
+            target,
+            0,
+            0,
+            &mut blob,
+            Some(&mut errors),
+        )
+    };
+
+    if let Err(e) = hr {
+        let msg = errors
+            .map(|b| {
+                let ptr = unsafe { b.GetBufferPointer() } as *const u8;
+                let len = unsafe { b.GetBufferSize() };
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                String::from_utf8_lossy(slice).to_string()
+            })
+            .unwrap_or_default();
+        return Err(CaptureError::platform(
+            anyhow::anyhow!("HLSL compile failed: {msg}").context(e.to_string()),
+        ));
+    }
+
+    let blob =
+        blob.ok_or_else(|| CaptureError::platform(anyhow::anyhow!("D3DCompile returned no blob")))?;
+    let ptr = unsafe { blob.GetBufferPointer() } as *const u8;
+    let len = unsafe { blob.GetBufferSize() };
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+struct GpuParams {
+    sdr_white_nits: f32,
+    hdr_peak_nits: f32,
+    sdr_transition_start: f32,
+    flags: u32,
+    tex_width: u32,
+    tex_height: u32,
+    lut_size_minus_one: u32,
+    rotation: u32,
+    lut_input_max: f32,
+    lut_inv_step: f32,
+    sdr_transition_inv_width: f32,
+    _pad2: f32,
+    color_rows: [[f32; 4]; 3],
+}
+
+impl GpuParams {
+    fn with_color_transform(mut self, transform: Option<ScreenColorTransform>) -> Self {
+        if let Some(transform) = transform {
+            self.flags |= GPU_FLAG_RESTORE_COLORS;
+            self.color_rows = transform.linear_rows();
+        }
+        self
+    }
+}
+
+const GPU_FLAG_USE_LUT: u32 = 1;
+const GPU_FLAG_RESTORE_COLORS: u32 = 2;
+
+/// Threshold below which we use the 1D dispatch path.
+/// For textures smaller than 512px on either axis, the 16x16 thread
+/// groups waste significant threads on boundary tiles.
+const SMALL_TEXTURE_THRESHOLD: u32 = 512;
+
+/// Shared GPU compute-shader pass infrastructure.
+///
+/// Encapsulates the D3D11 resources and caching logic common to both
+/// texture/UAV management, SRV caching, and the dispatch call.
+struct GpuComputePass {
+    cs: ID3D11ComputeShader,
+    /// 1D compute shader for small textures (256x1 thread groups).
+    cs_1d: Option<ID3D11ComputeShader>,
+    cbuf: ID3D11Buffer,
+    output_tex: Option<ID3D11Texture2D>,
+    output_uav: Option<ID3D11UnorderedAccessView>,
+    /// Cached SRV for the source texture. Reused when the source texture
+    /// COM pointer hasn't changed between frames (common when the desktop
+    /// hasn't updated).
+    cached_srv: Option<ID3D11ShaderResourceView>,
+    cached_srv_source: usize, // raw COM pointer of the texture the SRV was created for
+    cached_width: u32,
+    cached_height: u32,
+    output_desc: Option<D3D11_TEXTURE2D_DESC>,
+    // UAVs retain COM resources, but never retain the pool's immutable leases.
+    // This lets the pool reuse a destination after its published users release it.
+    pooled_outputs: Vec<(ID3D11Texture2D, ID3D11UnorderedAccessView)>,
+    pooled_output_size: (u32, u32),
+}
+
+impl GpuComputePass {
+    /// Creates a new compute pass from the given shader bytecodes.
+    /// `bytecode_1d` failure is non-fatal (falls back to 2D dispatch).
+    fn new(
+        device: &ID3D11Device,
+        bytecode: &[u8],
+        bytecode_1d: Option<&[u8]>,
+        label: &str,
+    ) -> CaptureResult<Self> {
+        let mut cs: Option<ID3D11ComputeShader> = None;
+        unsafe { device.CreateComputeShader(bytecode, None, Some(&mut cs)) }
+            .context(format!("CreateComputeShader ({label}) failed"))
+            .map_err(CaptureError::platform)?;
+        let cs = cs
+            .context(format!("CreateComputeShader ({label}) returned None"))
+            .map_err(CaptureError::platform)?;
+
+        let cs_1d = bytecode_1d.and_then(|bc| {
+            let mut shader: Option<ID3D11ComputeShader> = None;
+            unsafe { device.CreateComputeShader(bc, None, Some(&mut shader)) }.ok()?;
+            shader
+        });
+
+        let cbuf_desc = D3D11_BUFFER_DESC {
+            ByteWidth: std::mem::size_of::<GpuParams>() as u32,
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            ..Default::default()
+        };
+        let mut cbuf: Option<ID3D11Buffer> = None;
+        unsafe { device.CreateBuffer(&cbuf_desc, None, Some(&mut cbuf)) }
+            .context(format!("CreateBuffer ({label}) for constant buffer failed"))
+            .map_err(CaptureError::platform)?;
+        let cbuf = cbuf
+            .context(format!("CreateBuffer ({label}) returned None"))
+            .map_err(CaptureError::platform)?;
+
+        Ok(Self {
+            cs,
+            cs_1d,
+            cbuf,
+            output_tex: None,
+            output_uav: None,
+            cached_srv: None,
+            cached_srv_source: 0,
+            cached_width: 0,
+            cached_height: 0,
+            output_desc: None,
+            pooled_outputs: Vec::new(),
+            pooled_output_size: (0, 0),
+        })
+    }
+
+    fn ensure_output(
+        &mut self,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> CaptureResult<()> {
+        if self.cached_width == width && self.cached_height == height && self.output_tex.is_some() {
+            return Ok(());
+        }
+
+        crate::admit_raster(width, height)?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+            ..Default::default()
+        };
+
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D for compute output failed")
+            .map_err(CaptureError::platform)?;
+        let tex = tex
+            .context("CreateTexture2D returned None")
+            .map_err(CaptureError::platform)?;
+
+        let mut uav: Option<ID3D11UnorderedAccessView> = None;
+        unsafe { device.CreateUnorderedAccessView(&tex, None, Some(&mut uav)) }
+            .context("CreateUnorderedAccessView failed")
+            .map_err(CaptureError::platform)?;
+        let uav = uav
+            .context("CreateUnorderedAccessView returned None")
+            .map_err(CaptureError::platform)?;
+
+        self.output_tex = Some(tex);
+        self.output_uav = Some(uav);
+        self.cached_width = width;
+        self.cached_height = height;
+        self.output_desc = Some(desc);
+        Ok(())
+    }
+
+    /// Returns a cached or freshly created SRV for the given source texture.
+    fn get_or_create_srv(
+        &mut self,
+        device: &ID3D11Device,
+        source: &ID3D11Texture2D,
+    ) -> CaptureResult<ID3D11ShaderResourceView> {
+        let source_ptr = source.as_raw() as usize;
+        if source_ptr == self.cached_srv_source
+            && let Some(ref srv) = self.cached_srv
+        {
+            return Ok(srv.clone());
+        }
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        unsafe { device.CreateShaderResourceView(source, None, Some(&mut srv)) }
+            .context("CreateShaderResourceView for source failed")
+            .map_err(CaptureError::platform)?;
+        let srv = srv
+            .context("CreateShaderResourceView returned None")
+            .map_err(CaptureError::platform)?;
+
+        self.cached_srv = Some(srv.clone());
+        self.cached_srv_source = source_ptr;
+        Ok(srv)
+    }
+
+    fn pooled_output_uav(
+        &mut self,
+        device: &ID3D11Device,
+        output: &snow_d3d11::Texture,
+        dimensions: (u32, u32),
+    ) -> CaptureResult<ID3D11UnorderedAccessView> {
+        let desc = output.desc();
+        if (desc.Width, desc.Height) != dimensions
+            || desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+            || desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS.0 as u32 == 0
+            || desc.MipLevels != 1
+            || desc.ArraySize != 1
+            || desc.SampleDesc.Count != 1
+        {
+            return Err(CaptureError::InvalidConfig(
+                "GPU conversion output must be a matching RGBA8 UAV texture".into(),
+            ));
+        }
+        if self.pooled_output_size != dimensions {
+            self.pooled_outputs.clear();
+            self.pooled_output_size = dimensions;
+        }
+        if let Some((_, uav)) = self
+            .pooled_outputs
+            .iter()
+            .find(|(texture, _)| texture.as_raw() == output.raw().as_raw())
+        {
+            return Ok(uav.clone());
+        }
+        let mut uav = None;
+        unsafe { device.CreateUnorderedAccessView(output.raw(), None, Some(&mut uav)) }
+            .context("CreateUnorderedAccessView for pooled conversion output failed")
+            .map_err(CaptureError::platform)?;
+        let uav = uav
+            .context("CreateUnorderedAccessView for pooled conversion output returned None")
+            .map_err(CaptureError::platform)?;
+        // Match the bounded capture pools; larger callers still work through
+        // eviction rather than retaining an unbounded number of GPU resources.
+        if self.pooled_outputs.len() == 6 {
+            self.pooled_outputs.remove(0);
+        }
+        self.pooled_outputs
+            .push((output.raw().clone(), uav.clone()));
+        Ok(uav)
+    }
+
+    /// Uploads `gpu_params` to the constant buffer via Map/Unmap.
+    fn update_cbuf(
+        &self,
+        context: &ID3D11DeviceContext,
+        gpu_params: &GpuParams,
+    ) -> CaptureResult<()> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)) }
+            .context("Map constant buffer failed")
+            .map_err(CaptureError::platform)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gpu_params as *const GpuParams as *const u8,
+                mapped.pData as *mut u8,
+                std::mem::size_of::<GpuParams>(),
+            );
+            context.Unmap(&self.cbuf, 0);
+        }
+        Ok(())
+    }
+
+    /// Binds resources, dispatches the compute shader, and unbinds.
+    fn dispatch(
+        &self,
+        context: &ID3D11DeviceContext,
+        source_srv: ID3D11ShaderResourceView,
+        lut_srv: Option<ID3D11ShaderResourceView>,
+        width: u32,
+        height: u32,
+        uav: &ID3D11UnorderedAccessView,
+    ) {
+        unsafe {
+            let use_1d = (width < SMALL_TEXTURE_THRESHOLD || height < SMALL_TEXTURE_THRESHOLD)
+                && self.cs_1d.is_some();
+
+            if use_1d {
+                context.CSSetShader(self.cs_1d.as_ref().unwrap(), None);
+            } else {
+                context.CSSetShader(&self.cs, None);
+            }
+            context.CSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
+            context.CSSetShaderResources(0, Some(&[Some(source_srv), lut_srv]));
+            context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
+
+            if use_1d {
+                let groups_x = width.div_ceil(256);
+                context.Dispatch(groups_x, height, 1);
+            } else {
+                let groups_x = width.div_ceil(16);
+                let groups_y = height.div_ceil(16);
+                context.Dispatch(groups_x, groups_y, 1);
+            }
+
+            let no_srv: Option<ID3D11ShaderResourceView> = None;
+            context.CSSetShaderResources(0, Some(&[no_srv.clone(), no_srv]));
+            context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
+        }
+    }
+
+    fn output_tex(&self) -> &ID3D11Texture2D {
+        self.output_tex.as_ref().unwrap()
+    }
+
+    fn output_desc(&self) -> D3D11_TEXTURE2D_DESC {
+        self.output_desc
+            .expect("output descriptor must be available after ensure_output")
+    }
+
+    fn release_capture_surfaces(&mut self) {
+        self.output_uav = None;
+        self.output_tex = None;
+        self.cached_srv = None;
+        self.cached_srv_source = 0;
+        self.cached_width = 0;
+        self.cached_height = 0;
+        self.output_desc = None;
+        self.pooled_outputs.clear();
+        self.pooled_output_size = (0, 0);
+    }
+}
+
+pub(crate) struct GpuTonemapper {
+    pass: GpuComputePass,
+    rotation: DXGI_MODE_ROTATION,
+    /// Combined cache of tonemap params and dimensions written to the
+    cached_cbuf_state: Option<GpuParams>,
+    cached_lut_state: Option<(HdrFrameContext, f32, f32)>,
+    lut_tex: Option<ID3D11Texture2D>,
+    lut_srv: Option<ID3D11ShaderResourceView>,
+    lut_disabled: bool,
+}
+
+impl GpuTonemapper {
+    pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
+        let bytecode = cached_bytecode().as_ref().map_err(|e| {
+            CaptureError::platform(anyhow::anyhow!("shader compilation failed: {e}"))
+        })?;
+        let bytecode_1d = cached_bytecode_1d().as_ref().ok().map(|v| v.as_slice());
+
+        let pass = GpuComputePass::new(device, bytecode, bytecode_1d, "tonemap")?;
+        Ok(Self {
+            pass,
+            rotation: DXGI_MODE_ROTATION_IDENTITY,
+            cached_cbuf_state: None,
+            cached_lut_state: None,
+            lut_tex: None,
+            lut_srv: None,
+            lut_disabled: false,
+        })
+    }
+
+    pub(crate) fn set_rotation(&mut self, rotation: DXGI_MODE_ROTATION) {
+        self.rotation = rotation;
+    }
+
+    fn ensure_lut(
+        &mut self,
+        device: &ID3D11Device,
+        params: HdrFrameContext,
+    ) -> CaptureResult<(ID3D11ShaderResourceView, f32, f32)> {
+        if let Some((cached_params, input_max, inv_step)) = self.cached_lut_state
+            && cached_params == params
+            && let Some(ref srv) = self.lut_srv
+        {
+            return Ok((srv.clone(), input_max, inv_step));
+        }
+
+        let lut = build_bt2390_luma_lut(params);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: HDR_LUMA_LUT_SIZE as u32,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: lut.values_ptr() as *const _,
+            SysMemPitch: (HDR_LUMA_LUT_SIZE * std::mem::size_of::<f32>()) as u32,
+            SysMemSlicePitch: 0,
+        };
+
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)) }
+            .context("CreateTexture2D for tonemap LUT failed")
+            .map_err(CaptureError::platform)?;
+        let tex = tex
+            .context("CreateTexture2D for tonemap LUT returned None")
+            .map_err(CaptureError::platform)?;
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }
+            .context("CreateShaderResourceView for tonemap LUT failed")
+            .map_err(CaptureError::platform)?;
+        let srv = srv
+            .context("CreateShaderResourceView for tonemap LUT returned None")
+            .map_err(CaptureError::platform)?;
+
+        self.cached_lut_state = Some((params, lut.input_max(), lut.inv_step()));
+        self.lut_tex = Some(tex);
+        self.lut_srv = Some(srv.clone());
+        Ok((srv, lut.input_max(), lut.inv_step()))
+    }
+
+    /// Runs the HDR-to-SDR compute shader on the GPU.
+    /// `source` must be an R16G16B16A16_FLOAT texture.
+    /// Returns a reference to the RGBA8 output texture.
+    pub(crate) fn tonemap(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        source_desc: &D3D11_TEXTURE2D_DESC,
+        params: HdrFrameContext,
+        screen_color_transform: Option<ScreenColorTransform>,
+    ) -> CaptureResult<&ID3D11Texture2D> {
+        let (width, height) =
+            super::rotation::oriented_size(source_desc.Width, source_desc.Height, self.rotation);
+        self.pass.ensure_output(device, width, height)?;
+        let uav = self.pass.output_uav.as_ref().unwrap().clone();
+        self.dispatch_frame(
+            device,
+            context,
+            source,
+            params,
+            screen_color_transform,
+            (width, height),
+            &uav,
+        )?;
+        Ok(self.pass.output_tex())
+    }
+
+    /// Write directly into an exclusively acquired pool destination. The caller
+    /// publishes its immutable lease only after this dispatch has been queued.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tonemap_into(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        source_desc: &D3D11_TEXTURE2D_DESC,
+        params: HdrFrameContext,
+        screen_color_transform: Option<ScreenColorTransform>,
+        output: &snow_d3d11::Texture,
+    ) -> CaptureResult<()> {
+        let dimensions =
+            super::rotation::oriented_size(source_desc.Width, source_desc.Height, self.rotation);
+        let uav = self.pass.pooled_output_uav(device, output, dimensions)?;
+        self.dispatch_frame(
+            device,
+            context,
+            source,
+            params,
+            screen_color_transform,
+            dimensions,
+            &uav,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_frame(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        params: HdrFrameContext,
+        screen_color_transform: Option<ScreenColorTransform>,
+        (width, height): (u32, u32),
+        uav: &ID3D11UnorderedAccessView,
+    ) -> CaptureResult<()> {
+        let params = params.sanitized();
+
+        let (lut_srv, lut_input_max, lut_inv_step, flags) =
+            if params.tonemap_use_lut && !self.lut_disabled {
+                match self.ensure_lut(device, params) {
+                    Ok((srv, input_max, inv_step)) => {
+                        (Some(srv), input_max, inv_step, GPU_FLAG_USE_LUT)
+                    }
+                    Err(_) => {
+                        self.lut_disabled = true;
+                        (None, 0.0, 0.0, 0)
+                    }
+                }
+            } else {
+                if !params.tonemap_use_lut {
+                    self.lut_disabled = false;
+                }
+                (None, 0.0, 0.0, 0)
+            };
+
+        let gpu_params = GpuParams {
+            sdr_white_nits: params.sdr_white_nits,
+            hdr_peak_nits: params.hdr_peak_nits,
+            sdr_transition_start: HDR_SDR_TRANSITION_START,
+            flags,
+            tex_width: width,
+            tex_height: height,
+            lut_size_minus_one: (HDR_LUMA_LUT_SIZE - 1) as u32,
+            rotation: if super::rotation::is_rotated(self.rotation) {
+                (self.rotation.0 - 1) as u32
+            } else {
+                0
+            },
+            lut_input_max,
+            lut_inv_step,
+            sdr_transition_inv_width: HDR_SDR_TRANSITION_INV_WIDTH,
+            _pad2: 0.0,
+            color_rows: [[0.; 4]; 3],
+        }
+        .with_color_transform(screen_color_transform);
+        if self.cached_cbuf_state != Some(gpu_params) {
+            self.pass.update_cbuf(context, &gpu_params)?;
+            self.cached_cbuf_state = Some(gpu_params);
+        }
+
+        let srv = self.pass.get_or_create_srv(device, source)?;
+        self.pass
+            .dispatch(context, srv, lut_srv, width, height, uav);
+        Ok(())
+    }
+
+    pub(crate) fn output_desc(&self) -> D3D11_TEXTURE2D_DESC {
+        self.pass.output_desc()
+    }
+
+    pub(crate) fn release_capture_surfaces(&mut self) {
+        self.pass.release_capture_surfaces();
+    }
+}
+
+///
+/// Used when the source is RGBA16Float but no HDR-to-SDR tonemap is needed.
+/// Converts linear light values directly to sRGB gamma on the GPU, so the
+/// CPU readback path only needs to handle RGBA8 (a simple memcpy-equivalent).
+pub(crate) struct GpuF16Converter {
+    pass: GpuComputePass,
+    cached_cbuf_state: Option<GpuParams>,
+}
+
+impl GpuF16Converter {
+    pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
+        let bytecode = cached_bytecode_f16().as_ref().map_err(|e| {
+            CaptureError::platform(anyhow::anyhow!("F16 shader compilation failed: {e}"))
+        })?;
+        let bytecode_1d = cached_bytecode_f16_1d().as_ref().ok().map(|v| v.as_slice());
+
+        let pass = GpuComputePass::new(device, bytecode, bytecode_1d, "F16")?;
+        Ok(Self {
+            pass,
+            cached_cbuf_state: None,
+        })
+    }
+
+    /// Converts an F16 linear texture to RGBA8 sRGB on the GPU.
+    /// Returns a reference to the RGBA8 output texture.
+    pub(crate) fn convert(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        source_desc: &D3D11_TEXTURE2D_DESC,
+        screen_color_transform: Option<ScreenColorTransform>,
+    ) -> CaptureResult<&ID3D11Texture2D> {
+        let width = source_desc.Width;
+        let height = source_desc.Height;
+        self.pass.ensure_output(device, width, height)?;
+        let uav = self.pass.output_uav.as_ref().unwrap().clone();
+        self.dispatch_frame(
+            device,
+            context,
+            source,
+            screen_color_transform,
+            (width, height),
+            &uav,
+        )?;
+        Ok(self.pass.output_tex())
+    }
+
+    pub(crate) fn convert_into(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        source_desc: &D3D11_TEXTURE2D_DESC,
+        screen_color_transform: Option<ScreenColorTransform>,
+        output: &snow_d3d11::Texture,
+    ) -> CaptureResult<()> {
+        let dimensions = (source_desc.Width, source_desc.Height);
+        let uav = self.pass.pooled_output_uav(device, output, dimensions)?;
+        self.dispatch_frame(
+            device,
+            context,
+            source,
+            screen_color_transform,
+            dimensions,
+            &uav,
+        )
+    }
+
+    fn dispatch_frame(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        screen_color_transform: Option<ScreenColorTransform>,
+        (width, height): (u32, u32),
+        uav: &ID3D11UnorderedAccessView,
+    ) -> CaptureResult<()> {
+        let gpu_params = GpuParams {
+            sdr_white_nits: 0.0,
+            hdr_peak_nits: 0.0,
+            sdr_transition_start: 0.0,
+            flags: 0,
+            tex_width: width,
+            tex_height: height,
+            lut_size_minus_one: 0,
+            rotation: 0,
+            lut_input_max: 0.0,
+            lut_inv_step: 0.0,
+            sdr_transition_inv_width: 0.0,
+            _pad2: 0.0,
+            color_rows: [[0.; 4]; 3],
+        }
+        .with_color_transform(screen_color_transform);
+        if self.cached_cbuf_state != Some(gpu_params) {
+            self.pass.update_cbuf(context, &gpu_params)?;
+            self.cached_cbuf_state = Some(gpu_params);
+        }
+
+        let srv = self.pass.get_or_create_srv(device, source)?;
+        self.pass.dispatch(context, srv, None, width, height, uav);
+        Ok(())
+    }
+
+    pub(crate) fn output_desc(&self) -> D3D11_TEXTURE2D_DESC {
+        self.pass.output_desc()
+    }
+
+    pub(crate) fn release_capture_surfaces(&mut self) {
+        self.pass.release_capture_surfaces();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{rotation, surface};
+    use super::*;
+    use crate::backend::CaptureBlitRegion;
+    use crate::frame::{CapturePixelFormat, Frame};
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+    fn hdr_source(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(ID3D11Texture2D, D3D11_TEXTURE2D_DESC)> {
+        let pixels: Vec<[u16; 4]> = (0..width * height)
+            .map(|i| {
+                [
+                    ((i % 17) as f32) / 4.0,
+                    ((i % 31) as f32) / 6.0,
+                    ((i % 13) as f32) / 3.0,
+                    0.5,
+                ]
+                .map(|v| half::f16::from_f32(v).to_bits())
+            })
+            .collect();
+        hdr_source_from_pixels(device, width, height, &pixels)
+    }
+
+    fn hdr_source_from_pixels(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        pixels: &[[u16; 4]],
+    ) -> anyhow::Result<(ID3D11Texture2D, D3D11_TEXTURE2D_DESC)> {
+        assert_eq!(pixels.len(), (width * height) as usize);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: width * 8,
+            SysMemSlicePitch: 0,
+        };
+        let mut source = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut source)) }?;
+        Ok((source.unwrap(), desc))
+    }
+
+    struct Readback {
+        texture: ID3D11Texture2D,
+        desc: D3D11_TEXTURE2D_DESC,
+        frame: Frame,
+        format: CapturePixelFormat,
+    }
+
+    impl Readback {
+        fn new(
+            device: &ID3D11Device,
+            width: u32,
+            height: u32,
+            format: CapturePixelFormat,
+        ) -> anyhow::Result<Self> {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }?;
+            Ok(Self {
+                texture: texture.unwrap(),
+                desc,
+                frame: Frame::empty(),
+                format,
+            })
+        }
+
+        fn copy(
+            &mut self,
+            context: &ID3D11DeviceContext,
+            source: &ID3D11Texture2D,
+            x: u32,
+            y: u32,
+        ) -> anyhow::Result<()> {
+            let bounds = D3D11_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + self.desc.Width,
+                bottom: y + self.desc.Height,
+                back: 1,
+            };
+            unsafe {
+                context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, source, 0, Some(&bounds));
+            }
+            surface::map_staging_to_frame_blocking(
+                context,
+                &self.texture,
+                None,
+                &self.desc,
+                &mut self.frame,
+                crate::convert::SurfaceConversionOptions {
+                    output_pixel_format: self.format,
+                    ..Default::default()
+                },
+                "HDR rotation test readback",
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hdr_surface_preserves_sdr_and_legacy_highlights_in_both_shader_dispatches()
+    -> anyhow::Result<()> {
+        use crate::convert::hdr_tests::{
+            assert_color_bytes, boosted_sdr_palette, legacy_highlight_fixture,
+        };
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        for use_1d in [true, false] {
+            let mut mapper = GpuTonemapper::new(&device)?;
+            if use_1d {
+                assert!(mapper.pass.cs_1d.is_some());
+            } else {
+                mapper.pass.cs_1d = None;
+            }
+            // Reuse the mapper across white-level changes to exercise its caches.
+            for sdr_white_nits in [80.0, 160.0, 203.0, 280.0, 480.0] {
+                let (mut pixels, sdr_expected) = boosted_sdr_palette(sdr_white_nits);
+                pixels.extend(legacy_highlight_fixture(sdr_white_nits, 400.0).0);
+                let (source, desc) =
+                    hdr_source_from_pixels(&device, pixels.len() as u32, 1, &pixels)?;
+                let mut readback =
+                    Readback::new(&device, desc.Width, desc.Height, CapturePixelFormat::Rgba8)?;
+                for hdr_peak_nits in [400.0, 1000.0, 4000.0] {
+                    let mut expected = sdr_expected.clone();
+                    expected.extend(legacy_highlight_fixture(sdr_white_nits, hdr_peak_nits).1);
+                    for tonemap_use_lut in [false, true] {
+                        let params = HdrFrameContext {
+                            sdr_white_nits,
+                            hdr_peak_nits,
+                            tonemap_use_lut,
+                            ..Default::default()
+                        };
+                        let output =
+                            mapper.tonemap(&device, &context, &source, &desc, params, None)?;
+                        readback.copy(&context, output, 0, 0)?;
+                        assert_color_bytes(
+                            readback.frame.as_bytes(),
+                            &expected,
+                            false,
+                            &format!(
+                                "GPU 1D={use_1d}, white={sdr_white_nits}, peak={hdr_peak_nits}, LUT={tonemap_use_lut}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hdr_highlight_gradients_are_continuous_in_both_shader_dispatches() -> anyhow::Result<()> {
+        use crate::convert::hdr_tests::{
+            HIGHLIGHT_RAMP_HEIGHT, HIGHLIGHT_RAMP_WIDTH, assert_smooth_highlight_rows,
+            highlight_ramp,
+        };
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        for sdr_white_nits in [80.0, 160.0, 280.0, 480.0] {
+            let pixels = highlight_ramp(sdr_white_nits);
+            let (source, desc) = hdr_source_from_pixels(
+                &device,
+                HIGHLIGHT_RAMP_WIDTH as u32,
+                HIGHLIGHT_RAMP_HEIGHT as u32,
+                &pixels,
+            )?;
+            let src: Vec<u8> = pixels
+                .iter()
+                .flat_map(|px| px.iter().flat_map(|v| v.to_ne_bytes()))
+                .collect();
+            for use_1d in [true, false] {
+                let mut mapper = GpuTonemapper::new(&device)?;
+                if use_1d {
+                    assert!(mapper.pass.cs_1d.is_some());
+                } else {
+                    mapper.pass.cs_1d = None;
+                }
+                let mut readback =
+                    Readback::new(&device, desc.Width, desc.Height, CapturePixelFormat::Rgba8)?;
+                for hdr_peak_nits in [400.0, 1000.0, 4000.0] {
+                    for tonemap_use_lut in [false, true] {
+                        let params = HdrFrameContext {
+                            sdr_white_nits,
+                            hdr_peak_nits,
+                            tonemap_use_lut,
+                            ..Default::default()
+                        };
+                        let output =
+                            mapper.tonemap(&device, &context, &source, &desc, params, None)?;
+                        readback.copy(&context, output, 0, 0)?;
+                        let actual = readback.frame.as_bytes();
+                        assert_smooth_highlight_rows(
+                            actual,
+                            &format!(
+                                "GPU 1D={use_1d}, white={sdr_white_nits}, peak={hdr_peak_nits}, LUT={tonemap_use_lut}"
+                            ),
+                        );
+                        let mut expected = vec![0u8; actual.len()];
+                        crate::convert::convert_row_to_rgba_with_options(
+                            crate::convert::SurfacePixelFormat::Rgba16Float,
+                            &src,
+                            &mut expected,
+                            pixels.len(),
+                            crate::convert::SurfaceConversionOptions {
+                                hdr_to_sdr: Some(params),
+                                ..Default::default()
+                            },
+                        );
+                        for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                            assert!(
+                                a.abs_diff(*b) <= 1,
+                                "GPU at byte {i}: {a} != {b}, 1D={use_1d}, white={sdr_white_nits}, peak={hdr_peak_nits}, LUT={tonemap_use_lut}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hdr_fused_rotation_matches_cpu_for_dispatches_crops_and_cached_state() -> anyhow::Result<()>
+    {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+        };
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        for (width, height) in [(3, 2), (33, 17), (17, 17)] {
+            let (source, desc) = hdr_source(&device, width, height)?;
+            for use_1d in [false, true] {
+                for use_lut in [false, true] {
+                    let mut mapper = GpuTonemapper::new(&device)?;
+                    if !use_1d {
+                        mapper.pass.cs_1d = None;
+                    } else {
+                        assert!(mapper.pass.cs_1d.is_some());
+                    }
+                    let params = HdrFrameContext {
+                        tonemap_use_lut: use_lut,
+                        ..Default::default()
+                    };
+                    for format in [CapturePixelFormat::Rgba8, CapturePixelFormat::Bgra8] {
+                        mapper.set_rotation(DXGI_MODE_ROTATION_IDENTITY);
+                        let baseline =
+                            mapper.tonemap(&device, &context, &source, &desc, params, None)?;
+                        let mut native = Readback::new(&device, width, height, format)?;
+                        native.copy(&context, baseline, 0, 0)?;
+                        for rotation in [
+                            DXGI_MODE_ROTATION_ROTATE90,
+                            DXGI_MODE_ROTATION_ROTATE270,
+                            DXGI_MODE_ROTATION_ROTATE180,
+                            DXGI_MODE_ROTATION_IDENTITY,
+                        ] {
+                            mapper.set_rotation(rotation);
+                            let expected =
+                                rotation::orient_frame(&native.frame, Frame::empty(), rotation)?;
+                            let output = mapper
+                                .tonemap(&device, &context, &source, &desc, params, None)?
+                                .clone();
+                            let mut actual = Readback::new(
+                                &device,
+                                expected.width(),
+                                expected.height(),
+                                format,
+                            )?;
+                            actual.copy(&context, &output, 0, 0)?;
+                            assert_eq!(
+                                actual.frame.as_bytes(),
+                                expected.as_bytes(),
+                                "{width}x{height} {rotation:?} 1D={use_1d} LUT={use_lut}"
+                            );
+                            let output_again =
+                                mapper.tonemap(&device, &context, &source, &desc, params, None)?;
+                            assert_eq!(
+                                output.as_raw(),
+                                output_again.as_raw(),
+                                "stable output must reuse its texture"
+                            );
+                            let mut crop =
+                                Readback::new(&device, 1, expected.height() - 1, format)?;
+                            crop.copy(&context, &output, 1, 1)?;
+                            for y in 1..expected.height() {
+                                let offset = ((y * expected.width() + 1) * 4) as usize;
+                                assert_eq!(
+                                    &crop.frame.as_bytes()
+                                        [((y - 1) * 4) as usize..(y * 4) as usize],
+                                    &expected.as_bytes()[offset..offset + 4]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Release hardware benchmark; run scripts/run-capture-rotation-perf.ps1 -Hdr"]
+    fn hdr_rotation_performance_benchmark() -> anyhow::Result<()> {
+        use std::time::Instant;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_ROTATE90;
+        anyhow::ensure!(
+            !cfg!(debug_assertions),
+            "HDR rotation benchmark requires Release"
+        );
+        let (device, context) = super::super::d3d11::create_d3d11_device_default(true)?;
+        let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice = device.cast()?;
+        let adapter = unsafe { dxgi.GetAdapter()?.GetDesc()? };
+        println!(
+            "adapter={}",
+            String::from_utf16_lossy(&adapter.Description).trim_end_matches('\0')
+        );
+        println!("source,crop,mode,median_ms,p95_ms");
+        for (width, height) in [(1920, 1080), (3840, 2160)] {
+            let (source, desc) = hdr_source(&device, width, height)?;
+            for (crop_width, crop_height) in [(height, width), (320, 180)] {
+                let desktop = CaptureBlitRegion {
+                    src_x: (height - crop_width) / 2,
+                    src_y: (width - crop_height) / 2,
+                    width: crop_width,
+                    height: crop_height,
+                    dst_x: 0,
+                    dst_y: 0,
+                };
+                let crop =
+                    rotation::native_blit(desktop, height, width, DXGI_MODE_ROTATION_ROTATE90)?;
+                let mut baseline = GpuTonemapper::new(&device)?;
+                let mut fused = GpuTonemapper::new(&device)?;
+                fused.set_rotation(DXGI_MODE_ROTATION_ROTATE90);
+                let mut native =
+                    Readback::new(&device, crop.width, crop.height, CapturePixelFormat::Bgra8)?;
+                let mut upright =
+                    Readback::new(&device, crop_width, crop_height, CapturePixelFormat::Bgra8)?;
+                let mut cpu_output = Frame::empty();
+                let mut samples = [Vec::new(), Vec::new()];
+                for iteration in 0..60 {
+                    for mode in [iteration % 2, 1 - iteration % 2] {
+                        let started = Instant::now();
+                        if mode == 0 {
+                            let output = baseline.tonemap(
+                                &device,
+                                &context,
+                                &source,
+                                &desc,
+                                HdrFrameContext::default(),
+                                None,
+                            )?;
+                            native.copy(&context, output, crop.src_x, crop.src_y)?;
+                            cpu_output = rotation::orient_frame(
+                                &native.frame,
+                                cpu_output,
+                                DXGI_MODE_ROTATION_ROTATE90,
+                            )?;
+                            std::hint::black_box(cpu_output.as_bytes());
+                        } else {
+                            let output = fused.tonemap(
+                                &device,
+                                &context,
+                                &source,
+                                &desc,
+                                HdrFrameContext::default(),
+                                None,
+                            )?;
+                            upright.copy(&context, output, desktop.src_x, desktop.src_y)?;
+                            std::hint::black_box(upright.frame.as_bytes());
+                        }
+                        if iteration >= 10 {
+                            samples[mode].push(started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
+                }
+                assert_eq!(cpu_output.as_bytes(), upright.frame.as_bytes());
+                for (mode, mut times) in samples.into_iter().enumerate() {
+                    times.sort_by(f64::total_cmp);
+                    println!(
+                        "{width}x{height},{crop_width}x{crop_height},{},{:.4},{:.4}",
+                        ["tone-map+CPU-rotation", "fused-HDR-rotation"][mode],
+                        times[25],
+                        times[47]
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_pixel(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+    ) -> anyhow::Result<[u8; 4]> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }?;
+        let staging = staging.unwrap();
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context.CopyResource(&staging, texture);
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let pixel = std::ptr::read_unaligned(mapped.pData.cast::<[u8; 4]>());
+            context.Unmap(&staging, 0);
+            Ok(pixel)
+        }
+    }
+
+    #[test]
+    fn pooled_hdr_outputs_match_internal_outputs_and_preserve_leases() -> anyhow::Result<()> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+        };
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1()? };
+        let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter()? };
+        let shared = snow_d3d11::SharedDevice::create_compute(&adapter)?;
+        let _lock = shared.lock();
+        let device = shared.device();
+        let context = shared.context();
+        let mut mapper = GpuTonemapper::new(device)?;
+        let mut converter = GpuF16Converter::new(device)?;
+        let correction = ScreenColorTransform::from_magnifier_matrix(&[
+            -1., 0., 0., 0., 0., 0., -1., 0., 0., 0., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 1.,
+            1., 1., 0., 1.,
+        ])
+        .unwrap();
+        for (width, height) in [(19, 11), (513, 517)] {
+            let (source, desc) = hdr_source(device, width, height)?;
+            for rotation in [
+                DXGI_MODE_ROTATION_IDENTITY,
+                DXGI_MODE_ROTATION_ROTATE90,
+                DXGI_MODE_ROTATION_ROTATE180,
+                DXGI_MODE_ROTATION_ROTATE270,
+            ] {
+                mapper.set_rotation(rotation);
+                let (out_width, out_height) = rotation::oriented_size(width, height, rotation);
+                let mut pool = snow_d3d11::TexturePool::new(shared.clone(), 2);
+                let mut expected =
+                    Readback::new(device, out_width, out_height, CapturePixelFormat::Rgba8)?;
+                let mut actual =
+                    Readback::new(device, out_width, out_height, CapturePixelFormat::Rgba8)?;
+                for lut in [false, true] {
+                    for transform in [None, Some(correction)] {
+                        let params = HdrFrameContext {
+                            sdr_white_nits: 160.,
+                            tonemap_use_lut: lut,
+                            ..Default::default()
+                        };
+                        let internal =
+                            mapper.tonemap(device, context, &source, &desc, params, transform)?;
+                        expected.copy(context, internal, 0, 0)?;
+                        let first = crate::gpu::acquire_conversion_output(
+                            &mut pool, out_width, out_height,
+                        )?;
+                        let first_id = first.raw().as_raw();
+                        mapper.tonemap_into(
+                            device, context, &source, &desc, params, transform, &first,
+                        )?;
+                        let second = crate::gpu::acquire_conversion_output(
+                            &mut pool, out_width, out_height,
+                        )?;
+                        assert_ne!(first.raw().as_raw(), second.raw().as_raw());
+                        assert!(
+                            crate::gpu::acquire_conversion_output(&mut pool, out_width, out_height)
+                                .is_err()
+                        );
+                        mapper.tonemap_into(
+                            device,
+                            context,
+                            &source,
+                            &desc,
+                            HdrFrameContext {
+                                sdr_white_nits: 280.,
+                                ..params
+                            },
+                            transform,
+                            &second,
+                        )?;
+                        // Neither another pooled dispatch nor the internal-output
+                        // API may modify a previously published immutable lease.
+                        mapper.tonemap(device, context, &source, &desc, params, None)?;
+                        actual.copy(context, first.raw(), 0, 0)?;
+                        assert_eq!(actual.frame.as_bytes(), expected.frame.as_bytes());
+                        drop(first);
+                        drop(second);
+                        let reused = crate::gpu::acquire_conversion_output(
+                            &mut pool, out_width, out_height,
+                        )?;
+                        assert_eq!(reused.raw().as_raw(), first_id);
+                    }
+                }
+            }
+            let mut pool = snow_d3d11::TexturePool::new(shared.clone(), 2);
+            for transform in [None, Some(correction)] {
+                let internal = converter.convert(device, context, &source, &desc, transform)?;
+                let mut expected = Readback::new(device, width, height, CapturePixelFormat::Rgba8)?;
+                let mut actual = Readback::new(device, width, height, CapturePixelFormat::Rgba8)?;
+                expected.copy(context, internal, 0, 0)?;
+                let output = crate::gpu::acquire_conversion_output(&mut pool, width, height)?;
+                converter.convert_into(device, context, &source, &desc, transform, &output)?;
+                actual.copy(context, output.raw(), 0, 0)?;
+                assert_eq!(actual.frame.as_bytes(), expected.frame.as_bytes());
+            }
+            let wrong_size = crate::gpu::acquire_conversion_output(&mut pool, width + 1, height)?;
+            assert!(
+                converter
+                    .convert_into(device, context, &source, &desc, None, &wrong_size)
+                    .is_err()
+            );
+            let no_uav = shared.texture(
+                width,
+                height,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            )?;
+            assert!(
+                converter
+                    .convert_into(device, context, &source, &desc, None, &no_uav)
+                    .is_err()
+            );
+            assert!(mapper.pass.pooled_outputs.len() <= 6);
+        }
+        mapper.release_capture_surfaces();
+        converter.release_capture_surfaces();
+        assert!(mapper.pass.pooled_outputs.is_empty());
+        assert!(converter.pass.pooled_outputs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Release hardware benchmark; run with windows-msvc-performance and --ignored --nocapture"]
+    fn hdr_pooled_output_performance_benchmark() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+        anyhow::ensure!(
+            !cfg!(debug_assertions),
+            "Release is required for GPU benchmarks"
+        );
+        fn query(device: &ID3D11Device, kind: D3D11_QUERY) -> anyhow::Result<ID3D11Query> {
+            let mut result = None;
+            unsafe {
+                device.CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: kind,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut result),
+                )?;
+            }
+            Ok(result.unwrap())
+        }
+        fn query_data<T: Default>(
+            context: &ID3D11DeviceContext,
+            query: &ID3D11Query,
+        ) -> anyhow::Result<T> {
+            let start = Instant::now();
+            loop {
+                let mut value = T::default();
+                let status = unsafe {
+                    (context.vtable().GetData)(
+                        context.as_raw(),
+                        query.as_raw(),
+                        (&mut value as *mut T).cast(),
+                        std::mem::size_of::<T>() as u32,
+                        0,
+                    )
+                };
+                if status.0 == 0 {
+                    return Ok(value);
+                }
+                status.ok()?;
+                anyhow::ensure!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "GPU timestamp query timed out"
+                );
+                std::thread::yield_now();
+            }
+        }
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+        let adapter: IDXGIAdapter = unsafe { factory.EnumAdapters(0)? };
+        let shared = snow_d3d11::SharedDevice::create(&adapter)?;
+        println!("HDR_GPU_ADAPTER,{}", shared.identity().description);
+        let _lock = shared.lock();
+        let device = shared.device();
+        let context = shared.context();
+        let clock = query(device, D3D11_QUERY_TIMESTAMP_DISJOINT)?;
+        let begin = query(device, D3D11_QUERY_TIMESTAMP)?;
+        let end = query(device, D3D11_QUERY_TIMESTAMP)?;
+        println!(
+            "HDR_GPU_HEADER,round,width,height,mode,path,gpu_p50_ms,gpu_p95_ms,cpu_p50_ms,cpu_p95_ms"
+        );
+        for (width, height) in [(1920, 1080), (3840, 2160)] {
+            let (source, desc) = hdr_source(device, width, height)?;
+            for mode in ["lut", "precise", "f16"] {
+                let params = HdrFrameContext {
+                    sdr_white_nits: 160.,
+                    tonemap_use_lut: mode == "lut",
+                    ..Default::default()
+                };
+                for round in 0..3 {
+                    for direct in if round % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        let mut mapper = GpuTonemapper::new(device)?;
+                        let mut converter = GpuF16Converter::new(device)?;
+                        let mut pool = snow_d3d11::TexturePool::new(shared.clone(), 6);
+                        let mut history = VecDeque::new();
+                        let mut gpu_times = Vec::new();
+                        let mut cpu_times = Vec::new();
+                        let warming = Instant::now();
+                        let mut iteration = 0;
+                        while gpu_times.len() < 80 {
+                            unsafe {
+                                context.Begin(&clock);
+                                context.End(&begin);
+                            }
+                            let submitted = Instant::now();
+                            for _ in 0..16 {
+                                let output = if direct {
+                                    let output = crate::gpu::acquire_conversion_output(
+                                        &mut pool, width, height,
+                                    )?;
+                                    if mode == "f16" {
+                                        converter.convert_into(
+                                            device, context, &source, &desc, None, &output,
+                                        )?;
+                                    } else {
+                                        mapper.tonemap_into(
+                                            device, context, &source, &desc, params, None, &output,
+                                        )?;
+                                    }
+                                    output
+                                } else {
+                                    let temporary = if mode == "f16" {
+                                        converter.convert(device, context, &source, &desc, None)?
+                                    } else {
+                                        mapper.tonemap(
+                                            device, context, &source, &desc, params, None,
+                                        )?
+                                    };
+                                    crate::gpu::copy_texture(&shared, &mut pool, temporary)?
+                                };
+                                history.push_back(output);
+                                if history.len() > 3 {
+                                    history.pop_front();
+                                }
+                            }
+                            let cpu_ms = submitted.elapsed().as_secs_f64() * 1000. / 16.;
+                            unsafe {
+                                context.End(&end);
+                                context.End(&clock);
+                                context.Flush();
+                            }
+                            let data =
+                                query_data::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(context, &clock)?;
+                            let start = query_data::<u64>(context, &begin)?;
+                            let finish = query_data::<u64>(context, &end)?;
+                            if iteration >= 24
+                                && warming.elapsed() >= Duration::from_millis(750)
+                                && !data.Disjoint.as_bool()
+                            {
+                                gpu_times.push(
+                                    (finish - start) as f64 / data.Frequency as f64 * 1000. / 16.,
+                                );
+                                cpu_times.push(cpu_ms);
+                            }
+                            iteration += 1;
+                            anyhow::ensure!(
+                                warming.elapsed() < Duration::from_secs(30),
+                                "GPU benchmark case timed out"
+                            );
+                        }
+                        gpu_times.sort_by(f64::total_cmp);
+                        cpu_times.sort_by(f64::total_cmp);
+                        println!(
+                            "HDR_GPU_PERF,{round},{width},{height},{mode},{},{:.6},{:.6},{:.6},{:.6}",
+                            if direct { "direct" } else { "copy" },
+                            gpu_times[40],
+                            gpu_times[75],
+                            cpu_times[40],
+                            cpu_times[75]
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hdr_color_correction_shader_restores_sdr_and_updates_cached_constants() -> anyhow::Result<()>
+    {
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+        }
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let original = [0.07f32, 0.35, 2.8, 0.5];
+        let filtered = [0.93f32, 0.65, -1.8, 0.5].map(|v| half::f16::from_f32(v).to_bits());
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: filtered.as_ptr().cast(),
+            SysMemPitch: 8,
+            SysMemSlicePitch: 0,
+        };
+        let mut source = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut source)) }?;
+        let source = source.unwrap();
+        let transform = ScreenColorTransform {
+            inverted: true,
+            rows: [
+                [-1., 0., 0., 255.],
+                [0., -1., 0., 255.],
+                [0., 0., -1., 255.],
+            ],
+        };
+        let params = HdrFrameContext {
+            sdr_white_nits: 280.,
+            ..Default::default()
+        };
+        let bytes = original
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        for use_1d in [true, false] {
+            for hdr in [true, false] {
+                let mut mapper = GpuTonemapper::new(&device)?;
+                let mut converter = GpuF16Converter::new(&device)?;
+                if !use_1d {
+                    mapper.pass.cs_1d = None;
+                    converter.pass.cs_1d = None;
+                }
+                let mut expected = [0u8; 4];
+                crate::convert::convert_row_to_rgba_with_options(
+                    crate::convert::SurfacePixelFormat::Rgba16Float,
+                    &bytes,
+                    &mut expected,
+                    1,
+                    crate::convert::SurfaceConversionOptions {
+                        hdr_to_sdr: hdr.then_some(params),
+                        ..Default::default()
+                    },
+                );
+                let mut baseline = None;
+                for correction in [None, Some(transform), None] {
+                    let output = if hdr {
+                        mapper.tonemap(&device, &context, &source, &desc, params, correction)?
+                    } else {
+                        converter.convert(&device, &context, &source, &desc, correction)?
+                    };
+                    let actual = read_pixel(&device, &context, output)?;
+                    if correction.is_some() {
+                        for (a, b) in actual.into_iter().zip(expected) {
+                            assert!(
+                                a.abs_diff(b) <= 1,
+                                "GPU {actual:?} != SDR baseline {expected:?}"
+                            );
+                        }
+                    } else if let Some(baseline) = baseline {
+                        assert_eq!(
+                            actual, baseline,
+                            "disabling correction must update GPU constants"
+                        );
+                    } else {
+                        baseline = Some(actual);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

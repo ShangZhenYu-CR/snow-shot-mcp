@@ -1,0 +1,72 @@
+#pragma once
+
+#include "snow_canvas_image_source_types.h"
+
+#include <QList>
+#include <QRect>
+#include <QRegion>
+#include <QTransform>
+#include <QtGlobal>
+
+#include <cstdint>
+#include <optional>
+
+class QPainter;
+
+// A fixed source-pixel grid for scenes whose filters must scale with the image.
+struct SnowCanvasFilterRenderReference {
+    enum class Presentation { Replace, Composite };
+
+    QRectF canvasRect;
+    qreal pixelsPerCanvasUnit = 1.0;
+    // Replace owns the destination, including any viewport-wide backdrop. Composite
+    // draws only the complete reference scene over a background owned by the host.
+    Presentation presentation = Presentation::Replace;
+};
+
+struct SnowCanvasRenderContext {
+    enum class Purpose { Widget, ContentSnapshot };
+
+    QRect viewportRect;
+    QRegion exposedRegion;
+    QTransform canvasToViewTransform;
+    qreal devicePixelRatio = 1.0;
+    Purpose purpose = Purpose::Widget;
+};
+
+class SnowCanvasCustomRenderer {
+  public:
+    virtual ~SnowCanvasCustomRenderer() = default;
+
+    // Increment when renderBeforeCanvas() or renderOriginalBackground() would produce different
+    // pixels. The canvas uses this revision to invalidate its cached background tiles.
+    [[nodiscard]] virtual std::uint64_t contentRevision() const;
+
+    // Increment only when pristine pixels change. Hosts with temporary backdrop previews
+    // can keep eraser source tiles stable; the default follows contentRevision().
+    [[nodiscard]] virtual std::uint64_t originalBackgroundRevision() const;
+
+    // Shared original image layers in paint order, in canvas coordinates. Decorations,
+    // annotations and temporary effect previews must not be included.
+    [[nodiscard]] virtual QList<SnowCanvasBaseImageSource> baseImageSources() const;
+
+    // Retain the background and scene at this resolution when filters are present.
+    // Zoom, viewport size, and display DPR only transform the retained output.
+    // The rectangle must cover the complete scene presented by the host.
+    [[nodiscard]] virtual std::optional<SnowCanvasFilterRenderReference>
+    filterRenderReference() const;
+
+    // True only if renderBeforeCanvas replaces every pixel of this widget-space
+    // rectangle. Allows the canvas to omit a redundant background fill.
+    [[nodiscard]] virtual bool coversWidgetRect(const QRect& widgetRect) const;
+
+    // Releases derived data while preserving the sources and rendered content.
+    virtual void clearRenderState();
+
+    virtual void renderBeforeCanvas(QPainter& painter, const SnowCanvasRenderContext& context);
+    // Paint the pristine host backdrop, excluding annotation and temporary effect previews.
+    // The default preserves existing custom renderers' background behavior.
+    virtual void renderOriginalBackground(QPainter& painter,
+                                          const SnowCanvasRenderContext& context);
+    virtual void renderAfterCanvas(QPainter& painter, const SnowCanvasRenderContext& context);
+};

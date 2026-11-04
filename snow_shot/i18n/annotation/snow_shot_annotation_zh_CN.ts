@@ -1,0 +1,1698 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="zh_CN" sourcelanguage="en_US">
+    <context>
+        <name>ScreenshotQuickTextAnnotationToolbar</name>
+        <message>
+            <source>Highlight</source>
+            <translation>高亮</translation>
+        </message>
+        <message>
+            <source>Strikethrough</source>
+            <translation>删除线</translation>
+        </message>
+        <message>
+            <source>Underline</source>
+            <translation>下划线</translation>
+        </message>
+        <message>
+            <source>Wavy Underline</source>
+            <translation>波浪下划线</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotToolPalette</name>
+        <message>
+            <source>%1 (unavailable)</source>
+            <translation>%1（不可用）</translation>
+        </message>
+        <message>
+            <source>1 decimal place</source>
+            <translation>1 位小数</translation>
+        </message>
+        <message>
+            <source>180° angle</source>
+            <translation>180° 角</translation>
+        </message>
+        <message>
+            <source>2 decimal places</source>
+            <translation>2 位小数</translation>
+        </message>
+        <message>
+            <source>3 decimal places</source>
+            <translation>3 位小数</translation>
+        </message>
+        <message>
+            <source>360° angle</source>
+            <translation>360° 角</translation>
+        </message>
+        <message>
+            <source>Actual distance value</source>
+            <translation>实际距离值</translation>
+        </message>
+        <message>
+            <source>Add</source>
+            <translation>添加</translation>
+        </message>
+        <message>
+            <source>Add Template</source>
+            <translation>添加模板</translation>
+        </message>
+        <message>
+            <source>Add screenshot region</source>
+            <translation>添加截图区域</translation>
+        </message>
+        <message>
+            <source>Add template</source>
+            <translation>添加模板</translation>
+        </message>
+        <message>
+            <source>Adjust filter intensity</source>
+            <translation>调整滤镜强度</translation>
+        </message>
+        <message>
+            <source>Adjust opacity</source>
+            <translation>调整不透明度</translation>
+        </message>
+        <message>
+            <source>AirDrop</source>
+            <translation>隔空投送</translation>
+        </message>
+        <message>
+            <source>Align bottom</source>
+            <translation>底对齐</translation>
+        </message>
+        <message>
+            <source>Align left</source>
+            <translation>左对齐</translation>
+        </message>
+        <message>
+            <source>Align right</source>
+            <translation>右对齐</translation>
+        </message>
+        <message>
+            <source>Align text center</source>
+            <translation>文本居中对齐</translation>
+        </message>
+        <message>
+            <source>Align text left</source>
+            <translation>文本左对齐</translation>
+        </message>
+        <message>
+            <source>Align text right</source>
+            <translation>文本右对齐</translation>
+        </message>
+        <message>
+            <source>Align top</source>
+            <translation>顶对齐</translation>
+        </message>
+        <message>
+            <source>Angle annotation</source>
+            <translation>角度标注</translation>
+        </message>
+        <message>
+            <source>Angle stroke color</source>
+            <translation>角度线条颜色</translation>
+        </message>
+        <message>
+            <source>Angle stroke color %1</source>
+            <translation>角度线条颜色 %1</translation>
+        </message>
+        <message>
+            <source>Angle stroke width %1</source>
+            <translation>角度线条宽度 %1</translation>
+        </message>
+        <message>
+            <source>Angle type</source>
+            <translation>角度类型</translation>
+        </message>
+        <message>
+            <source>Angle unit</source>
+            <translation>角度单位</translation>
+        </message>
+        <message>
+            <source>Animated recording formats do not contain audio</source>
+            <translation>动画录制格式不包含音频</translation>
+        </message>
+        <message>
+            <source>Annotation Template</source>
+            <translation>标注模板</translation>
+        </message>
+        <message>
+            <source>Arabic numerals</source>
+            <translation>阿拉伯数字</translation>
+        </message>
+        <message>
+            <source>Architect</source>
+            <translation>建筑师</translation>
+        </message>
+        <message>
+            <source>Arrow</source>
+            <translation>箭头</translation>
+        </message>
+        <message>
+            <source>Arrow color</source>
+            <translation>箭头颜色</translation>
+        </message>
+        <message>
+            <source>Arrow color %1</source>
+            <translation>箭头颜色 %1</translation>
+        </message>
+        <message>
+            <source>Arrow outline color %1</source>
+            <translation>箭头描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Arrow outline color transparent</source>
+            <translation>箭头描边颜色透明</translation>
+        </message>
+        <message>
+            <source>Arrow outline width</source>
+            <translation>箭头描边宽度</translation>
+        </message>
+        <message>
+            <source>Arrow outline width %1px</source>
+            <translation>箭头描边宽度 %1px</translation>
+        </message>
+        <message>
+            <source>Arrow shaft type</source>
+            <translation>箭杆类型</translation>
+        </message>
+        <message>
+            <source>Arrow width %1</source>
+            <translation>箭头宽度 %1</translation>
+        </message>
+        <message>
+            <source>Arrowhead scale (scroll to adjust)</source>
+            <translation>箭头端点比例（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Artist</source>
+            <translation>艺术家</translation>
+        </message>
+        <message>
+            <source>Auto Filter</source>
+            <translation>自动滤镜</translation>
+        </message>
+        <message>
+            <source>Auto-scroll</source>
+            <translation>自动滚动</translation>
+        </message>
+        <message>
+            <source>Auto-scroll interval (scroll to adjust; click to reset to 200 ms)</source>
+            <translation>自动滚动间隔（滚轮调整；单击重置为 200 ms）</translation>
+        </message>
+        <message>
+            <source>Available for multi-region selections</source>
+            <translation>仅适用于多区域选区</translation>
+        </message>
+        <message>
+            <source>Avatar</source>
+            <translation>头像</translation>
+        </message>
+        <message>
+            <source>Barcode recognition</source>
+            <translation>条码识别</translation>
+        </message>
+        <message>
+            <source>Blue</source>
+            <translation>蓝色</translation>
+        </message>
+        <message>
+            <source>Bold</source>
+            <translation>粗体</translation>
+        </message>
+        <message>
+            <source>Bracket annotation</source>
+            <translation>括号标注</translation>
+        </message>
+        <message>
+            <source>Bracket stroke color</source>
+            <translation>括号描边颜色</translation>
+        </message>
+        <message>
+            <source>Bracket stroke color %1</source>
+            <translation>括号描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Bracket stroke width %1</source>
+            <translation>括号描边宽度 %1</translation>
+        </message>
+        <message>
+            <source>Brightness</source>
+            <translation>亮度</translation>
+        </message>
+        <message>
+            <source>Bring forward</source>
+            <translation>上移一层</translation>
+        </message>
+        <message>
+            <source>Bring to front</source>
+            <translation>置于顶层</translation>
+        </message>
+        <message>
+            <source>Brush Eraser</source>
+            <translation>画笔橡皮擦</translation>
+        </message>
+        <message>
+            <source>Brush eraser width %1 (%2px)</source>
+            <translation>画笔橡皮擦宽度 %1（%2 像素）</translation>
+        </message>
+        <message>
+            <source>Cancel</source>
+            <translation>取消</translation>
+        </message>
+        <message>
+            <source>Cancel screenshot</source>
+            <translation>取消截图</translation>
+        </message>
+        <message>
+            <source>Capture interface during scrolling screenshot</source>
+            <translation>滚动截图时捕获界面</translation>
+        </message>
+        <message>
+            <source>Cartoonist</source>
+            <translation>漫画家</translation>
+        </message>
+        <message>
+            <source>Center horizontally</source>
+            <translation>水平居中</translation>
+        </message>
+        <message>
+            <source>Center vertically</source>
+            <translation>垂直居中</translation>
+        </message>
+        <message>
+            <source>Chinese numerals</source>
+            <translation>中文数字</translation>
+        </message>
+        <message>
+            <source>Circle</source>
+            <translation>圆形</translation>
+        </message>
+        <message>
+            <source>Click-through</source>
+            <translation>鼠标穿透</translation>
+        </message>
+        <message>
+            <source>Close recording</source>
+            <translation>关闭录制</translation>
+        </message>
+        <message>
+            <source>Compact layout</source>
+            <translation>紧凑布局</translation>
+        </message>
+        <message>
+            <source>Confirm edit</source>
+            <translation>确认编辑</translation>
+        </message>
+        <message>
+            <source>Connection type</source>
+            <translation>连接类型</translation>
+        </message>
+        <message>
+            <source>Control keys</source>
+            <translation>控制键</translation>
+        </message>
+        <message>
+            <source>Convert to HTML</source>
+            <translation>转换为 HTML</translation>
+        </message>
+        <message>
+            <source>Convert to Markdown</source>
+            <translation>转换为 Markdown</translation>
+        </message>
+        <message>
+            <source>Copy recording</source>
+            <translation>复制录制内容</translation>
+        </message>
+        <message>
+            <source>Copy selected elements</source>
+            <translation>复制选中元素</translation>
+        </message>
+        <message>
+            <source>Copy to clipboard</source>
+            <translation>复制到剪贴板</translation>
+        </message>
+        <message>
+            <source>Corner radius (scroll to adjust)</source>
+            <translation>圆角半径（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Could not capture selected elements</source>
+            <translation>无法捕获所选元素</translation>
+        </message>
+        <message>
+            <source>Could not delete the annotation template</source>
+            <translation>无法删除标注模板</translation>
+        </message>
+        <message>
+            <source>Could not save the annotation template</source>
+            <translation>无法保存标注模板</translation>
+        </message>
+        <message>
+            <source>Crosshatched fill</source>
+            <translation>交叉线填充</translation>
+        </message>
+        <message>
+            <source>Crosshatched sequence number background</source>
+            <translation>交叉线序号背景</translation>
+        </message>
+        <message>
+            <source>Crosshatched text background</source>
+            <translation>交叉线文本背景</translation>
+        </message>
+        <message>
+            <source>Current angle stroke width</source>
+            <translation>当前角度线条宽度</translation>
+        </message>
+        <message>
+            <source>Current arrow width</source>
+            <translation>当前箭头宽度</translation>
+        </message>
+        <message>
+            <source>Current bracket stroke width</source>
+            <translation>当前括号描边宽度</translation>
+        </message>
+        <message>
+            <source>Current brush eraser width</source>
+            <translation>当前画笔橡皮擦宽度</translation>
+        </message>
+        <message>
+            <source>Current distance stroke width</source>
+            <translation>当前距离描边宽度</translation>
+        </message>
+        <message>
+            <source>Current magnifier stroke width</source>
+            <translation>当前放大镜描边宽度</translation>
+        </message>
+        <message>
+            <source>Current pen filter width</source>
+            <translation>当前画笔滤镜宽度</translation>
+        </message>
+        <message>
+            <source>Current pen highlight width</source>
+            <translation>当前画笔高亮宽度</translation>
+        </message>
+        <message>
+            <source>Current sequence number font size</source>
+            <translation>当前序号字体大小</translation>
+        </message>
+        <message>
+            <source>Current stroke width</source>
+            <translation>当前描边宽度</translation>
+        </message>
+        <message>
+            <source>Current text font size</source>
+            <translation>当前文本字体大小</translation>
+        </message>
+        <message>
+            <source>Current watermark font size</source>
+            <translation>当前水印字体大小</translation>
+        </message>
+        <message>
+            <source>Cursor data is unavailable for this screenshot</source>
+            <translation>此截图没有可用的光标数据</translation>
+        </message>
+        <message>
+            <source>Curve region</source>
+            <translation>曲线区域</translation>
+        </message>
+        <message>
+            <source>Curved arrow</source>
+            <translation>曲线箭头</translation>
+        </message>
+        <message>
+            <source>Curved line</source>
+            <translation>曲线</translation>
+        </message>
+        <message>
+            <source>Dashed arrow line</source>
+            <translation>虚线箭头</translation>
+        </message>
+        <message>
+            <source>Dashed stroke</source>
+            <translation>虚线描边</translation>
+        </message>
+        <message>
+            <source>Decimal places</source>
+            <translation>小数位数</translation>
+        </message>
+        <message>
+            <source>Dedicated Model</source>
+            <translation>专用模型</translation>
+        </message>
+        <message>
+            <source>Default</source>
+            <translation>默认</translation>
+        </message>
+        <message>
+            <source>Degrees</source>
+            <translation>度</translation>
+        </message>
+        <message>
+            <source>Delay recording (scroll to adjust)</source>
+            <translation>延迟录制（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Delete</source>
+            <translation>删除</translation>
+        </message>
+        <message>
+            <source>Delete Annotation Template</source>
+            <translation>删除标注模板</translation>
+        </message>
+        <message>
+            <source>Delete annotation template "%1"? This action cannot be undone</source>
+            <translation>删除标注模板“%1”？此操作无法撤销</translation>
+        </message>
+        <message>
+            <source>Delete selected elements</source>
+            <translation>删除选中元素</translation>
+        </message>
+        <message>
+            <source>Delete template</source>
+            <translation>删除模板</translation>
+        </message>
+        <message>
+            <source>Delete template "%1"? This action cannot be undone</source>
+            <translation>删除模板“%1”？此操作无法撤销</translation>
+        </message>
+        <message>
+            <source>Diamond</source>
+            <translation>菱形</translation>
+        </message>
+        <message>
+            <source>Distance annotation</source>
+            <translation>距离标注</translation>
+        </message>
+        <message>
+            <source>Distance stroke color</source>
+            <translation>距离描边颜色</translation>
+        </message>
+        <message>
+            <source>Distance stroke color %1</source>
+            <translation>距离描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Distance stroke width %1</source>
+            <translation>距离描边宽度 %1</translation>
+        </message>
+        <message>
+            <source>Distance unit</source>
+            <translation>距离单位</translation>
+        </message>
+        <message>
+            <source>Distribute horizontally</source>
+            <translation>水平分布</translation>
+        </message>
+        <message>
+            <source>Distribute vertically</source>
+            <translation>垂直分布</translation>
+        </message>
+        <message>
+            <source>Dotted arrow line</source>
+            <translation>点线箭头</translation>
+        </message>
+        <message>
+            <source>Dotted stroke</source>
+            <translation>点线描边</translation>
+        </message>
+        <message>
+            <source>Drag toolbar</source>
+            <translation>拖动工具栏</translation>
+        </message>
+        <message>
+            <source>Edit</source>
+            <translation>编辑</translation>
+        </message>
+        <message>
+            <source>Edit selection</source>
+            <translation>编辑选区</translation>
+        </message>
+        <message>
+            <source>Effect Settings</source>
+            <translation>效果设置</translation>
+        </message>
+        <message>
+            <source>Elbow arrow</source>
+            <translation>折线箭头</translation>
+        </message>
+        <message>
+            <source>Element Eraser</source>
+            <translation>元素橡皮擦</translation>
+        </message>
+        <message>
+            <source>Ellipse</source>
+            <translation>椭圆</translation>
+        </message>
+        <message>
+            <source>Emboss</source>
+            <translation>浮雕</translation>
+        </message>
+        <message>
+            <source>End arrowhead</source>
+            <translation>末端箭头</translation>
+        </message>
+        <message>
+            <source>End arrowhead bar</source>
+            <translation>末端箭头 横杠</translation>
+        </message>
+        <message>
+            <source>End arrowhead circle</source>
+            <translation>末端箭头 圆形</translation>
+        </message>
+        <message>
+            <source>End arrowhead circle outline</source>
+            <translation>末端箭头 空心圆</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot many</source>
+            <translation>末端箭头 鸟爪多</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot one</source>
+            <translation>末端箭头 鸟爪单</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot one or many</source>
+            <translation>末端箭头 鸟爪一或多</translation>
+        </message>
+        <message>
+            <source>End arrowhead diamond</source>
+            <translation>末端箭头 菱形</translation>
+        </message>
+        <message>
+            <source>End arrowhead diamond outline</source>
+            <translation>末端箭头 空心菱形</translation>
+        </message>
+        <message>
+            <source>End arrowhead dot</source>
+            <translation>末端箭头 圆点</translation>
+        </message>
+        <message>
+            <source>End arrowhead indented triangle</source>
+            <translation>末端箭头 内凹三角形</translation>
+        </message>
+        <message>
+            <source>End arrowhead none</source>
+            <translation>末端箭头 无</translation>
+        </message>
+        <message>
+            <source>End arrowhead standard</source>
+            <translation>末端箭头 标准</translation>
+        </message>
+        <message>
+            <source>End arrowhead triangle</source>
+            <translation>末端箭头 三角形</translation>
+        </message>
+        <message>
+            <source>End arrowhead triangle outline</source>
+            <translation>末端箭头 空心三角形</translation>
+        </message>
+        <message>
+            <source>Endpoint scale (scroll to adjust)</source>
+            <translation>端点比例（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Endpoint style</source>
+            <translation>端点样式</translation>
+        </message>
+        <message>
+            <source>Eraser</source>
+            <translation>橡皮擦</translation>
+        </message>
+        <message>
+            <source>Exit</source>
+            <translation>退出</translation>
+        </message>
+        <message>
+            <source>Export Settings</source>
+            <translation>导出设置</translation>
+        </message>
+        <message>
+            <source>Fill color</source>
+            <translation>填充颜色</translation>
+        </message>
+        <message>
+            <source>Fill color %1</source>
+            <translation>填充颜色 %1</translation>
+        </message>
+        <message>
+            <source>Fill color transparent</source>
+            <translation>填充颜色透明</translation>
+        </message>
+        <message>
+            <source>Fill regions</source>
+            <translation>填充区域</translation>
+        </message>
+        <message>
+            <source>Filter</source>
+            <translation>滤镜</translation>
+        </message>
+        <message>
+            <source>Filter intensity</source>
+            <translation>滤镜强度</translation>
+        </message>
+        <message>
+            <source>Filter type</source>
+            <translation>滤镜类型</translation>
+        </message>
+        <message>
+            <source>Font family</source>
+            <translation>字体</translation>
+        </message>
+        <message>
+            <source>Formatting</source>
+            <translation>格式</translation>
+        </message>
+        <message>
+            <source>Freehand region</source>
+            <translation>自由绘制区域</translation>
+        </message>
+        <message>
+            <source>Gaussian blur</source>
+            <translation>高斯模糊</translation>
+        </message>
+        <message>
+            <source>Gradient</source>
+            <translation>渐变</translation>
+        </message>
+        <message>
+            <source>Grayscale</source>
+            <translation>灰度</translation>
+        </message>
+        <message>
+            <source>Green</source>
+            <translation>绿色</translation>
+        </message>
+        <message>
+            <source>Hatched fill</source>
+            <translation>线条填充</translation>
+        </message>
+        <message>
+            <source>Hatched sequence number background</source>
+            <translation>线条序号背景</translation>
+        </message>
+        <message>
+            <source>Hatched text background</source>
+            <translation>线条文本背景</translation>
+        </message>
+        <message>
+            <source>Hide selection toolbar</source>
+            <translation>隐藏选区工具栏</translation>
+        </message>
+        <message>
+            <source>Highlight</source>
+            <translation>高亮</translation>
+        </message>
+        <message>
+            <source>Highlight color</source>
+            <translation>高亮颜色</translation>
+        </message>
+        <message>
+            <source>Highlight color %1</source>
+            <translation>高亮颜色 %1</translation>
+        </message>
+        <message>
+            <source>Highlight outline color %1</source>
+            <translation>高亮描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Highlight outline width</source>
+            <translation>高亮描边宽度</translation>
+        </message>
+        <message>
+            <source>Highlight outline width %1px</source>
+            <translation>高亮描边宽度 %1 像素</translation>
+        </message>
+        <message>
+            <source>Horizontal Crop</source>
+            <translation>水平裁剪</translation>
+        </message>
+        <message>
+            <source>Horizontal scrolling</source>
+            <translation>水平滚动</translation>
+        </message>
+        <message>
+            <source>Icon</source>
+            <translation>图标</translation>
+        </message>
+        <message>
+            <source>Image</source>
+            <translation>图像</translation>
+        </message>
+        <message>
+            <source>Image Editing</source>
+            <translation>图片编辑</translation>
+        </message>
+        <message>
+            <source>Image Splitting</source>
+            <translation>图片分割</translation>
+        </message>
+        <message>
+            <source>Integers</source>
+            <translation>整数</translation>
+        </message>
+        <message>
+            <source>Inversion</source>
+            <translation>反相</translation>
+        </message>
+        <message>
+            <source>Italic</source>
+            <translation>斜体</translation>
+        </message>
+        <message>
+            <source>Jump to Translation Page</source>
+            <translation>跳转到翻译页面</translation>
+        </message>
+        <message>
+            <source>Keyboard Background Color</source>
+            <translation>键盘背景颜色</translation>
+        </message>
+        <message>
+            <source>Keyboard Foreground Color</source>
+            <translation>键盘前景颜色</translation>
+        </message>
+        <message>
+            <source>Keyboard Size</source>
+            <translation>键盘大小</translation>
+        </message>
+        <message>
+            <source>LaTeX Formula Recognition</source>
+            <translation>LaTeX 公式识别</translation>
+        </message>
+        <message>
+            <source>LaTeX-Specific Model</source>
+            <translation>LaTeX 专用模型</translation>
+        </message>
+        <message>
+            <source>Laser pointer</source>
+            <translation>激光笔</translation>
+        </message>
+        <message>
+            <source>Layout compaction disabled</source>
+            <translation>已禁用紧凑布局</translation>
+        </message>
+        <message>
+            <source>Layout compaction enabled</source>
+            <translation>已启用紧凑布局</translation>
+        </message>
+        <message>
+            <source>Layout spacing (scroll to adjust; click to reset to 0)</source>
+            <translation>布局间距（滚动调整；点击重置为 0）</translation>
+        </message>
+        <message>
+            <source>Leader line</source>
+            <translation>引导线</translation>
+        </message>
+        <message>
+            <source>Leader line arrowhead</source>
+            <translation>引导线箭头样式</translation>
+        </message>
+        <message>
+            <source>Letters and symbols</source>
+            <translation>字母和符号</translation>
+        </message>
+        <message>
+            <source>Line</source>
+            <translation>直线</translation>
+        </message>
+        <message>
+            <source>Logical Pixel Selection</source>
+            <translation>逻辑像素选区</translation>
+        </message>
+        <message>
+            <source>Lowercase letters</source>
+            <translation>小写字母</translation>
+        </message>
+        <message>
+            <source>Magnification factor (scroll to adjust)</source>
+            <translation>放大倍数（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Magnifier</source>
+            <translation>放大镜</translation>
+        </message>
+        <message>
+            <source>Magnifier shape</source>
+            <translation>放大镜形状</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke color</source>
+            <translation>放大镜描边颜色</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke color %1</source>
+            <translation>放大镜描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke width %1</source>
+            <translation>放大镜描边宽度 %1</translation>
+        </message>
+        <message>
+            <source>Mask color</source>
+            <translation>遮罩颜色</translation>
+        </message>
+        <message>
+            <source>Mask color %1</source>
+            <translation>遮罩颜色 %1</translation>
+        </message>
+        <message>
+            <source>Merge cells</source>
+            <translation>合并单元格</translation>
+        </message>
+        <message>
+            <source>Message box</source>
+            <translation>消息框</translation>
+        </message>
+        <message>
+            <source>Mixed</source>
+            <translation>混合</translation>
+        </message>
+        <message>
+            <source>More distance units</source>
+            <translation>更多距离单位</translation>
+        </message>
+        <message>
+            <source>Mosaic</source>
+            <translation>马赛克</translation>
+        </message>
+        <message>
+            <source>Mouse Trail Duration</source>
+            <translation>鼠标轨迹持续时间</translation>
+        </message>
+        <message>
+            <source>Mouse click color</source>
+            <translation>鼠标点击颜色</translation>
+        </message>
+        <message>
+            <source>Mouse click color %1</source>
+            <translation>鼠标点击颜色 %1</translation>
+        </message>
+        <message>
+            <source>Mouse click color transparent</source>
+            <translation>鼠标点击颜色 透明</translation>
+        </message>
+        <message>
+            <source>Mouse highlight</source>
+            <translation>鼠标高亮</translation>
+        </message>
+        <message>
+            <source>Mouse highlight color</source>
+            <translation>鼠标高亮颜色</translation>
+        </message>
+        <message>
+            <source>Mouse highlight preview</source>
+            <translation>鼠标高亮预览</translation>
+        </message>
+        <message>
+            <source>Mouse highlight radius</source>
+            <translation>鼠标高亮半径</translation>
+        </message>
+        <message>
+            <source>Mouse trail color</source>
+            <translation>鼠标轨迹颜色</translation>
+        </message>
+        <message>
+            <source>Mouse trail color %1</source>
+            <translation>鼠标轨迹颜色 %1</translation>
+        </message>
+        <message>
+            <source>Mouse trail color transparent</source>
+            <translation>鼠标轨迹颜色 透明</translation>
+        </message>
+        <message>
+            <source>Move selection horizontally (press and hold to drag)</source>
+            <translation>水平移动选区（按住并拖动）</translation>
+        </message>
+        <message>
+            <source>Move selection vertically (press and hold to drag)</source>
+            <translation>垂直移动选区（按住并拖动）</translation>
+        </message>
+        <message>
+            <source>No fill</source>
+            <translation>无填充</translation>
+        </message>
+        <message>
+            <source>No matching templates</source>
+            <translation>没有匹配的模板</translation>
+        </message>
+        <message>
+            <source>No templates yet</source>
+            <translation>暂无模板</translation>
+        </message>
+        <message>
+            <source>None</source>
+            <translation>无</translation>
+        </message>
+        <message>
+            <source>Number keys</source>
+            <translation>数字键</translation>
+        </message>
+        <message>
+            <source>Opacity</source>
+            <translation>不透明度</translation>
+        </message>
+        <message>
+            <source>Open recording folder</source>
+            <translation>打开录制文件夹</translation>
+        </message>
+        <message>
+            <source>Open spreadsheet file</source>
+            <translation>打开电子表格文件</translation>
+        </message>
+        <message>
+            <source>Outlined circle</source>
+            <translation>轮廓圆形</translation>
+        </message>
+        <message>
+            <source>Outlined square</source>
+            <translation>轮廓方形</translation>
+        </message>
+        <message>
+            <source>Pan</source>
+            <translation>平移</translation>
+        </message>
+        <message>
+            <source>Pause recording</source>
+            <translation>暂停录制</translation>
+        </message>
+        <message>
+            <source>Pen</source>
+            <translation>画笔</translation>
+        </message>
+        <message>
+            <source>Pen filter</source>
+            <translation>画笔滤镜</translation>
+        </message>
+        <message>
+            <source>Pen filter width %1 (%2px)</source>
+            <translation>画笔滤镜宽度 %1（%2 像素）</translation>
+        </message>
+        <message>
+            <source>Pen highlight</source>
+            <translation>画笔高亮</translation>
+        </message>
+        <message>
+            <source>Pen highlight color</source>
+            <translation>画笔高亮颜色</translation>
+        </message>
+        <message>
+            <source>Pen highlight color %1</source>
+            <translation>画笔高亮颜色 %1</translation>
+        </message>
+        <message>
+            <source>Pen highlight width %1 (%2px)</source>
+            <translation>画笔高亮宽度 %1（%2 像素）</translation>
+        </message>
+        <message>
+            <source>Physical Pixel Selection</source>
+            <translation>物理像素选区</translation>
+        </message>
+        <message>
+            <source>Pick color from canvas</source>
+            <translation>从画布拾取颜色</translation>
+        </message>
+        <message>
+            <source>Pin Window to Screen</source>
+            <translation>固定窗口到屏幕</translation>
+        </message>
+        <message>
+            <source>Pin to screen</source>
+            <translation>固定到屏幕</translation>
+        </message>
+        <message>
+            <source>Plain shaft</source>
+            <translation>普通箭杆</translation>
+        </message>
+        <message>
+            <source>Please enter a template name</source>
+            <translation>请输入模板名称</translation>
+        </message>
+        <message>
+            <source>Please enter a template value</source>
+            <translation>请输入模板值</translation>
+        </message>
+        <message>
+            <source>Polyline region</source>
+            <translation>折线区域</translation>
+        </message>
+        <message>
+            <source>Post-processing effects</source>
+            <translation>后处理效果</translation>
+        </message>
+        <message>
+            <source>Preserve keyboard shortcuts</source>
+            <translation>保留键盘快捷键</translation>
+        </message>
+        <message>
+            <source>Pressure-sensitive brush</source>
+            <translation>压感画笔</translation>
+        </message>
+        <message>
+            <source>Print</source>
+            <translation>打印</translation>
+        </message>
+        <message>
+            <source>Progress Bar Color</source>
+            <translation>进度条颜色</translation>
+        </message>
+        <message>
+            <source>Punctuation</source>
+            <translation>标点符号</translation>
+        </message>
+        <message>
+            <source>Quick save</source>
+            <translation>快速保存</translation>
+        </message>
+        <message>
+            <source>Radians</source>
+            <translation>弧度</translation>
+        </message>
+        <message>
+            <source>Recapture</source>
+            <translation>重新截图</translation>
+        </message>
+        <message>
+            <source>Recognition model</source>
+            <translation>识别模型</translation>
+        </message>
+        <message>
+            <source>Record microphone</source>
+            <translation>录制麦克风</translation>
+        </message>
+        <message>
+            <source>Record mouse clicks</source>
+            <translation>录制鼠标按键</translation>
+        </message>
+        <message>
+            <source>Record mouse scrolling</source>
+            <translation>录制鼠标滚动</translation>
+        </message>
+        <message>
+            <source>Record screen</source>
+            <translation>录制屏幕</translation>
+        </message>
+        <message>
+            <source>Record speakers</source>
+            <translation>录制系统声音</translation>
+        </message>
+        <message>
+            <source>Record webcam</source>
+            <translation>录制摄像头</translation>
+        </message>
+        <message>
+            <source>Recording duration</source>
+            <translation>录制时长</translation>
+        </message>
+        <message>
+            <source>Recording format</source>
+            <translation>录制格式</translation>
+        </message>
+        <message>
+            <source>Recording settings</source>
+            <translation>屏幕录制设置</translation>
+        </message>
+        <message>
+            <source>Rectangle</source>
+            <translation>矩形</translation>
+        </message>
+        <message>
+            <source>Rectangle Eraser</source>
+            <translation>矩形橡皮擦</translation>
+        </message>
+        <message>
+            <source>Rectangle filter</source>
+            <translation>矩形滤镜</translation>
+        </message>
+        <message>
+            <source>Rectangle highlight</source>
+            <translation>矩形高亮</translation>
+        </message>
+        <message>
+            <source>Rectangle region</source>
+            <translation>矩形区域</translation>
+        </message>
+        <message>
+            <source>Red</source>
+            <translation>红色</translation>
+        </message>
+        <message>
+            <source>Redo</source>
+            <translation>重做</translation>
+        </message>
+        <message>
+            <source>Regular brush</source>
+            <translation>普通画笔</translation>
+        </message>
+        <message>
+            <source>Reset</source>
+            <translation>重置</translation>
+        </message>
+        <message>
+            <source>Resize window</source>
+            <translation>调整窗口大小</translation>
+        </message>
+        <message>
+            <source>Resume recording</source>
+            <translation>继续录制</translation>
+        </message>
+        <message>
+            <source>Roman numerals</source>
+            <translation>罗马数字</translation>
+        </message>
+        <message>
+            <source>Save as file</source>
+            <translation>保存为文件</translation>
+        </message>
+        <message>
+            <source>Save to File</source>
+            <translation>保存到文件</translation>
+        </message>
+        <message>
+            <source>Scrolling screenshot</source>
+            <translation>滚动截图</translation>
+        </message>
+        <message>
+            <source>Scrolling screenshot settings</source>
+            <translation>滚动截图设置</translation>
+        </message>
+        <message>
+            <source>Select elements</source>
+            <translation>选择元素</translation>
+        </message>
+        <message>
+            <source>Selected model (%1)</source>
+            <translation>已选模型（%1）</translation>
+        </message>
+        <message>
+            <source>Selection background opacity</source>
+            <translation>选区背景不透明度</translation>
+        </message>
+        <message>
+            <source>Selection background opacity (scroll to adjust; click to reset to 0%)</source>
+            <translation>选区背景不透明度（滚动调整；点击重置为 0%）</translation>
+        </message>
+        <message>
+            <source>Send backward</source>
+            <translation>下移一层</translation>
+        </message>
+        <message>
+            <source>Send to back</source>
+            <translation>置于底层</translation>
+        </message>
+        <message>
+            <source>Sequence number (scroll to adjust)</source>
+            <translation>序号（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Sequence number background color</source>
+            <translation>序号背景颜色</translation>
+        </message>
+        <message>
+            <source>Sequence number background color %1</source>
+            <translation>序号背景颜色 %1</translation>
+        </message>
+        <message>
+            <source>Sequence number background color transparent</source>
+            <translation>序号背景颜色透明</translation>
+        </message>
+        <message>
+            <source>Sequence number color</source>
+            <translation>序号颜色</translation>
+        </message>
+        <message>
+            <source>Sequence number color %1</source>
+            <translation>序号颜色 %1</translation>
+        </message>
+        <message>
+            <source>Sequence number font family</source>
+            <translation>序号字体</translation>
+        </message>
+        <message>
+            <source>Sequence number font size %1px</source>
+            <translation>序号字号 %1 像素</translation>
+        </message>
+        <message>
+            <source>Sequence number numeric type</source>
+            <translation>序号数字类型</translation>
+        </message>
+        <message>
+            <source>Sequence number type</source>
+            <translation>序号类型</translation>
+        </message>
+        <message>
+            <source>Serial number</source>
+            <translation>序号</translation>
+        </message>
+        <message>
+            <source>Settings</source>
+            <translation>设置</translation>
+        </message>
+        <message>
+            <source>Shape</source>
+            <translation>图形</translation>
+        </message>
+        <message>
+            <source>Show Cursor</source>
+            <translation>显示光标</translation>
+        </message>
+        <message>
+            <source>Show Playback Time</source>
+            <translation>显示播放时间</translation>
+        </message>
+        <message>
+            <source>Show Progress Bar</source>
+            <translation>显示进度条</translation>
+        </message>
+        <message>
+            <source>Show QR Code</source>
+            <translation>显示二维码</translation>
+        </message>
+        <message>
+            <source>Show cursor in recording</source>
+            <translation>在录制中显示光标</translation>
+        </message>
+        <message>
+            <source>Show keystrokes in recording</source>
+            <translation>在录制中显示按键</translation>
+        </message>
+        <message>
+            <source>Show original image</source>
+            <translation>显示原图</translation>
+        </message>
+        <message>
+            <source>Smart Erase</source>
+            <translation>智能擦除</translation>
+        </message>
+        <message>
+            <source>Snow Shot visual understanding</source>
+            <translation>Snow Shot 视觉理解</translation>
+        </message>
+        <message>
+            <source>Solid arrow line</source>
+            <translation>实线箭头</translation>
+        </message>
+        <message>
+            <source>Solid circle</source>
+            <translation>实心圆形</translation>
+        </message>
+        <message>
+            <source>Solid fill</source>
+            <translation>纯色填充</translation>
+        </message>
+        <message>
+            <source>Solid sequence number background</source>
+            <translation>纯色序号背景</translation>
+        </message>
+        <message>
+            <source>Solid square</source>
+            <translation>实心方形</translation>
+        </message>
+        <message>
+            <source>Solid stroke</source>
+            <translation>实线描边</translation>
+        </message>
+        <message>
+            <source>Solid text background</source>
+            <translation>纯色文本背景</translation>
+        </message>
+        <message>
+            <source>Source region outline</source>
+            <translation>源区域轮廓</translation>
+        </message>
+        <message>
+            <source>Speech Bubble</source>
+            <translation>对话气泡</translation>
+        </message>
+        <message>
+            <source>Split cells</source>
+            <translation>拆分单元格</translation>
+        </message>
+        <message>
+            <source>Spotlight</source>
+            <translation>聚光灯</translation>
+        </message>
+        <message>
+            <source>Square</source>
+            <translation>方形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead</source>
+            <translation>起始箭头</translation>
+        </message>
+        <message>
+            <source>Start arrowhead bar</source>
+            <translation>起始箭头 横杠</translation>
+        </message>
+        <message>
+            <source>Start arrowhead circle</source>
+            <translation>起始箭头 圆形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead circle outline</source>
+            <translation>起始箭头 空心圆</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot many</source>
+            <translation>起始箭头 鸟爪多</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot one</source>
+            <translation>起始箭头 鸟爪单</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot one or many</source>
+            <translation>起始箭头 鸟爪一或多</translation>
+        </message>
+        <message>
+            <source>Start arrowhead diamond</source>
+            <translation>起始箭头 菱形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead diamond outline</source>
+            <translation>起始箭头 空心菱形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead dot</source>
+            <translation>起始箭头 圆点</translation>
+        </message>
+        <message>
+            <source>Start arrowhead indented triangle</source>
+            <translation>起始箭头 内凹三角形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead none</source>
+            <translation>起始箭头 无</translation>
+        </message>
+        <message>
+            <source>Start arrowhead standard</source>
+            <translation>起始箭头 标准</translation>
+        </message>
+        <message>
+            <source>Start arrowhead triangle</source>
+            <translation>起始箭头 三角形</translation>
+        </message>
+        <message>
+            <source>Start arrowhead triangle outline</source>
+            <translation>起始箭头 空心三角形</translation>
+        </message>
+        <message>
+            <source>Start recording</source>
+            <translation>开始录制</translation>
+        </message>
+        <message>
+            <source>Stop recording</source>
+            <translation>停止录制</translation>
+        </message>
+        <message>
+            <source>Straight arrow</source>
+            <translation>直线箭头</translation>
+        </message>
+        <message>
+            <source>Straight line</source>
+            <translation>直线</translation>
+        </message>
+        <message>
+            <source>Stroke color</source>
+            <translation>描边颜色</translation>
+        </message>
+        <message>
+            <source>Stroke color %1</source>
+            <translation>描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Stroke width %1</source>
+            <translation>描边宽度 %1</translation>
+        </message>
+        <message>
+            <source>Subtract screenshot region</source>
+            <translation>减去截图区域</translation>
+        </message>
+        <message>
+            <source>Table recognition</source>
+            <translation>表格识别</translation>
+        </message>
+        <message>
+            <source>Table-Specific Model</source>
+            <translation>表格专用模型</translation>
+        </message>
+        <message>
+            <source>Tapered shaft</source>
+            <translation>渐宽箭杆</translation>
+        </message>
+        <message>
+            <source>Tapered shafts support standard, triangle, triangle outline, and indented triangle arrowheads</source>
+            <translation>渐宽箭杆支持标准、三角形、空心三角形和内凹三角形箭头</translation>
+        </message>
+        <message>
+            <source>Target Language</source>
+            <translation>目标语言</translation>
+        </message>
+        <message>
+            <source>Template</source>
+            <translation>模板</translation>
+        </message>
+        <message>
+            <source>Template %1</source>
+            <translation>模板 %1</translation>
+        </message>
+        <message>
+            <source>Template Name</source>
+            <translation>模板名称</translation>
+        </message>
+        <message>
+            <source>Template Value</source>
+            <translation>模板值</translation>
+        </message>
+        <message>
+            <source>Text</source>
+            <translation>文本</translation>
+        </message>
+        <message>
+            <source>Text alignment</source>
+            <translation>文本对齐</translation>
+        </message>
+        <message>
+            <source>Text background color</source>
+            <translation>文本背景颜色</translation>
+        </message>
+        <message>
+            <source>Text background color %1</source>
+            <translation>文本背景颜色 %1</translation>
+        </message>
+        <message>
+            <source>Text background color transparent</source>
+            <translation>文本背景颜色透明</translation>
+        </message>
+        <message>
+            <source>Text background corner radius (scroll to adjust)</source>
+            <translation>文本背景圆角半径（滚动调整）</translation>
+        </message>
+        <message>
+            <source>Text block</source>
+            <translation>文本块</translation>
+        </message>
+        <message>
+            <source>Text color</source>
+            <translation>文本颜色</translation>
+        </message>
+        <message>
+            <source>Text color %1</source>
+            <translation>文本颜色 %1</translation>
+        </message>
+        <message>
+            <source>Text font family</source>
+            <translation>文本字体</translation>
+        </message>
+        <message>
+            <source>Text font size %1 (%2px)</source>
+            <translation>文本字号 %1（%2 像素）</translation>
+        </message>
+        <message>
+            <source>Text in box</source>
+            <translation>框内文本</translation>
+        </message>
+        <message>
+            <source>Text outline color %1</source>
+            <translation>文本描边颜色 %1</translation>
+        </message>
+        <message>
+            <source>Text outline color transparent</source>
+            <translation>文本描边颜色透明</translation>
+        </message>
+        <message>
+            <source>Text outline width</source>
+            <translation>文本描边宽度</translation>
+        </message>
+        <message>
+            <source>Text outline width %1px</source>
+            <translation>文本描边宽度 %1 像素</translation>
+        </message>
+        <message>
+            <source>Text recognition</source>
+            <translation>文本识别</translation>
+        </message>
+        <message>
+            <source>Text translation</source>
+            <translation>文本翻译</translation>
+        </message>
+        <message>
+            <source>Thought Bubble</source>
+            <translation>思考气泡</translation>
+        </message>
+        <message>
+            <source>Translation service</source>
+            <translation>翻译服务</translation>
+        </message>
+        <message>
+            <source>Translation settings</source>
+            <translation>翻译设置</translation>
+        </message>
+        <message>
+            <source>Transparent</source>
+            <translation>透明</translation>
+        </message>
+        <message>
+            <source>Trim Video</source>
+            <translation>裁剪视频</translation>
+        </message>
+        <message>
+            <source>Unable to save scrolling screenshot settings</source>
+            <translation>无法保存滚动截图设置</translation>
+        </message>
+        <message>
+            <source>Undo</source>
+            <translation>撤销</translation>
+        </message>
+        <message>
+            <source>Upload to Cloud</source>
+            <translation>上传到云端</translation>
+        </message>
+        <message>
+            <source>Uppercase letters</source>
+            <translation>大写字母</translation>
+        </message>
+        <message>
+            <source>Vertical Crop</source>
+            <translation>垂直裁剪</translation>
+        </message>
+        <message>
+            <source>Vertical scrolling</source>
+            <translation>垂直滚动</translation>
+        </message>
+        <message>
+            <source>Vision Model</source>
+            <translation>视觉模型</translation>
+        </message>
+        <message>
+            <source>Watermark</source>
+            <translation>水印</translation>
+        </message>
+        <message>
+            <source>Watermark angle</source>
+            <translation>水印角度</translation>
+        </message>
+        <message>
+            <source>Watermark color</source>
+            <translation>水印颜色</translation>
+        </message>
+        <message>
+            <source>Watermark color %1</source>
+            <translation>水印颜色 %1</translation>
+        </message>
+        <message>
+            <source>Watermark font family</source>
+            <translation>水印字体</translation>
+        </message>
+        <message>
+            <source>Watermark font size %1 (%2px)</source>
+            <translation>水印字体大小 %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Watermark gap</source>
+            <translation>水印间距</translation>
+        </message>
+        <message>
+            <source>Watermark text</source>
+            <translation>水印文本</translation>
+        </message>
+        <message>
+            <source>Webcam Shape</source>
+            <translation>摄像头形状</translation>
+        </message>
+        <message>
+            <source>Webcam Size</source>
+            <translation>摄像头大小</translation>
+        </message>
+        <message>
+            <source>Yellow</source>
+            <translation>黄色</translation>
+        </message>
+        <message>
+            <source>cm</source>
+            <translation>cm</translation>
+        </message>
+        <message>
+            <source>ft</source>
+            <translation>ft</translation>
+        </message>
+        <message>
+            <source>in</source>
+            <translation>in</translation>
+        </message>
+        <message>
+            <source>km</source>
+            <translation>km</translation>
+        </message>
+        <message>
+            <source>m</source>
+            <translation>m</translation>
+        </message>
+        <message>
+            <source>mm</source>
+            <translation>mm</translation>
+        </message>
+        <message>
+            <source>ms</source>
+            <translation>毫秒</translation>
+        </message>
+        <message>
+            <source>ms</source>
+            <comment>Auto-scroll interval unit</comment>
+            <translation>ms</translation>
+        </message>
+        <message>
+            <source>pt</source>
+            <translation>pt</translation>
+        </message>
+        <message>
+            <source>px</source>
+            <translation>px</translation>
+        </message>
+        <message>
+            <source>{text} represents the current watermark text; timestamp formats such as {YYYY-MM-DD_HH-mm-ss} are supported</source>
+            <translation>{text} 表示当前水印文本；支持 {YYYY-MM-DD_HH-mm-ss} 等时间戳格式</translation>
+        </message>
+        <message>
+            <source>μm</source>
+            <translation>μm</translation>
+        </message>
+    </context>
+    <context>
+        <name>snow_shot::presentation::GlobalCanvasController</name>
+        <message>
+            <source>Could not change canvas click-through</source>
+            <translation>无法切换画布的鼠标穿透状态</translation>
+        </message>
+        <message>
+            <source>Could not show the laser pointer: %1</source>
+            <translation>无法显示激光笔：%1</translation>
+        </message>
+        <message>
+            <source>The laser pointer is unavailable</source>
+            <translation>激光笔不可用</translation>
+        </message>
+    </context>
+</TS>

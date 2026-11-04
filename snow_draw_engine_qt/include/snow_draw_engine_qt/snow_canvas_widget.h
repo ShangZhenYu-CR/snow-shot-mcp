@@ -1,0 +1,267 @@
+#pragma once
+#include "snow_draw_engine_qt/snow_canvas_style_edit.h"
+#include "snow_draw_engine_qt/snow_canvas_smart_erase.h"
+
+#include <QRect>
+#include <QByteArray>
+#include <QRectF>
+#include <QTransform>
+#include <QVariant>
+#include <QWidget>
+
+#include <cstdint>
+#include <memory>
+#include <functional>
+#include <optional>
+
+#include "snow_draw_engine_qt/snow_canvas_types.h"
+
+class QCursor;
+class QRegion;
+class QEnterEvent;
+class QEvent;
+class QFocusEvent;
+class QInputMethodEvent;
+class QKeyEvent;
+class QMouseEvent;
+class QTabletEvent;
+class QPaintEvent;
+class QPointF;
+class QResizeEvent;
+class QWheelEvent;
+class SnowCanvasRuntime;
+class SnowCanvasCustomRenderer;
+
+struct SnowCanvasDecorationRenderAreas {
+    std::optional<QRectF> watermark;
+    std::optional<QRectF> spotlight;
+};
+
+class SnowCanvasWidget : public QWidget {
+    Q_OBJECT
+
+  public:
+    explicit SnowCanvasWidget(QWidget* parent = nullptr);
+    explicit SnowCanvasWidget(SnowCanvasRuntime& runtime, QWidget* parent = nullptr);
+    ~SnowCanvasWidget() override;
+
+    // Resolve command keys without changing text/IME input. An empty resolver
+    // preserves the library's default Qt key semantics.
+    using CommandKeyResolver = std::function<Qt::Key(const QKeyEvent&)>;
+    void setCommandKeyResolver(CommandKeyResolver resolver);
+
+    SnowCanvasTool canvasTool() const;
+    bool setCanvasTool(SnowCanvasTool tool);
+
+    void setCursorForLayer(SnowCanvasCursorLayer layer, const QCursor& cursor);
+    void clearCursorForLayer(SnowCanvasCursorLayer layer);
+
+    // Customize semantic crosshair cursors without changing the cursor layers.
+    // An empty factory preserves the platform crosshair; the result is cached per display scale.
+    using CrosshairCursorFactory = std::function<QCursor(qreal devicePixelRatio)>;
+    void setCrosshairCursorFactory(CrosshairCursorFactory factory);
+
+    // Apply a property patch without recording a user preference (restoration/replication).
+    bool applyStyleEdit(const SnowCanvasStyleEdit& edit);
+    // Apply explicit user intent and publish it only on success.
+    bool commitStyleEdit(const SnowCanvasStyleEdit& edit);
+    bool stepFontSize(int direction);
+    SnowCanvasStyleToolbarState canvasStyleToolbarState() const;
+    SnowCanvasSerialNumberToolbarState serialNumberToolbarState() const;
+    SnowCanvasWatermarkConfig canvasWatermarkConfig() const;
+    bool setCanvasWatermarkConfig(const SnowCanvasWatermarkConfig& config);
+    void previewCanvasWatermarkConfig(const SnowCanvasWatermarkConfig& config);
+    SnowCanvasSpotlightConfig canvasSpotlightConfig() const;
+    bool setCanvasSpotlightConfig(const SnowCanvasSpotlightConfig& config);
+    void previewCanvasSpotlightConfig(const SnowCanvasSpotlightConfig& config);
+    SnowCanvasDistanceStyle canvasDistanceStyle() const;
+    SnowCanvasAngleStyle canvasAngleStyle() const;
+    SnowCanvasMagnifierStyle canvasMagnifierStyle() const;
+    bool setCanvasMagnifierStyle(const SnowCanvasMagnifierStyle& style,
+                                 quint32 properties = SnowCanvasMagnifierStyleAllProperties);
+    bool setCanvasAngleStyle(
+        const SnowCanvasAngleStyle& style,
+        quint32 properties = static_cast<quint32>(SnowCanvasAngleStyleProperty::All));
+    bool setCanvasAngleStylePatch(const SnowCanvasAngleStyle& style, quint32 properties);
+    SnowCanvasBracketStyle canvasBracketStyle() const;
+    bool setCanvasBracketStyle(
+        const SnowCanvasBracketStyle& style,
+        quint32 properties = static_cast<quint32>(SnowCanvasBracketStyleProperty::All));
+    bool setCanvasBracketStylePatch(const SnowCanvasBracketStyle& style, quint32 properties);
+    // Adjusts the third-point preview, otherwise an angle-only selection, in radians.
+    bool adjustAngleValue(double deltaRadians);
+    // Factor-wheel ownership follows the active tool or selection, including in host routers.
+    bool hasMagnifierAdjustmentTarget() const;
+    // Accumulates wheel input for the active or selected magnifier independently of camera zoom.
+    // Publishes completed factor edits so hosts can remember creation preferences.
+    bool adjustMagnifierFromWheel(const QWheelEvent& event);
+    bool setCanvasDistanceStyle(const SnowCanvasDistanceStyle& style,
+                                quint32 properties = SnowCanvasDistanceStyleAllProperties);
+    // Source-image pixels per canvas unit, captured when a distance draft begins.
+    bool setDistanceCreationPixelScale(const QSizeF& scale);
+    bool setCanvasShapeStylePatch(const SnowCanvasShapeStyle& style, quint32 properties,
+                                  SnowCanvasShapeKind kind);
+    bool setCanvasFilterStyle(const SnowCanvasFilterStyle& style, quint32 properties);
+    // Updates shared creation defaults for RectangleFilter or PenFilter without
+    // changing this widget's active tool, selection, or existing elements.
+    // Strength remains shared by both filter families.
+    bool setCanvasFilterCreationStyle(const SnowCanvasFilterStyle& style, quint32 properties,
+                                      SnowCanvasTool filterTool);
+    // Changes only future brush erasers, preserving selection, tool and history.
+    bool setCanvasBrushEraserCreationStyle(
+        const SnowCanvasBrushEraserStyle& style,
+        quint32 properties = SnowCanvasBrushEraserStylePropertyStrokeWidth);
+    bool setCanvasTextStyle(const SnowCanvasTextStyle& style,
+                            quint32 properties = SnowCanvasTextStyleAllProperties);
+    bool setCanvasSerialNumberStyle(const SnowCanvasSerialNumberStyle& style);
+
+    SnowCanvasHistoryState canvasHistoryState() const;
+    quint64 autoFilterGeneration() const;
+    std::optional<SnowCanvasAutoFilterRecord> autoFilterRegions() const;
+    bool setAutoFilterRegions(const std::optional<SnowCanvasAutoFilterRecord>& record);
+    bool fillAutoFilterCategory(const QString& category);
+
+    SnowCanvasSnapConfig canvasSnapConfig() const;
+    bool setCanvasSnapConfig(const SnowCanvasSnapConfig& config);
+    bool setCanvasSnapGuideTargets(const SnowCanvasSnapGuideTargets& targets);
+
+    SnowCanvasGridConfig canvasGridConfig() const;
+    bool setCanvasGridConfig(const SnowCanvasGridConfig& config);
+
+    bool undo();
+    bool redo();
+    bool deleteSelected();
+    // Deletes every document element as one undoable history entry, preserving viewports,
+    // creation styles, history, and document-wide configuration.
+    bool deleteAllElements();
+    // Clears all document elements and history, preserving viewports and creation styles.
+    bool clearDocument();
+    bool duplicateSelected(const QPointF& offset = QPointF(12.0, 12.0));
+    bool insertDrawTemplate(const QByteArray& payload, const QPointF& center);
+    bool reorderSelected(SnowCanvasSelectionOrder order);
+    // Aligns or distributes the selected elements to their shared bounds as one
+    // undoable history entry. Requires at least two selected elements for the
+    // align modes and three for the distribute modes.
+    bool alignSelected(SnowCanvasSelectionAlignment alignment);
+    bool setSelectedOpacity(double opacity);
+    bool adjustSelectedSerialNumbers(qint64 delta);
+    bool createSerialNumberText();
+    // Opens the label of one selected arrow, or starts an uncommitted attached draft.
+    bool editSelectedArrowText();
+    // Commits active text, clears transient editing state and selection, and
+    // restores the select tool.
+    bool resetEditingState();
+    // Commits active text and clears transient editing state and selection while
+    // preserving the currently active canvas tool.
+    bool resetEditingStatePreservingTool();
+    // Discards an uncommitted inline text draft without adding it to history.
+    bool cancelActiveTextEditing();
+    // Releases renderer cache and scratch memory without changing document, view, styles, or
+    // selection.
+    void clearRenderState();
+    [[nodiscard]] bool hasActiveTextEditing() const;
+    // Makes Delete edit the active text draft instead of removing its element.
+    bool deleteTextAfterCursor() const;
+    void setDeleteTextAfterCursor(bool enabled);
+    // Limits automatic-width, unrotated text input to this canvas-space area's
+    // horizontal edges. Clearing the bounds restores natural-width input.
+    std::optional<QRectF> textEditingBounds() const;
+    void setTextEditingBounds(const std::optional<QRectF>& bounds);
+    // Keeps an active inline text draft alive while a text-style popup owns focus.
+    void beginTextStylePopupInteraction();
+    // Ends a text-style popup interaction and restores text input when appropriate.
+    void endTextStylePopupInteraction(QWidget* focusScope);
+
+    bool interactionEnabled() const;
+    void setInteractionEnabled(bool enabled);
+    // Tests element bodies using the active tool and the requested button's policy.
+    [[nodiscard]] bool hasQuickSelectionTargetAt(const QPointF& viewPosition,
+                                                 Qt::MouseButton button) const;
+    bool wheelZoomEnabled() const;
+    void setWheelZoomEnabled(bool enabled);
+    // Controls engine-owned scene, overlay, editor, and auxiliary content.
+    // Custom renderer passes and background clearing remain active.
+    [[nodiscard]] bool canvasContentVisible() const;
+    void setCanvasContentVisible(bool visible);
+    bool clearBackgroundEnabled() const;
+    void setClearBackgroundEnabled(bool enabled);
+
+    bool showDirtyRects() const;
+    std::uint64_t viewportId() const;
+
+    bool setViewportCamera(double centerX, double centerY, double zoom);
+    // Clips document pixels and limits new pointer gestures to the host image bounds.
+    // Existing selection controls and inline editing remain usable outside the image.
+    // Does not change document geometry, history, or runtime exports.
+    void setContentClip(std::optional<QRectF> canvasRect);
+    // Limits the viewport-anchored watermark to a canvas-space area. An empty
+    // area renders no watermark; clearWatermarkRenderArea() restores the full
+    // viewport behavior.
+    bool hasWatermarkRenderArea() const;
+    QRectF watermarkRenderArea() const;
+    void setWatermarkRenderArea(const QRectF& canvasRect);
+    void clearWatermarkRenderArea();
+    void setDecorationRenderAreas(const SnowCanvasDecorationRenderAreas& areas);
+    bool hasSpotlightRenderArea() const;
+    QRectF spotlightRenderArea() const;
+    void setSpotlightRenderArea(const QRectF& canvasRect);
+    void clearSpotlightRenderArea();
+    // The renderer is borrowed and must be detached before it is destroyed.
+    SnowCanvasCustomRenderer* customRenderer() const;
+    void setCustomRenderer(SnowCanvasCustomRenderer* renderer);
+    void setBaseImageSources(const QList<SnowCanvasBaseImageSource>& sources);
+    void setBaseImageSources(const QList<SnowCanvasBaseImageSource>& sources,
+                             const QRegion& damage);
+    // Repaint changed original pixels and magnifier destinations that sample them.
+    void updateBaseImageContent(const QRegion& damage);
+    [[nodiscard]] QTransform canvasToViewTransform() const;
+    // Paint the current viewport at physicalSize without editor overlays. Hosts receive
+    // ContentSnapshot so they can omit presentation-only selection masks and borders.
+    [[nodiscard]] QImage renderContentToImage(const QSize& physicalSize);
+    QRect viewRectForCanvasRect(const QRectF& canvasRect, int paddingPx = 0) const;
+
+  public slots:
+    void setShowDirtyRects(bool show);
+
+  signals:
+    void autoFilterRegionsChanged();
+    void autoFilterInteractionStarting();
+    void activeToolChanged();
+    // Changes when angle wheel adjustments target a different draft or selection.
+    void angleAdjustmentTargetChanged();
+    void styleToolbarStateChanged();
+    void styleEditCommitted(const SnowCanvasStyleEdit& edit);
+    void historyStateChanged();
+    void snapConfigChanged();
+    void gridConfigChanged();
+    void watermarkPreviewApplied();
+    void spotlightPreviewApplied();
+    void freeDrawMoveBatchProcessed(quint32 inputCount, quint32 dispatchedCount);
+    void eraserMoveFrameProcessed();
+    void unhandledLeftDoubleClick();
+    void unhandledMiddleClick();
+    void showDirtyRectsChanged();
+
+  protected:
+    bool event(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void tabletEvent(QTabletEvent* event) override;
+    void enterEvent(QEnterEvent* event) override;
+    void leaveEvent(QEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
+    void inputMethodEvent(QInputMethodEvent* event) override;
+    QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
+    void focusOutEvent(QFocusEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};

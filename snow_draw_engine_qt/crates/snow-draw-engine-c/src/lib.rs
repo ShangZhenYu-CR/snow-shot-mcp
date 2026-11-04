@@ -1,0 +1,50 @@
+#![allow(clippy::missing_safety_doc)]
+
+mod abi {
+    #[cfg(test)]
+    mod angle_tests;
+    pub(crate) mod annotation_exports;
+    pub(crate) mod auto_filter_exports;
+    pub(crate) mod convert;
+    #[cfg(test)]
+    mod distance_tests;
+    pub(crate) mod document_exports;
+    pub(crate) mod exports;
+    pub(crate) mod handles;
+    pub(crate) mod history_exports;
+    pub(crate) mod input_exports;
+    #[cfg(test)]
+    mod layout_tests;
+    pub(crate) mod magnifier_exports;
+    #[cfg(test)]
+    mod magnifier_tests;
+    pub(crate) mod patch;
+    pub(crate) mod patch_exports;
+    pub(crate) mod path_exports;
+    pub(crate) mod raw_enum;
+    pub(crate) mod snap_exports;
+    pub(crate) mod speech_bubble_exports;
+    pub(crate) mod stroke_exports;
+    pub(crate) mod style_exports;
+    pub(crate) mod text;
+    pub(crate) mod text_exports;
+    pub(crate) mod types;
+}
+
+pub use abi::annotation_exports::*;
+pub use abi::auto_filter_exports::*;
+pub use abi::document_exports::*;
+pub use abi::exports::*;
+pub use abi::handles::{
+    SnowChangedViewportList, SnowPatchHandle, SnowRuntime, SnowSerializedBytes, SnowViewport,
+};
+pub use abi::history_exports::*;
+pub use abi::input_exports::*;
+pub use abi::magnifier_exports::*;
+pub use abi::patch_exports::*;
+pub use abi::path_exports::*;
+pub use abi::snap_exports::*;
+pub use abi::stroke_exports::*;
+pub use abi::style_exports::*;
+pub use abi::text_exports::*;
+pub use abi::types::*;

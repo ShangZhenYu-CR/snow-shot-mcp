@@ -1,0 +1,281 @@
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/storage/settingsadapters.h"
+
+#include "theme/theme_manager.h"
+#include "themeconfig_p.h"
+
+#include <QApplication>
+#include <QStyleHints>
+#include <QtGlobal>
+
+namespace snow_shot::presentation::styles {
+namespace {
+ThemeMode decodeThemeMode(const QString& value) {
+    const QString key = value.trimmed().toLower();
+    if (key == QStringLiteral("light")) {
+        return ThemeMode::Light;
+    }
+    if (key == QStringLiteral("dark")) {
+        return ThemeMode::Dark;
+    }
+    return ThemeMode::FollowSystem;
+}
+
+QString encodeThemeMode(ThemeMode mode) {
+    switch (mode) {
+    case ThemeMode::Light:
+        return QStringLiteral("light");
+    case ThemeMode::Dark:
+        return QStringLiteral("dark");
+    case ThemeMode::FollowSystem:
+    default:
+        return QStringLiteral("system");
+    }
+}
+
+ThemeAppearance systemThemeAppearance() {
+    const QStyleHints* styleHints = QApplication::styleHints();
+    if (styleHints != nullptr && styleHints->colorScheme() == Qt::ColorScheme::Dark) {
+        return ThemeAppearance::Dark;
+    }
+    return ThemeAppearance::Light;
+}
+
+ThemeAppearance resolvedAppearance(ThemeMode mode) {
+    switch (mode) {
+    case ThemeMode::Dark:
+        return ThemeAppearance::Dark;
+    case ThemeMode::Light:
+        return ThemeAppearance::Light;
+    case ThemeMode::FollowSystem:
+    default:
+        return systemThemeAppearance();
+    }
+}
+
+ThemeAppearance toThemeAppearance(adqt::theme::ThemeScheme scheme) {
+    return scheme == adqt::theme::ThemeScheme::Dark ? ThemeAppearance::Dark
+                                                    : ThemeAppearance::Light;
+}
+
+ThemePreset toThemePreset(adqt::theme::ThemeDensity density) {
+    return density == adqt::theme::ThemeDensity::Compact ? ThemePreset::Compact
+                                                         : ThemePreset::Default;
+}
+
+ThemeStyleConfig toThemeStyleConfig(const adqt::theme::ResolvedTheme& resolvedTheme) {
+    ThemeStyleConfig config;
+    config.preset = toThemePreset(resolvedTheme.config.density);
+    config.appearance = toThemeAppearance(resolvedTheme.config.scheme);
+    config.colorPrimary = resolvedTheme.config.primary;
+    config.colorSuccess = resolvedTheme.config.success;
+    config.colorWarning = resolvedTheme.config.warning;
+    config.colorError = resolvedTheme.config.error;
+    config.colorInfo = resolvedTheme.config.info;
+    config.colorLink = resolvedTheme.config.link;
+    config.colorTextBase = resolvedTheme.values.colorTextBase;
+    config.colorBgBase = resolvedTheme.values.colorBgBase;
+    config.appFont = resolvedTheme.config.appFont;
+    config.fontSize = qRound(resolvedTheme.config.fontSize);
+    config.lineWidth = qRound(resolvedTheme.config.lineWidth);
+    config.borderRadius = qRound(resolvedTheme.config.borderRadius);
+    config.sizeUnit = qRound(resolvedTheme.config.sizeUnit);
+    config.sizeStep = qRound(resolvedTheme.config.sizeStep);
+    config.controlHeight = qRound(resolvedTheme.config.controlHeight);
+    config.motionUnit = resolvedTheme.config.motion ? 0.1 : 0.0;
+    return config;
+}
+} // namespace
+
+ThemeManager::ThemeManager(QObject* parent)
+    : QObject(parent), m_config(toThemeStyleConfig(adqt::theme::makeResolvedTheme(
+                           adqt::theme::ThemeManager::instance().config()))),
+      m_scheme(generateThemeColorScheme(m_config)),
+      m_mode(decodeThemeMode(snow_shot::storage::InterfaceSettings().themeMode())),
+      m_appFontSize(storage::InterfaceSettings().appFontSize()) {
+    m_config.colorPrimary = storage::InterfaceSettings().themePrimaryColor();
+    const QString family = storage::InterfaceSettings().appFontFamily();
+    if (!family.isEmpty()) {
+        m_config.appFont.setFamily(family);
+    }
+    applyFontSize(m_config);
+    auto& adqtThemeManager = adqt::theme::ThemeManager::instance();
+    adqtThemeManager.setConfig(detail::toAdqtThemeConfig(m_config));
+    m_config = toThemeStyleConfig(adqt::theme::makeResolvedTheme(adqtThemeManager.config()));
+    m_scheme = generateThemeColorScheme(m_config);
+}
+
+void ThemeManager::initialize(QApplication& application) {
+    if (m_initialized) {
+        return;
+    }
+
+    m_initialized = true;
+    applyThemeMode();
+    adqt::theme::ThemeManager::instance().applyTo(application);
+
+    if (QStyleHints* styleHints = QApplication::styleHints(); styleHints != nullptr) {
+        m_systemColorSchemeConnection =
+            connect(styleHints, &QStyleHints::colorSchemeChanged, this, [this](Qt::ColorScheme) {
+                if (m_mode == ThemeMode::FollowSystem) {
+                    applyThemeMode();
+                }
+            });
+    }
+}
+
+ThemeManager& ThemeManager::instance() {
+    static ThemeManager manager;
+    return manager;
+}
+
+ThemeMode ThemeManager::themeMode() const {
+    return m_mode;
+}
+
+ThemeColorScheme ThemeManager::themeColorScheme() const {
+    return m_scheme;
+}
+
+QJsonObject ThemeManager::updateProgressAppearance() const {
+    const auto& resolved = adqt::theme::ThemeManager::instance().globalResolvedTheme();
+    const auto& colors = resolved.theme.palette;
+    const auto& metrics = resolved.theme.metrics;
+    const QColor background = resolved.semantic.surfaceElevated;
+    // The native updater paints opaque RGB surfaces. Flatten Ant's translucent
+    // text and fill tokens over the same elevated background used by Qt popups.
+    const auto rgb = [&background](const QColor& color) {
+        const float alpha = color.alphaF();
+        QColor mixed;
+        mixed.setRedF(color.redF() * alpha + background.redF() * (1.0F - alpha));
+        mixed.setGreenF(color.greenF() * alpha + background.greenF() * (1.0F - alpha));
+        mixed.setBlueF(color.blueF() * alpha + background.blueF() * (1.0F - alpha));
+        return static_cast<int>(mixed.rgb() & 0xffffffU);
+    };
+    return {{QStringLiteral("background"), rgb(background)},
+            {QStringLiteral("border"), rgb(colors.colorBorderSecondary)},
+            {QStringLiteral("text"), rgb(colors.colorText)},
+            {QStringLiteral("textSecondary"), rgb(colors.colorTextSecondary)},
+            {QStringLiteral("textTertiary"), rgb(colors.colorTextTertiary)},
+            {QStringLiteral("fillSecondary"), rgb(colors.colorFillSecondary)},
+            {QStringLiteral("fillTertiary"), rgb(colors.colorFillTertiary)},
+            {QStringLiteral("primary"), rgb(colors.colorPrimary)},
+            {QStringLiteral("primaryBackground"), rgb(colors.colorPrimaryBg)},
+            {QStringLiteral("success"), rgb(colors.colorSuccess)},
+            {QStringLiteral("error"), rgb(colors.colorError)},
+            {QStringLiteral("fontFamily"), QApplication::font().family().left(63)},
+            {QStringLiteral("fontSize"), qRound(metrics.fontSize)},
+            {QStringLiteral("smallFontSize"), qRound(metrics.fontSizeSM)},
+            {QStringLiteral("borderRadius"), qRound(metrics.borderRadiusLG)},
+            {QStringLiteral("motion"), resolved.config.motion}};
+}
+
+void ThemeManager::setThemeStyleConfig(const ThemeStyleConfig& config) {
+    auto& adqtThemeManager = adqt::theme::ThemeManager::instance();
+    adqtThemeManager.setConfig(detail::toAdqtThemeConfig(config));
+    m_config = toThemeStyleConfig(adqt::theme::makeResolvedTheme(adqtThemeManager.config()));
+    rebuildScheme();
+}
+
+QString ThemeManager::appFontFamily() const {
+    return (m_config.appFont.resolveMask() & (QFont::FamilyResolved | QFont::FamiliesResolved)) != 0
+               ? m_config.appFont.family()
+               : QString();
+}
+
+bool ThemeManager::setAppFontFamily(const QString& family) {
+    const QString normalized = family.trimmed();
+    if (!storage::InterfaceSettings().setAppFontFamily(normalized)) {
+        return false;
+    }
+    if (appFontFamily() != normalized) {
+        auto config = m_config;
+        config.appFont = QFont();
+        if (!normalized.isEmpty()) {
+            config.appFont.setFamily(normalized);
+        }
+        applyFontSize(config);
+        setThemeStyleConfig(config);
+        emit appFontFamilyChanged(normalized);
+    }
+    return true;
+}
+
+int ThemeManager::appFontSize() const {
+    return m_appFontSize;
+}
+
+bool ThemeManager::setAppFontSize(int pixelSize) {
+    if (!storage::InterfaceSettings().setAppFontSize(pixelSize)) {
+        return false;
+    }
+    if (m_appFontSize != pixelSize) {
+        m_appFontSize = pixelSize;
+        auto config = m_config;
+        applyFontSize(config);
+        setThemeStyleConfig(config);
+        emit appFontSizeChanged(pixelSize);
+    }
+    return true;
+}
+
+void ThemeManager::applyFontSize(ThemeStyleConfig& config) const {
+    config.fontSize = m_appFontSize;
+    config.appFont.setPixelSize(m_appFontSize);
+}
+
+bool ThemeManager::setThemePrimaryColor(const QColor& color) {
+    if (!color.isValid() || !storage::InterfaceSettings().setThemePrimaryColor(color)) {
+        return false;
+    }
+    if (m_config.colorPrimary != color) {
+        auto config = m_config;
+        config.colorPrimary = color;
+        setThemeStyleConfig(config);
+    }
+    return true;
+}
+
+void ThemeManager::setThemeMode(ThemeMode mode) {
+    if (m_mode == mode) {
+        return;
+    }
+
+    m_mode = mode;
+    snow_shot::storage::InterfaceSettings().setThemeMode(encodeThemeMode(m_mode));
+    applyThemeMode();
+    emit themeModeChanged(m_mode);
+}
+
+void ThemeManager::setThemeAppearance(ThemeAppearance appearance) {
+    setThemeMode(appearance == ThemeAppearance::Dark ? ThemeMode::Dark : ThemeMode::Light);
+}
+
+void ThemeManager::setThemePreset(ThemePreset preset) {
+    if (m_config.preset == preset) {
+        return;
+    }
+
+    auto& adqtThemeManager = adqt::theme::ThemeManager::instance();
+    adqtThemeManager.setDensity(detail::toAdqtDensity(preset));
+    m_config = toThemeStyleConfig(adqt::theme::makeResolvedTheme(adqtThemeManager.config()));
+    rebuildScheme();
+}
+
+void ThemeManager::rebuildScheme() {
+    m_scheme = generateThemeColorScheme(m_config);
+    emit themeChanged(m_scheme);
+}
+
+void ThemeManager::applyThemeMode() {
+    const ThemeAppearance appearance = resolvedAppearance(m_mode);
+    if (m_config.appearance == appearance) {
+        return;
+    }
+
+    auto& adqtThemeManager = adqt::theme::ThemeManager::instance();
+    adqtThemeManager.setColorScheme(detail::toAdqtScheme(appearance));
+    m_config = toThemeStyleConfig(adqt::theme::makeResolvedTheme(adqtThemeManager.config()));
+    rebuildScheme();
+}
+} // namespace snow_shot::presentation::styles

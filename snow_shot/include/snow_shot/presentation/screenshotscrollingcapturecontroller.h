@@ -1,0 +1,80 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTSCROLLINGCAPTURECONTROLLER_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTSCROLLINGCAPTURECONTROLLER_H
+
+#include "snow_shot/presentation/screenshotscrollingtypes.h"
+#include "snow_shot/presentation/screenshotscrollingsnapshot.h"
+
+#include <QImage>
+#include <QJsonObject>
+#include <QObject>
+#include <QRect>
+#include <QSize>
+
+#include <functional>
+#include <memory>
+
+class ScreenshotDisplaySession;
+class ScreenshotGeometryMapper;
+class ScreenshotOverlayCoordinator;
+
+struct ScreenshotScrollingCaptureControllerContext {
+    ScreenshotDisplaySession& displaySession;
+    const ScreenshotGeometryMapper& geometry;
+    ScreenshotOverlayCoordinator& overlayCoordinator;
+    std::function<bool()> restoreOriginalScreenColors = []() { return false; };
+    // When enabled the overlay and the screenshot toolbar stay capturable, so
+    // they appear in the stitched scrolling screenshot.
+    std::function<bool()> captureUiInScrollingScreenshot = []() { return false; };
+    std::function<void()> captureFailed = {};
+    std::function<bool()> presentationSuppressed = [] { return false; };
+};
+
+class ScreenshotScrollingCaptureController final : public QObject {
+    Q_OBJECT
+  public:
+    using SnapshotResultCallback = std::function<void(ScreenshotScrollingSnapshot)>;
+    using SnapshotCancellationCallback = std::function<void()>;
+
+    explicit ScreenshotScrollingCaptureController(
+        ScreenshotScrollingCaptureControllerContext context, QObject* parent = nullptr);
+    ~ScreenshotScrollingCaptureController() override;
+
+    [[nodiscard]] bool
+    start(const QRect& canvasSelection,
+          ScreenshotScrollingRecognitionMode mode = ScreenshotScrollingRecognitionMode::Vertical);
+    [[nodiscard]] bool restart();
+    [[nodiscard]] bool setRecognitionMode(ScreenshotScrollingRecognitionMode mode);
+    [[nodiscard]] ScreenshotScrollingRecognitionMode recognitionMode() const;
+    void stop(bool restoreScreenshotPresentation);
+    [[nodiscard]] bool active() const;
+    void setExportPaused(bool paused);
+    void setAutoScroll(bool enabled);
+    void setAutoScrollIntervalMs(int milliseconds);
+    [[nodiscard]] QJsonObject state() const;
+    [[nodiscard]] bool setTrimRange(int start, int end);
+    [[nodiscard]] bool moveSelection(QPoint offset);
+    // Acknowledges native input dispatch; capture continues asynchronously.
+    [[nodiscard]] QJsonObject scrollOnce(const QString& direction, QString* error);
+    [[nodiscard]] bool beginSelectionMove(ScreenshotScrollingRecognitionMode axis,
+                                          QPoint physicalPointer);
+    void updateSelectionMove(QPoint physicalPointer);
+    void endSelectionMove();
+    [[nodiscard]] bool movingSelection() const;
+    [[nodiscard]] QSize trimmedSize() const;
+    [[nodiscard]] qreal sourceScale() const;
+    // Cancellation releases preparation state when capture discards a pending request.
+    // Detached exports keep their accepted completion through capture teardown.
+    [[nodiscard]] bool requestTrimmedSnapshot(SnapshotResultCallback callback,
+                                              SnapshotCancellationCallback cancelled = {});
+    void detachPendingResultRequest();
+    [[nodiscard]] QRect canvasSelection() const;
+
+  signals:
+    void stateChanged();
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTSCROLLINGCAPTURECONTROLLER_H

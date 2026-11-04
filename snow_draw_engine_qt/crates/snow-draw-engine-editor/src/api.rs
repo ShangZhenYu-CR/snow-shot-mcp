@@ -1,0 +1,687 @@
+use serde::{Deserialize, Serialize};
+use snow_draw_engine_core::{
+    Camera, ColorRgba8, CornerRadii, ErrorCode, PathGeometry, Point, SnapGuide, SurfaceSize,
+    arrow::{ArrowType, Arrowhead, StrokeStyle},
+    validate_camera,
+};
+use snow_draw_engine_document::{
+    ArrowData, CanvasFilterType, ElementId, FillStyle, FilterData, FreeDrawData, HighlightShape,
+    PenFilterData, RectangleData, SerialNumberData, TextData,
+};
+use std::sync::Arc;
+
+use crate::text::{SerialNumberStyle, TextPreviewPaint, TextStyle};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActiveTool {
+    Select,
+    #[default]
+    Shape,
+    Arrow,
+    Line,
+    FreeDraw,
+    RectangleHighlight,
+    PenHighlight,
+    RectangleFilter,
+    PenFilter,
+    Watermark,
+    Eraser,
+    Text,
+    SerialNumber,
+    Spotlight,
+    AutoFilter,
+    RectangleEraser,
+    BrushEraser,
+    Distance,
+    Angle,
+    Magnifier,
+    SpeechBubble,
+    Bracket,
+}
+
+impl ActiveTool {
+    #[allow(non_upper_case_globals)]
+    pub const Filter: Self = Self::RectangleFilter;
+
+    pub const fn policy_bit(self) -> u64 {
+        1_u64 << (self as u32)
+    }
+
+    pub(crate) const fn uses_stroke_cursor(self) -> bool {
+        matches!(
+            self,
+            Self::FreeDraw | Self::PenHighlight | Self::PenFilter | Self::BrushEraser
+        )
+    }
+
+    pub(crate) const fn is_filter(self) -> bool {
+        match self {
+            Self::RectangleFilter
+            | Self::PenFilter
+            | Self::AutoFilter
+            | Self::RectangleEraser
+            | Self::BrushEraser => true,
+            Self::Select
+            | Self::Shape
+            | Self::Arrow
+            | Self::Line
+            | Self::FreeDraw
+            | Self::RectangleHighlight
+            | Self::PenHighlight
+            | Self::Watermark
+            | Self::Eraser
+            | Self::Text
+            | Self::SerialNumber
+            | Self::Spotlight
+            | Self::Distance
+            | Self::Angle
+            | Self::Magnifier
+            | Self::SpeechBubble
+            | Self::Bracket => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RectangleShapeStyle {
+    pub fill: ColorRgba8,
+    pub fill_style: FillStyle,
+    pub stroke: ColorRgba8,
+    pub stroke_width: f64,
+    pub stroke_style: StrokeStyle,
+    #[serde(default)]
+    pub stroke_rendering_style: snow_draw_engine_core::arrow::StrokeRenderingStyle,
+    pub corner_radii: CornerRadii,
+    pub shape: HighlightShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArrowStyle {
+    pub stroke: ColorRgba8,
+    pub stroke_width: f64,
+    pub start_arrowhead: Option<Arrowhead>,
+    pub end_arrowhead: Option<Arrowhead>,
+    pub stroke_style: StrokeStyle,
+    #[serde(default)]
+    pub stroke_rendering_style: snow_draw_engine_core::arrow::StrokeRenderingStyle,
+    pub arrow_type: ArrowType,
+    #[serde(default)]
+    pub arrow_shaft_type: snow_draw_engine_core::arrow::ArrowShaftType,
+    #[serde(
+        default = "snow_draw_engine_core::arrow::default_arrow_ratio",
+        deserialize_with = "snow_draw_engine_core::arrow::deserialize_arrow_ratio"
+    )]
+    pub arrow_ratio: f64,
+    #[serde(default = "snow_draw_engine_core::arrow::default_arrow_outline_color")]
+    pub arrow_outline_color: ColorRgba8,
+    #[serde(
+        default,
+        deserialize_with = "snow_draw_engine_core::arrow::deserialize_arrow_outline_width"
+    )]
+    pub arrow_outline_width: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShapeStyle {
+    #[serde(default)]
+    pub brush_mode: snow_draw_engine_core::BrushMode,
+    pub fill: ColorRgba8,
+    pub fill_style: FillStyle,
+    pub stroke: ColorRgba8,
+    pub stroke_width: f64,
+    pub corner_radii: CornerRadii,
+    pub start_arrowhead: Option<Arrowhead>,
+    pub end_arrowhead: Option<Arrowhead>,
+    pub stroke_style: StrokeStyle,
+    #[serde(default)]
+    pub stroke_rendering_style: snow_draw_engine_core::arrow::StrokeRenderingStyle,
+    pub arrow_type: ArrowType,
+    #[serde(default)]
+    pub arrow_shaft_type: snow_draw_engine_core::arrow::ArrowShaftType,
+    #[serde(
+        default = "snow_draw_engine_core::arrow::default_arrow_ratio",
+        deserialize_with = "snow_draw_engine_core::arrow::deserialize_arrow_ratio"
+    )]
+    pub arrow_ratio: f64,
+    pub opacity: f64,
+    pub highlight_shape: HighlightShape,
+    pub shape: HighlightShape,
+    #[serde(default = "snow_draw_engine_core::arrow::default_arrow_outline_color")]
+    pub arrow_outline_color: ColorRgba8,
+    #[serde(
+        default,
+        deserialize_with = "snow_draw_engine_core::arrow::deserialize_arrow_outline_width"
+    )]
+    pub arrow_outline_width: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleToolbarSource {
+    DefaultRectangle,
+    SelectedRectangle,
+    DefaultArrow,
+    SelectedArrow,
+    DefaultLine,
+    SelectedLine,
+    DefaultFreeDraw,
+    SelectedFreeDraw,
+    DefaultRectangleHighlight,
+    SelectedRectangleHighlight,
+    DefaultPenHighlight,
+    SelectedPenHighlight,
+    DefaultText,
+    SelectedText,
+    DefaultSerialNumber,
+    SelectedSerialNumber,
+    Eraser,
+    DefaultRectangleFilter,
+    SelectedRectangleFilter,
+    DefaultPenFilter,
+    SelectedPenFilter,
+    Watermark,
+    DefaultSpotlight,
+    SelectedSpotlight,
+    DefaultRectangleEraser,
+    DefaultBrushEraser,
+    DefaultDistance,
+    SelectedDistance,
+    DefaultAngle,
+    SelectedAngle,
+    DefaultMagnifier,
+    SelectedMagnifier,
+    DefaultSpeechBubble,
+    SelectedSpeechBubble,
+    DefaultBracket,
+    SelectedBracket,
+}
+
+impl StyleToolbarSource {
+    #[allow(non_upper_case_globals)]
+    pub const DefaultFilter: Self = Self::DefaultRectangleFilter;
+    #[allow(non_upper_case_globals)]
+    pub const SelectedFilter: Self = Self::SelectedRectangleFilter;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterStyle {
+    pub filter_type: snow_draw_engine_document::CanvasFilterType,
+    pub strength: f64,
+    pub opacity: f64,
+    pub stroke_width: f64,
+}
+
+impl Default for FilterStyle {
+    fn default() -> Self {
+        Self {
+            filter_type: Default::default(),
+            strength: 0.5,
+            opacity: 1.0,
+            stroke_width: 2.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrushEraserStyle {
+    pub stroke_width: f64,
+}
+
+impl Default for BrushEraserStyle {
+    fn default() -> Self {
+        Self { stroke_width: 30.0 }
+    }
+}
+
+pub const BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH: u32 = 1 << 0;
+
+pub const FILTER_STYLE_PROPERTY_TYPE: u32 = 1 << 0;
+pub const FILTER_STYLE_PROPERTY_STRENGTH: u32 = 1 << 1;
+pub const FILTER_STYLE_PROPERTY_OPACITY: u32 = 1 << 2;
+pub const FILTER_STYLE_PROPERTY_STROKE_WIDTH: u32 = 1 << 3;
+pub const FILTER_STYLE_PROPERTY_ALL: u32 = FILTER_STYLE_PROPERTY_TYPE
+    | FILTER_STYLE_PROPERTY_STRENGTH
+    | FILTER_STYLE_PROPERTY_OPACITY
+    | FILTER_STYLE_PROPERTY_STROKE_WIDTH;
+pub const FILTER_STYLE_MIXED_CONTAINS_BOTH_FILTERS: u32 = 1 << 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    SpeechBubble,
+    Rectangle,
+    Arrow,
+    Line,
+    FreeDraw,
+    RectangleHighlight,
+    PenHighlight,
+    Spotlight,
+}
+
+pub const SHAPE_STYLE_PROPERTY_FILL: u32 = 1 << 0;
+pub const SHAPE_STYLE_PROPERTY_FILL_STYLE: u32 = 1 << 1;
+pub const SHAPE_STYLE_PROPERTY_STROKE: u32 = 1 << 2;
+pub const SHAPE_STYLE_PROPERTY_STROKE_WIDTH: u32 = 1 << 3;
+pub const SHAPE_STYLE_PROPERTY_CORNER_RADII: u32 = 1 << 4;
+pub const SHAPE_STYLE_PROPERTY_START_ARROWHEAD: u32 = 1 << 5;
+pub const SHAPE_STYLE_PROPERTY_END_ARROWHEAD: u32 = 1 << 6;
+pub const SHAPE_STYLE_PROPERTY_STROKE_STYLE: u32 = 1 << 7;
+pub const SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR: u32 = 1 << 16;
+pub const SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH: u32 = 1 << 17;
+pub const SHAPE_STYLE_PROPERTY_ARROW_RATIO: u32 = 1 << 13;
+pub const SHAPE_STYLE_PROPERTY_BRUSH_MODE: u32 = 1 << 14;
+pub const SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE: u32 = 1 << 15;
+pub const SHAPE_STYLE_MIXED_STROKE_RENDERING_STYLE: u32 =
+    SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE;
+pub const SHAPE_STYLE_MIXED_BRUSH_MODE: u32 = SHAPE_STYLE_PROPERTY_BRUSH_MODE;
+pub const SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE: u32 = 1 << 12;
+pub const SHAPE_STYLE_PROPERTY_ARROW_TYPE: u32 = 1 << 8;
+pub const SHAPE_STYLE_PROPERTY_OPACITY: u32 = 1 << 9;
+pub const SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE: u32 = 1 << 10;
+pub const SHAPE_STYLE_PROPERTY_SHAPE: u32 = 1 << 11;
+
+pub const SHAPE_STYLE_PROPERTY_RECTANGLE: u32 = SHAPE_STYLE_PROPERTY_FILL
+    | SHAPE_STYLE_PROPERTY_FILL_STYLE
+    | SHAPE_STYLE_PROPERTY_STROKE
+    | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+    | SHAPE_STYLE_PROPERTY_CORNER_RADII
+    | SHAPE_STYLE_PROPERTY_STROKE_STYLE
+    | SHAPE_STYLE_PROPERTY_SHAPE
+    | SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE;
+pub const SHAPE_STYLE_PROPERTY_ARROW: u32 = SHAPE_STYLE_PROPERTY_STROKE
+    | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+    | SHAPE_STYLE_PROPERTY_START_ARROWHEAD
+    | SHAPE_STYLE_PROPERTY_END_ARROWHEAD
+    | SHAPE_STYLE_PROPERTY_STROKE_STYLE
+    | SHAPE_STYLE_PROPERTY_ARROW_TYPE
+    | SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE
+    | SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR
+    | SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH
+    | SHAPE_STYLE_PROPERTY_ARROW_RATIO
+    | SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE;
+pub const SHAPE_STYLE_PROPERTY_LINE: u32 = SHAPE_STYLE_PROPERTY_FILL
+    | SHAPE_STYLE_PROPERTY_FILL_STYLE
+    | SHAPE_STYLE_PROPERTY_STROKE
+    | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+    | SHAPE_STYLE_PROPERTY_STROKE_STYLE
+    | SHAPE_STYLE_PROPERTY_ARROW_TYPE
+    | SHAPE_STYLE_PROPERTY_OPACITY
+    | SHAPE_STYLE_PROPERTY_STROKE_RENDERING_STYLE;
+pub const SHAPE_STYLE_PROPERTY_FREE_DRAW: u32 = SHAPE_STYLE_PROPERTY_FILL
+    | SHAPE_STYLE_PROPERTY_FILL_STYLE
+    | SHAPE_STYLE_PROPERTY_STROKE
+    | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+    | SHAPE_STYLE_PROPERTY_STROKE_STYLE
+    | SHAPE_STYLE_PROPERTY_OPACITY
+    | SHAPE_STYLE_PROPERTY_BRUSH_MODE;
+pub const SHAPE_STYLE_PROPERTY_ALL: u32 = SHAPE_STYLE_PROPERTY_RECTANGLE
+    | SHAPE_STYLE_PROPERTY_ARROW
+    | SHAPE_STYLE_PROPERTY_LINE
+    | SHAPE_STYLE_PROPERTY_HIGHLIGHT_SHAPE
+    | SHAPE_STYLE_PROPERTY_SHAPE
+    | SHAPE_STYLE_PROPERTY_BRUSH_MODE;
+
+impl ShapeKind {
+    pub const fn supported_properties(self) -> u32 {
+        match self {
+            Self::Rectangle | Self::SpeechBubble => SHAPE_STYLE_PROPERTY_RECTANGLE,
+            Self::Arrow => SHAPE_STYLE_PROPERTY_ARROW,
+            Self::Line => SHAPE_STYLE_PROPERTY_LINE,
+            Self::FreeDraw => SHAPE_STYLE_PROPERTY_FREE_DRAW,
+            Self::RectangleHighlight => {
+                SHAPE_STYLE_PROPERTY_FILL
+                    | SHAPE_STYLE_PROPERTY_STROKE
+                    | SHAPE_STYLE_PROPERTY_STROKE_WIDTH
+            }
+            Self::PenHighlight => SHAPE_STYLE_PROPERTY_STROKE | SHAPE_STYLE_PROPERTY_STROKE_WIDTH,
+            Self::Spotlight => SHAPE_STYLE_PROPERTY_SHAPE | SHAPE_STYLE_PROPERTY_CORNER_RADII,
+        }
+    }
+}
+
+pub const SHAPE_STYLE_MIXED_FILL: u32 = SHAPE_STYLE_PROPERTY_FILL;
+pub const SHAPE_STYLE_MIXED_FILL_STYLE: u32 = SHAPE_STYLE_PROPERTY_FILL_STYLE;
+pub const SHAPE_STYLE_MIXED_STROKE: u32 = SHAPE_STYLE_PROPERTY_STROKE;
+pub const SHAPE_STYLE_MIXED_STROKE_WIDTH: u32 = SHAPE_STYLE_PROPERTY_STROKE_WIDTH;
+pub const SHAPE_STYLE_MIXED_CORNER_RADII: u32 = SHAPE_STYLE_PROPERTY_CORNER_RADII;
+pub const SHAPE_STYLE_MIXED_START_ARROWHEAD: u32 = SHAPE_STYLE_PROPERTY_START_ARROWHEAD;
+pub const SHAPE_STYLE_MIXED_END_ARROWHEAD: u32 = SHAPE_STYLE_PROPERTY_END_ARROWHEAD;
+pub const SHAPE_STYLE_MIXED_STROKE_STYLE: u32 = SHAPE_STYLE_PROPERTY_STROKE_STYLE;
+pub const SHAPE_STYLE_MIXED_ARROW_OUTLINE_COLOR: u32 = SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_COLOR;
+pub const SHAPE_STYLE_MIXED_ARROW_OUTLINE_WIDTH: u32 = SHAPE_STYLE_PROPERTY_ARROW_OUTLINE_WIDTH;
+pub const SHAPE_STYLE_MIXED_ARROW_RATIO: u32 = SHAPE_STYLE_PROPERTY_ARROW_RATIO;
+pub const SHAPE_STYLE_MIXED_ARROW_SHAFT_TYPE: u32 = SHAPE_STYLE_PROPERTY_ARROW_SHAFT_TYPE;
+pub const SHAPE_STYLE_MIXED_ARROW_TYPE: u32 = SHAPE_STYLE_PROPERTY_ARROW_TYPE;
+pub const SHAPE_STYLE_MIXED_OPACITY: u32 = 1 << 9;
+pub const SHAPE_STYLE_MIXED_SHAPE: u32 = SHAPE_STYLE_PROPERTY_SHAPE;
+pub const SHAPE_STYLE_MIXED_HIGHLIGHT_SHAPE: u32 = 1 << 10;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeStylePatch {
+    pub kind: ShapeKind,
+    pub style: ShapeStyle,
+    pub properties: u32,
+}
+
+pub const TEXT_STYLE_MIXED_COLOR: u32 = 1 << 0;
+pub const TEXT_STYLE_MIXED_FONT_SIZE: u32 = 1 << 1;
+pub const TEXT_STYLE_MIXED_FONT_FAMILY: u32 = 1 << 2;
+pub const TEXT_STYLE_MIXED_FILL: u32 = 1 << 3;
+pub const TEXT_STYLE_MIXED_FILL_STYLE: u32 = 1 << 4;
+pub const TEXT_STYLE_MIXED_STROKE: u32 = 1 << 5;
+pub const TEXT_STYLE_MIXED_STROKE_WIDTH: u32 = 1 << 6;
+pub const TEXT_STYLE_MIXED_CORNER_RADII: u32 = 1 << 7;
+pub const TEXT_STYLE_MIXED_HORIZONTAL_ALIGN: u32 = 1 << 8;
+pub const TEXT_STYLE_MIXED_VERTICAL_ALIGN: u32 = 1 << 9;
+pub const TEXT_STYLE_MIXED_OPACITY: u32 = 1 << 10;
+pub const TEXT_STYLE_MIXED_BOLD: u32 = 1 << 11;
+pub const TEXT_STYLE_MIXED_ITALIC: u32 = 1 << 12;
+pub const TEXT_STYLE_ALL_PROPERTIES: u32 = (1 << 13) - 1;
+
+pub const SERIAL_NUMBER_STYLE_MIXED_NUMBER: u32 = 1 << 0;
+pub const SERIAL_NUMBER_STYLE_MIXED_COLOR: u32 = 1 << 1;
+pub const SERIAL_NUMBER_STYLE_MIXED_FILL: u32 = 1 << 2;
+pub const SERIAL_NUMBER_STYLE_MIXED_FILL_STYLE: u32 = 1 << 3;
+pub const SERIAL_NUMBER_STYLE_MIXED_FONT_SIZE: u32 = 1 << 4;
+pub const SERIAL_NUMBER_STYLE_MIXED_FONT_FAMILY: u32 = 1 << 5;
+pub const SERIAL_NUMBER_STYLE_MIXED_STROKE_WIDTH: u32 = 1 << 6;
+pub const SERIAL_NUMBER_STYLE_MIXED_STROKE_STYLE: u32 = 1 << 7;
+pub const SERIAL_NUMBER_STYLE_MIXED_OPACITY: u32 = 1 << 8;
+pub const SERIAL_NUMBER_STYLE_MIXED_TYPE: u32 = 1 << 9;
+pub const SERIAL_NUMBER_STYLE_MIXED_NUMERIC_TYPE: u32 = 1 << 10;
+pub const SERIAL_NUMBER_STYLE_MIXED_STROKE_RENDERING_STYLE: u32 = 1 << 11;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryState {
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleToolbarState {
+    pub source: StyleToolbarSource,
+    pub selected_element_count: u32,
+    pub shape_style: ShapeStyle,
+    pub text_style: TextStyle,
+    pub serial_number_style: SerialNumberStyle,
+    pub text_style_mixed: u32,
+    pub serial_number_style_mixed: u32,
+    pub shape_style_mixed: u32,
+    pub filter_style: FilterStyle,
+    pub filter_style_mixed: u32,
+    pub brush_eraser_style: BrushEraserStyle,
+    pub distance_style: crate::DistanceStyle,
+    pub distance_style_mixed: u32,
+    pub angle_style: crate::AngleStyle,
+    pub bracket_style: crate::BracketStyle,
+    pub angle_style_mixed: u32,
+    pub bracket_style_mixed: u32,
+    pub magnifier_style: crate::MagnifierStyle,
+    pub magnifier_style_mixed: u32,
+    pub distance_measured_length: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SerialNumberToolbarState {
+    pub visible: bool,
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+    pub can_decrease: bool,
+    pub can_increase: bool,
+    pub can_create_text: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EditorViewState {
+    pub surface: SurfaceSize,
+    pub camera: Camera,
+    pub clear_color: ColorRgba8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PenFilterPreview {
+    pub global_points: Vec<Point<f64>>,
+    pub filter_type: CanvasFilterType,
+    pub strength: f64,
+    pub stroke_width: f64,
+    pub opacity: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreeDrawPreview {
+    pub geometry: Arc<PathGeometry>,
+    pub brush_mode: snow_draw_engine_core::BrushMode,
+    pub pressure_geometry: Option<Arc<PathGeometry>>,
+    pub stroke: ColorRgba8,
+    pub stroke_width: f64,
+    pub stroke_style: StrokeStyle,
+    pub fill: ColorRgba8,
+    pub fill_style: FillStyle,
+    pub opacity: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ElementCreationPreview {
+    SpeechBubble(snow_draw_engine_document::SpeechBubbleData),
+    Rectangle(RectangleData),
+    Magnifier(snow_draw_engine_document::MagnifierData),
+    Filter(FilterData),
+    PenFilter(PenFilterPreview),
+    FreeDraw(Arc<FreeDrawPreview>),
+    Arrow(ArrowData),
+    SerialNumber(SerialNumberData),
+}
+
+/// Lower zoom bound for sizing binding-highlight strokes and midpoint dots,
+/// keeping them readable on screen instead of shrinking with the camera.
+pub const MIN_BINDING_HIGHLIGHT_ZOOM: f64 = 0.25;
+
+/// Hover feedback for the bindable an arrow endpoint/focus drag would attach to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindingHighlightPresentation {
+    /// Outline geometry of the bindable in canvas coordinates.
+    pub rect: RectangleData,
+    /// Screen-constant highlight stroke width in canvas units (already zoom-divided).
+    pub stroke_width: f64,
+    /// Side midpoint the drag currently snaps to, if any.
+    pub mid_point: Option<Point<f64>>,
+    /// Remaining side midpoints rendered as proximity hints.
+    pub near_mid_points: Vec<Point<f64>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorPresentationState {
+    /// Additive, uncommitted copies. Uses the same transaction builder as duplication.
+    pub duplicate_preview: Option<snow_draw_engine_document::Transaction>,
+    pub creation_preview: Option<ElementCreationPreview>,
+    pub distance_creation_text: Option<(ElementId, TextData)>,
+    pub free_draw_endpoint: Option<Point<f64>>,
+    pub free_draw_replacement: Option<(ElementId, Arc<FreeDrawPreview>)>,
+    pub active_text_draft: Option<ActiveTextDraftPresentation>,
+    pub shape_bound_text_preview: Option<crate::ShapeBoundTextPreview>,
+    pub shape_text_handle: Option<Point<f64>>,
+    pub arrow_text_previews: Vec<(ElementId, TextData)>,
+    pub preview_arrows: Vec<SelectionArrowState>,
+    pub speech_bubble_previews: Vec<(ElementId, snow_draw_engine_document::SpeechBubbleData)>,
+    pub speech_bubble_text_previews: Vec<(ElementId, TextData)>,
+    pub speech_bubble_handles: Vec<(u8, Point<f64>)>,
+    pub speech_bubble_handle_leaders: Vec<(Point<f64>, Point<f64>)>,
+    pub preview_magnifiers: Vec<crate::SelectionMagnifierState>,
+    pub selected_magnifiers: Vec<crate::SelectionMagnifierState>,
+    pub preview_elements: Vec<SelectionRectState>,
+    pub preview_text_paints: Vec<TextPreviewPaint>,
+    pub auto_filter_highlights: Vec<RectangleData>,
+    pub marquee: Option<RectangleData>,
+    pub marquee_candidate_elements: Vec<SelectionRectState>,
+    pub marquee_candidate_arrows: Vec<SelectionArrowState>,
+    pub text_rect_ids: Vec<ElementId>,
+    pub hovered_rect: Option<RectangleData>,
+    pub hovered_magnifier: Option<snow_draw_engine_document::MagnifierData>,
+    pub hovered_free_draw: Option<FreeDrawData>,
+    pub hovered_pen_filter: Option<PenFilterData>,
+    pub hovered_text_rect: Option<RectangleData>,
+    pub hovered_arrow: Option<ArrowData>,
+    pub selection_bounds: Option<SelectionBounds>,
+    pub selection_elements: Vec<SelectionRectState>,
+    pub selection_arrows: Vec<SelectionArrowState>,
+    pub selected_single_rect: Option<RectangleData>,
+    pub selected_single_text_rect: Option<RectangleData>,
+    pub selected_single_arrow: Option<ArrowData>,
+    pub arrow_handles: Vec<ArrowHandleState>,
+    pub snap_guides: Vec<SnapGuide>,
+    pub binding_highlight: Option<BindingHighlightPresentation>,
+}
+
+/// Whether the generic selection frame and its controls apply to these members.
+pub fn selection_box_visible_for_members(
+    selection_elements: &[SelectionRectState],
+    selection_arrows: &[SelectionArrowState],
+) -> bool {
+    let selected_item_count = selection_elements.len() + selection_arrows.len();
+    selected_item_count != 1
+        || !matches!(
+            selection_arrows,
+            [arrow] if arrow.arrow.points.len() == 2 || arrow.arrow.is_bracket()
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorViewportState {
+    pub surface: SurfaceSize,
+    pub camera: Camera,
+    pub snap_guide_targets: SnapGuideTargets,
+    pub distance_pixel_scale: Point<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SnapGuideTargets {
+    pub vertical_xs: [Option<f64>; 2],
+    pub horizontal_ys: [Option<f64>; 2],
+}
+
+impl Default for EditorViewportState {
+    fn default() -> Self {
+        Self {
+            surface: SurfaceSize::default(),
+            snap_guide_targets: SnapGuideTargets::default(),
+            distance_pixel_scale: Point::new(1.0, 1.0),
+            camera: Camera {
+                center: Point::default(),
+                zoom: 1.0,
+            },
+        }
+    }
+}
+
+impl EditorViewportState {
+    pub fn set_surface_size(&mut self, width: u32, height: u32) {
+        self.surface = SurfaceSize { width, height };
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) -> Result<(), ErrorCode> {
+        validate_camera(&camera)?;
+        self.camera = camera;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionRectState {
+    pub id: snow_draw_engine_document::ElementId,
+    pub rect: RectangleData,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectionArrowState {
+    pub id: snow_draw_engine_document::ElementId,
+    pub arrow: ArrowData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrowHandleKind {
+    Endpoint,
+    AngleArc,
+    LoopStart,
+    LoopEnd,
+    FocusPoint,
+    Segment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrowHandleState {
+    pub kind: ArrowHandleKind,
+    pub center: Point<f64>,
+    pub anchor: Option<Point<f64>>,
+    pub fixed_segment: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionBounds {
+    pub center: Point<f64>,
+    pub width: f64,
+    pub height: f64,
+    pub rotation: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveTextDraftTarget {
+    New,
+    NewArrow(ElementId),
+    NewSpeechBubble(ElementId),
+    Existing(ElementId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveTextDraftPresentation {
+    pub target: ActiveTextDraftTarget,
+    pub revision: u64,
+    pub text: TextData,
+}
+
+impl ActiveTextDraftPresentation {
+    pub fn existing_id(&self) -> Option<ElementId> {
+        match self.target {
+            ActiveTextDraftTarget::New
+            | ActiveTextDraftTarget::NewArrow(_)
+            | ActiveTextDraftTarget::NewSpeechBubble(_) => None,
+            ActiveTextDraftTarget::Existing(id) => Some(id),
+        }
+    }
+
+    pub fn display_id(&self) -> ElementId {
+        self.existing_id().unwrap_or(ElementId {
+            index: u32::MAX,
+            generation: self.revision as u32,
+        })
+    }
+
+    pub fn rect(&self) -> RectangleData {
+        RectangleData {
+            text_element_id: None,
+            stroke_rendering_seed: 0,
+            stroke_rendering_style: Default::default(),
+            rectangle_kind: snow_draw_engine_document::RectangleElementKind::Rectangle,
+            highlight_shape: snow_draw_engine_document::HighlightShape::Rectangle,
+            center: self.text.center,
+            width: self.text.width(),
+            height: self.text.height(),
+            rotation: self.text.rotation,
+            fill: self.text.fill,
+            fill_style: self.text.fill_style,
+            stroke: self.text.stroke,
+            stroke_width: self.text.stroke_width,
+            stroke_style: StrokeStyle::Solid,
+            corner_radii: self.text.corner_radii,
+            opacity: self.text.opacity,
+        }
+    }
+
+    pub fn with_rect(&self, rect: RectangleData) -> Self {
+        let mut next = self.clone();
+        next.text.center = rect.center;
+        next.text.layout = next.text.layout.with_wrap(rect.width, rect.height);
+        next.text.rotation = rect.rotation;
+        next.text.corner_radii = rect.corner_radii;
+        next
+    }
+}

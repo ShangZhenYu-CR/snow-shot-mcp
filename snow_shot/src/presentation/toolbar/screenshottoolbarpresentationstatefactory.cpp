@@ -1,0 +1,41 @@
+#include "snow_shot/presentation/screenshottoolbarpresentationstatefactory.h"
+
+#include "snow_shot/presentation/screenshotinteractionstate.h"
+#include "snow_shot/presentation/screenshotocrrecognitionservice.h"
+#include "snow_shot/presentation/screenshotselectionmodel.h"
+
+ScreenshotToolbarPresentationState
+makeScreenshotToolbarPresentationState(const ScreenshotInteractionState& interaction,
+                                       const ScreenshotSelectionModel& selection) {
+    ScreenshotToolbarPresentationState state;
+    state.selectionPixels = selection.pixelSelection();
+    state.regionType = selection.regionType();
+    state.selectionCanvas = selection.normalizedSelection();
+    state.inactive = interaction.inactive();
+    state.selectionToolbarMode =
+        interaction.selectionToolbarMode() && !selection.regionOperationActive() &&
+        !(interaction.marqueeSelecting() && state.regionType != ScreenshotRegionType::Rectangle);
+    state.selectionEditable = interaction.canResizeSelection();
+    state.selectionResizable = selection.resizable() && state.selectionEditable;
+    state.intelligentSelecting = interaction.intelligentSelecting();
+    state.selectionDragging = interaction.dragging();
+    state.editing = interaction.editing();
+    const QRect selectionPixels = state.selectionPixels;
+    state.ocrAvailable = selectionPixels.width() < 1 || selectionPixels.height() < 1 ||
+                         screenshotOcrImageWithinPixelLimit(selectionPixels.size());
+    state.aspectRatioLocked = selection.aspectRatioLocked();
+    state.aspectRatioPreset = selection.aspectRatioPreset();
+    state.cornerRadius = selection.cornerRadius();
+    state.cornerRadiusApplicable = selection.cornerRadiusApplicable();
+    state.backgroundOpacityPercent = selection.backgroundOpacityPercent();
+    state.backgroundOpacityAvailable = selection.hasPixelSelection() && !state.selectionDragging &&
+                                       !selection.constructionActive() &&
+                                       !selection.regionOperationActive();
+    state.layoutCompaction = selection.layoutCompaction();
+    state.layoutCompactionAvailable =
+        selection.layoutCompactionAvailable() && !state.selectionDragging;
+    state.borderType = selection.borderType();
+    state.effectWidth = selection.effectWidth();
+    state.effectColor = selection.effectColor();
+    return state;
+}

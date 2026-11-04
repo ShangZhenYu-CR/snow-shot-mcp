@@ -1,0 +1,522 @@
+#include "snow_shot/presentation/screenshotcursorimagesource.h"
+#include "snow_shot/platform/applicationqos.h"
+#include "../pinned/screenshotclipboardplacementgeometry.h"
+#include "snow_shot/presentation/screenshotexportservice.h"
+#include "snow_shot/presentation/screenshotencodingsettings.h"
+#include "snow_shot/runtime/runtimeactivitytracker.h"
+
+#include "snow_shot/presentation/screenshotdisplaysession.h"
+#include "snow_shot/presentation/screenshotclipboardservice.h"
+#include "snow_shot/presentation/screenshotdefaultstyles.h"
+#include "snow_shot/presentation/screenshotresultcompositor.h"
+#include "snow_shot/presentation/screenshotselectionbackground.h"
+#include "snow_shot/presentation/screenshotselectioncomposition.h"
+#include "snow_shot/presentation/screenshotselectionpin.h"
+#include "snow_shot/presentation/screenshotselectionshadowrenderer.h"
+
+#include "screenshotclipboardperfinstrumentation.h"
+#include "../pinned/screenshotpintoperfinstrumentation.h"
+
+#include "snow_draw_engine_qt/snow_canvas_runtime.h"
+
+#include <QList>
+#include <QMetaObject>
+#include <QObject>
+#include <QPointer>
+#include <QThread>
+#include <QScopeGuard>
+#include <QColorSpace>
+
+#include <optional>
+#include <utility>
+
+namespace {
+using LayoutPlan = std::shared_ptr<const ScreenshotLayoutCompactionPlan>;
+
+LayoutPlan exportLayoutPlan(const ScreenshotResultStyle& style,
+                            const ScreenshotSelectionRenderSpec& spec,
+                            ScreenshotLayoutCompaction compaction) {
+    return ScreenshotResultCompositor::layoutCompactionForContent(spec.pixelSize, style, compaction,
+                                                                  spec.scale);
+}
+
+bool validExportSize(const ScreenshotResultStyle& style, const ScreenshotSelectionRenderSpec& spec,
+                     const LayoutPlan& plan) {
+    if (!spec.isValid() || (plan && !plan->isValid()))
+        return false;
+    const auto size = plan ? plan->outputSize : spec.pixelSize;
+    const auto layout = ScreenshotResultCompositor::layoutForContent(
+        size, ScreenshotResultCompositor::scaledStyle(style, spec.scale));
+    return layout.isValid() &&
+           qint64(layout.outputRect.width()) * layout.outputRect.height() <= 100000000;
+}
+
+QList<CanvasExportSource> exportSourcesForSelection(const ScreenshotDisplaySession& displaySession,
+                                                    const QRect& selection) {
+    QList<CanvasExportSource> sources;
+    sources.reserve(displaySession.size());
+    Q_UNUSED(selection);
+    // A magnifier visible inside the export can sample a display outside its crop.
+    // Keep shared original layers; the output painter clips ordinary background drawing.
+    displaySession.forEachImageSource(
+        [&sources, &displaySession](qsizetype, const CapturedDisplayModel& display) {
+            if (display.image.isNull()) {
+                return;
+            }
+
+            for (const auto& layer :
+                 screenshotDisplayImageLayers(display, displaySession.cursorVisible))
+                sources.push_back(CanvasExportSource{layer.image, layer.destinationCanvasRect});
+        });
+    return sources;
+}
+
+QImage composeSelectionResultFromRuntime(SnowCanvasRuntime& runtime, const QRect& selection,
+                                         const ScreenshotResultStyle& style,
+                                         const QList<CanvasExportSource>& sources,
+                                         const ScreenshotSelectionRenderSpec& spec = {},
+                                         LayoutPlan plan = {}) {
+    if (selection.width() < 1 || selection.height() < 1) {
+        qWarning(
+            "Screenshot selection export failed: stage=selection_validation width=%d height=%d",
+            selection.width(), selection.height());
+        return {};
+    }
+
+    const auto pixelSize = spec.isValid() ? spec.pixelSize : selection.size();
+    auto outputStyle = ScreenshotResultCompositor::scaledStyle(style, spec.scale);
+    if (plan && plan->changed)
+        outputStyle = compactedScreenshotResultStyle(outputStyle, *plan);
+
+    if (style.region && runtime.hasDocumentContent())
+        return renderAnnotatedScreenshotSelection(runtime, selection, pixelSize, sources,
+                                                  outputStyle, plan.get());
+    QImage content;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.render_canvas");
+        SNOW_SHOT_PIN_PERF_SCOPE("export.render_canvas");
+        if (plan && plan->changed) {
+            QList<CanvasExportTile> tiles;
+            tiles.reserve(plan->tiles.size());
+            for (const auto& tile : plan->tiles)
+                tiles.append({tile.source, tile.destination});
+            content =
+                runtime.renderTilesToImage(selection, pixelSize, plan->outputSize, tiles, sources);
+        } else {
+            content = runtime.renderToImage(QRectF(selection), pixelSize, sources);
+        }
+    }
+    if (content.isNull()) {
+        qWarning("Screenshot selection export failed: stage=render_canvas width=%d height=%d "
+                 "sources=%lld",
+                 selection.width(), selection.height(), static_cast<long long>(sources.size()));
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.render_canvas", 1);
+        return {};
+    }
+    // The canvas paints canonical sRGB capture sources and annotation colors.
+    // Its generic renderer allocates a new raster without color metadata.
+    content.setColorSpace(QColorSpace::SRgb);
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.rendered_bytes", content.sizeInBytes());
+    SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.compose_result");
+    SNOW_SHOT_PIN_PERF_SCOPE("export.compose_result");
+    const QImage background =
+        renderScreenshotSelectionBackground(sources, selection, pixelSize, outputStyle, plan.get());
+    if (outputStyle.backgroundOpacityPercent > 0 && background.isNull())
+        return {};
+    QImage result = ScreenshotResultCompositor::compose(content, outputStyle, 1.0, 1.0, background);
+    if (result.isNull()) {
+        qWarning("Screenshot selection export failed: stage=compose_result width=%d height=%d",
+                 content.width(), content.height());
+    }
+    return result;
+}
+
+class ScreenshotExportWorker final : public QObject {
+  public:
+    QImage renderSelection(const QByteArray& documentSession,
+                           const SnowCanvasSmartEraseSnapshot& smartErase, const QRect& selection,
+                           const ScreenshotResultStyle& style,
+                           const QList<CanvasExportSource>& sources,
+                           const ScreenshotSelectionRenderSpec& spec = {}, LayoutPlan plan = {}) {
+        // This thread outlives captures. Release caches on the owning thread,
+        // including failure exits, before publishing the completed result.
+        const auto releaseCaches = qScopeGuard([this, &style] {
+            if (m_runtime != nullptr && !m_runtime->clearDocumentPreservingViewports()) {
+                // An invalid runtime must not retain the previous export's document.
+                m_runtime.reset();
+            }
+            ScreenshotSelectionShadowRenderer::resetCacheForCurrentThread();
+            resetScreenshotLayoutCompactionCache();
+            if (style.region)
+                style.region->clearDerivedCache();
+        });
+        // The pin trace needs the export baseline even though these stages are
+        // shared with the clipboard-copy flows; the sink drops records whenever
+        // no pin sample is active.
+        SNOW_SHOT_PIN_PERF_SCOPE("export.render_selection");
+        QImage image;
+        {
+            SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.ensure_worker_runtime");
+            SNOW_SHOT_PIN_PERF_SCOPE("export.ensure_worker_runtime");
+            if (!ensureRuntime()) {
+                qWarning("Screenshot selection export failed: stage=worker_runtime");
+                SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.worker_runtime", 1);
+                return {};
+            }
+        }
+        {
+            SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.restore_document");
+            SNOW_SHOT_PIN_PERF_SCOPE("export.restore_document");
+            if (!m_runtime->restoreDocumentSession(documentSession)) {
+                qWarning("Screenshot selection export failed: stage=restore_document bytes=%lld",
+                         static_cast<long long>(documentSession.size()));
+                SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.restore_document", 1);
+                return {};
+            }
+        }
+        m_runtime->restoreSmartEraseSnapshot(smartErase);
+        image =
+            composeSelectionResultFromRuntime(*m_runtime, selection, style, sources, spec, plan);
+        if (image.isNull()) {
+            return {};
+        }
+        SNOW_SHOT_PIN_PERF_COUNTER("export.output_bytes", image.sizeInBytes());
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.output_width", image.width());
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.output_height", image.height());
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.output_bytes", image.sizeInBytes());
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.success", 1);
+        return image;
+    }
+
+    ScreenshotSelectionClipboardResult prepareSelectionClipboard(
+        const QByteArray& documentSession, const SnowCanvasSmartEraseSnapshot& smartErase,
+        const QRect& selection, const ScreenshotResultStyle& style,
+        const QList<CanvasExportSource>& sources, const ScreenshotSelectionRenderSpec& spec,
+        std::optional<ScreenshotClipboardPlacement> placement,
+        ScreenshotImageEncodingOptions encoding, ScreenshotLayoutCompaction compaction,
+        LayoutPlan plan) {
+        const auto releasePlan = qScopeGuard([] { resetScreenshotLayoutCompactionCache(); });
+        ScreenshotSelectionClipboardResult result;
+        result.image =
+            renderSelection(documentSession, smartErase, selection, style, sources, spec, plan);
+        result.payload = ScreenshotClipboardService::prepareImage(
+            result.image, encoding, std::move(placement),
+            screenshotSelectionClipboardAppearance(selection.size(), style, compaction));
+        return result;
+    }
+
+  private:
+    bool ensureRuntime() {
+        if (m_runtime == nullptr) {
+            m_runtime = std::make_unique<SnowCanvasRuntime>(
+                SnowCanvasRuntimeConfig{snow_shot::presentation::screenshotCanvasStyleDefaults()});
+        }
+        return m_runtime->isValid();
+    }
+
+    std::unique_ptr<SnowCanvasRuntime> m_runtime;
+};
+} // namespace
+
+ScreenshotExportService::ScreenshotExportService(ScreenshotExportServiceContext context)
+    : m_context(context), m_thread(std::make_unique<QThread>()),
+      m_worker(new ScreenshotExportWorker), m_completionContext(new QObject) {
+    m_thread->setObjectName(QStringLiteral("ScreenshotExportWorker"));
+    m_worker->moveToThread(m_thread.get());
+    QObject::connect(m_thread.get(), &QThread::finished, m_worker, &QObject::deleteLater);
+    snow_shot::platform::configureApplicationQoSThread(m_thread.get());
+    m_thread->start();
+}
+
+ScreenshotExportService::~ScreenshotExportService() {
+    delete m_completionContext;
+    m_completionContext = nullptr;
+    if (m_thread != nullptr) {
+        m_thread->quit();
+        m_thread->wait();
+    }
+    m_worker = nullptr;
+}
+
+bool ScreenshotExportService::requestSelectionResult(const QRect& selection,
+                                                     const ScreenshotResultStyle& style,
+                                                     QObject* receiver, ImageCallback callback,
+                                                     ScreenshotLayoutCompaction compaction) {
+    return requestSelectionResultAtScale(selection, style, 1.0, receiver, std::move(callback),
+                                         compaction);
+}
+
+bool ScreenshotExportService::requestSelectionResultAtScale(const QRect& selection,
+                                                            const ScreenshotResultStyle& style,
+                                                            qreal scale, QObject* receiver,
+                                                            ImageCallback callback,
+                                                            ScreenshotLayoutCompaction compaction) {
+    if (!qIsFinite(scale) || scale < 0.1 || scale > 4.0)
+        return false;
+    if (selection.isEmpty() || receiver == nullptr || !callback || m_worker == nullptr ||
+        m_thread == nullptr || !m_thread->isRunning()) {
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.invalid_request", 1);
+        return false;
+    }
+    const snow_shot::presentation::clipboard_perf::Stopwatch requestTimer;
+    auto smartErase = m_context.runtime.smartEraseSnapshot();
+    QByteArray documentSession;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.serialize_document");
+        documentSession = m_context.runtime.serializeDocumentSession();
+    }
+    auto spec = screenshotSelectionRenderSpec(m_context.displaySession, selection);
+    spec.scale *= scale;
+    spec.pixelSize = screenshotSelectionRenderedPixelSize(selection.size(), spec.scale);
+    const auto plan = exportLayoutPlan(style, spec, compaction);
+    if (!validExportSize(style, spec, plan))
+        return false;
+    QList<CanvasExportSource> sources;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.collect_sources");
+        sources = exportSourcesForSelection(m_context.displaySession, selection);
+    }
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.document_bytes", documentSession.size());
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.source_count", sources.size());
+    if (documentSession.isEmpty() || sources.isEmpty()) {
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.empty_input", 1);
+        return false;
+    }
+    auto* worker = static_cast<ScreenshotExportWorker*>(m_worker);
+    const QPointer<QObject> guardedReceiver(receiver);
+    const QPointer<QObject> guardedCompletionContext(m_completionContext);
+    const snow_shot::presentation::clipboard_perf::Stopwatch workerQueueTimer;
+    bool scheduled = false;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.schedule_worker");
+        scheduled = QMetaObject::invokeMethod(
+            worker,
+            snow_shot::runtime::trackRuntimeWork(
+                [worker, guardedReceiver, guardedCompletionContext, documentSession, smartErase,
+                 selection, style, sources, spec, plan, requestTimer, workerQueueTimer,
+                 callback = std::move(callback)]() mutable {
+                    if (guardedReceiver.isNull() || guardedCompletionContext.isNull())
+                        return;
+                    snow_shot::presentation::clipboard_perf::duration(
+                        "export.worker_queue_delay", workerQueueTimer.elapsedNanoseconds());
+                    QImage image = worker->renderSelection(documentSession, smartErase, selection,
+                                                           style, sources, spec, plan);
+                    smartErase = {};
+                    documentSession.clear();
+                    sources.clear();
+                    if (guardedReceiver.isNull() || guardedCompletionContext.isNull()) {
+                        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.receiver_destroyed", 1);
+                        return;
+                    }
+                    const snow_shot::presentation::clipboard_perf::Stopwatch callbackQueueTimer;
+                    const bool callbackScheduled = QMetaObject::invokeMethod(
+                        guardedCompletionContext,
+                        snow_shot::runtime::trackRuntimeWork(
+                            [guardedReceiver, guardedCompletionContext, image = std::move(image),
+                             callback = std::move(callback), requestTimer,
+                             callbackQueueTimer]() mutable {
+                                snow_shot::presentation::clipboard_perf::duration(
+                                    "export.callback_queue_delay",
+                                    callbackQueueTimer.elapsedNanoseconds());
+                                snow_shot::presentation::clipboard_perf::duration(
+                                    "export.request_to_result", requestTimer.elapsedNanoseconds());
+                                if (!guardedReceiver.isNull() &&
+                                    !guardedCompletionContext.isNull()) {
+                                    callback(std::move(image));
+                                }
+                            }),
+                        Qt::QueuedConnection);
+                    if (!callbackScheduled) {
+                        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.schedule_callback", 1);
+                    }
+                }),
+            Qt::QueuedConnection);
+    }
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER(
+        scheduled ? "export.request_scheduled" : "export.failure.schedule_worker", 1);
+    return scheduled;
+}
+
+bool ScreenshotExportService::requestSelectionClipboard(const QRect& selection,
+                                                        const ScreenshotResultStyle& style,
+                                                        QObject* receiver,
+                                                        ClipboardCallback callback,
+                                                        ScreenshotLayoutCompaction compaction) {
+    if (selection.isEmpty() || receiver == nullptr || !callback || m_worker == nullptr ||
+        m_thread == nullptr || !m_thread->isRunning()) {
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.invalid_clipboard_request", 1);
+        return false;
+    }
+
+    const snow_shot::presentation::clipboard_perf::Stopwatch requestTimer;
+    const auto placement = prepareClipboardPlacement(selection, style, compaction);
+    const auto encoding = snow_shot::presentation::screenshotEncodingOptions(
+        snow_shot::storage::ScreenshotSettings{});
+    auto smartErase = m_context.runtime.smartEraseSnapshot();
+    QByteArray documentSession;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.serialize_document");
+        documentSession = m_context.runtime.serializeDocumentSession();
+    }
+    const auto spec = screenshotSelectionRenderSpec(m_context.displaySession, selection);
+    const auto plan = exportLayoutPlan(style, spec, compaction);
+    if (!validExportSize(style, spec, plan))
+        return false;
+    QList<CanvasExportSource> sources;
+    {
+        SNOW_SHOT_CLIPBOARD_PERF_SCOPE("export.collect_sources");
+        sources = exportSourcesForSelection(m_context.displaySession, selection);
+    }
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.document_bytes", documentSession.size());
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.source_count", sources.size());
+    if (documentSession.isEmpty() || sources.isEmpty()) {
+        SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.empty_input", 1);
+        return false;
+    }
+
+    auto* worker = static_cast<ScreenshotExportWorker*>(m_worker);
+    const QPointer<QObject> guardedReceiver(receiver);
+    const QPointer<QObject> guardedCompletionContext(m_completionContext);
+    const snow_shot::presentation::clipboard_perf::Stopwatch workerQueueTimer;
+    const bool scheduled = QMetaObject::invokeMethod(
+        worker,
+        snow_shot::runtime::trackRuntimeWork([worker, guardedReceiver, guardedCompletionContext,
+                                              documentSession, smartErase, selection, style,
+                                              sources, spec, placement, encoding, compaction, plan,
+                                              requestTimer, workerQueueTimer,
+                                              callback = std::move(callback)]() mutable {
+            snow_shot::presentation::clipboard_perf::duration(
+                "export.worker_queue_delay", workerQueueTimer.elapsedNanoseconds());
+            auto result = std::make_shared<ScreenshotSelectionClipboardResult>(
+                worker->prepareSelectionClipboard(documentSession, smartErase, selection, style,
+                                                  sources, spec, placement, encoding, compaction,
+                                                  plan));
+            smartErase = {};
+            documentSession.clear();
+            sources.clear();
+            if (guardedReceiver.isNull() || guardedCompletionContext.isNull()) {
+                SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.receiver_destroyed", 1);
+                return;
+            }
+            const snow_shot::presentation::clipboard_perf::Stopwatch callbackQueueTimer;
+            const bool callbackScheduled = QMetaObject::invokeMethod(
+                guardedCompletionContext,
+                snow_shot::runtime::trackRuntimeWork([guardedReceiver, guardedCompletionContext,
+                                                      result, callback = std::move(callback),
+                                                      requestTimer, callbackQueueTimer]() mutable {
+                    snow_shot::presentation::clipboard_perf::duration(
+                        "export.callback_queue_delay", callbackQueueTimer.elapsedNanoseconds());
+                    snow_shot::presentation::clipboard_perf::duration(
+                        "export.request_to_result", requestTimer.elapsedNanoseconds());
+                    if (!guardedReceiver.isNull() && !guardedCompletionContext.isNull()) {
+                        callback(std::move(*result));
+                    }
+                }),
+                Qt::QueuedConnection);
+            if (!callbackScheduled) {
+                SNOW_SHOT_CLIPBOARD_PERF_COUNTER("export.failure.schedule_callback", 1);
+            }
+        }),
+        Qt::QueuedConnection);
+    SNOW_SHOT_CLIPBOARD_PERF_COUNTER(
+        scheduled ? "export.clipboard_request_scheduled" : "export.failure.schedule_worker", 1);
+    return scheduled;
+}
+
+std::optional<ScreenshotPinnedSelectionRequest>
+ScreenshotExportService::preparePinnedSelection(const QRect& selection,
+                                                const ScreenshotResultStyle& style,
+                                                ScreenshotLayoutCompaction compaction) const {
+    if (selection.isEmpty()) {
+        return std::nullopt;
+    }
+    SNOW_SHOT_PIN_PERF_SCOPE("export.prepare_pin_plan");
+    ScreenshotPinnedSelectionRequest request = screenshotSelectionPinRequest(
+        m_context.displaySession, m_context.geometry, selection, style, compaction);
+    if (!request.isPrepared()) {
+        return std::nullopt;
+    }
+    return request;
+}
+
+std::optional<ScreenshotClipboardPlacement>
+ScreenshotExportService::prepareClipboardPlacement(const QRect& selection,
+                                                   const ScreenshotResultStyle& style,
+                                                   ScreenshotLayoutCompaction compaction) const {
+    const auto request = preparePinnedSelection(selection, style, compaction);
+    return request
+               ? screenshotClipboardSelectionPlacement(request->geometry.nativeGeometry,
+                                                       request->initialWindowSize, request->screen)
+               : std::nullopt;
+}
+
+bool ScreenshotExportService::schedulePinnedSelection(ScreenshotPinnedSelectionRequest request,
+                                                      QObject* receiver,
+                                                      PinRequestCallback callback) {
+    if (!request.isPrepared() || receiver == nullptr || !callback || m_worker == nullptr ||
+        m_thread == nullptr || !m_thread->isRunning() || m_completionContext == nullptr) {
+        return false;
+    }
+
+    const QPointer<QObject> guardedReceiver(receiver);
+    QList<CanvasExportSource> sources =
+        exportSourcesForSelection(m_context.displaySession, request.selection);
+    if (sources.isEmpty()) {
+        return false;
+    }
+
+    auto smartErase = m_context.runtime.smartEraseSnapshot();
+    QByteArray documentSession;
+    {
+        SNOW_SHOT_PIN_PERF_SCOPE("export.serialize_document");
+        documentSession = m_context.runtime.serializeDocumentSession();
+        if (documentSession.isEmpty()) {
+            return false;
+        }
+    }
+
+    auto* worker = static_cast<ScreenshotExportWorker*>(m_worker);
+    const auto renderSpec =
+        screenshotSelectionRenderSpec(m_context.displaySession, request.selection);
+    const auto plan = exportLayoutPlan(request.resultStyle, renderSpec, request.layoutCompaction);
+    if (!validExportSize(request.resultStyle, renderSpec, plan))
+        return false;
+    const auto resultState = std::make_shared<ScreenshotPinnedSelectionResultHandle::State>();
+    const QPointer<ScreenshotExportWorker> guardedWorker(worker);
+    const bool scheduled = QMetaObject::invokeMethod(
+        worker,
+        snow_shot::runtime::trackRuntimeWork(
+            [guardedWorker, resultState, documentSession = std::move(documentSession), smartErase,
+             sources = std::move(sources), selection = request.selection,
+             style = request.resultStyle, plan, renderSpec]() mutable {
+                SNOW_SHOT_PIN_PERF_SCOPE("export.worker_callback");
+                if (guardedWorker.isNull() || resultState->isCancelled()) {
+                    return;
+                }
+                SNOW_SHOT_PIN_PERF_MILESTONE("export.render_started");
+                QImage image = guardedWorker->renderSelection(
+                    documentSession, smartErase, selection, style, sources, renderSpec, plan);
+                smartErase = {};
+                documentSession.clear();
+                sources.clear();
+                SNOW_SHOT_PIN_PERF_MILESTONE("export.render_finished");
+                SNOW_SHOT_PIN_PERF_MILESTONE("export.result_published");
+                const bool succeeded = !image.isNull();
+                resultState->publish(succeeded, std::move(image));
+            }),
+        Qt::QueuedConnection);
+    if (!scheduled) {
+        return false;
+    }
+
+    SNOW_SHOT_PIN_PERF_MILESTONE("export.dispatch_started");
+    SNOW_SHOT_PIN_PERF_COUNTER("export.pin_dispatch_count", 1);
+    if (guardedReceiver.isNull()) {
+        resultState->cancel();
+        return false;
+    }
+
+    SNOW_SHOT_PIN_PERF_SCOPE("export.pin_callback");
+    callback(std::move(request), ScreenshotPinnedSelectionResultHandle(resultState));
+    return true;
+}

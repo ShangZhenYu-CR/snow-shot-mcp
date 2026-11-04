@@ -1,0 +1,456 @@
+//! Stable arrow data types used by documents, editor state, display lists, and
+//! FFI conversions. Arrow routing, binding, and hit-test algorithms live in the
+//! document layer; this module owns the shared contract they operate on.
+
+use serde::{Deserialize, Serialize};
+
+pub use crate::PathCommand as ArrowPathCommand;
+
+pub type Point = [f64; 2];
+pub type Bounds = [f64; 4];
+pub type ArrowheadPoints = Vec<f64>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindMode {
+    Inside,
+    Orbit,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArrowEndpointEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrowEndpointPosition {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArrowEndpointSelector {
+    Start,
+    End,
+    StartBinding,
+    EndBinding,
+}
+
+pub fn normalize_arrow_endpoint_edge(edge: ArrowEndpointSelector) -> ArrowEndpointEdge {
+    match edge {
+        ArrowEndpointSelector::Start | ArrowEndpointSelector::StartBinding => {
+            ArrowEndpointEdge::Start
+        }
+        ArrowEndpointSelector::End | ArrowEndpointSelector::EndBinding => ArrowEndpointEdge::End,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Arrowhead {
+    #[serde(rename = "arrow")]
+    Arrow,
+    #[serde(rename = "bar")]
+    Bar,
+    #[serde(rename = "dot")]
+    Dot,
+    #[serde(rename = "circle")]
+    Circle,
+    #[serde(rename = "circle_outline")]
+    CircleOutline,
+    #[serde(rename = "triangle")]
+    Triangle,
+    #[serde(rename = "triangle_outline")]
+    TriangleOutline,
+    #[serde(rename = "diamond")]
+    Diamond,
+    #[serde(rename = "diamond_outline")]
+    DiamondOutline,
+    #[serde(rename = "crowfoot_one")]
+    CrowfootOne,
+    #[serde(rename = "crowfoot_many")]
+    CrowfootMany,
+    #[serde(rename = "crowfoot_one_or_many")]
+    CrowfootOneOrMany,
+    #[serde(rename = "square")]
+    Square,
+    #[serde(rename = "invertedTriangle")]
+    InvertedTriangle,
+    #[serde(rename = "indented_triangle")]
+    IndentedTriangle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrokeStyle {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+/// The geometric character of an outline, independent of its dash pattern.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u32)]
+pub enum StrokeRenderingStyle {
+    #[default]
+    Architect = 0,
+    Artist = 1,
+    Cartoonist = 2,
+}
+
+/// Maximum canvas-space displacement of a styled outline. Every renderer offset
+/// is bounded by this radius, including Bezier control points and secondary passes.
+/// Positive infinity requests the conservative unclamped maximum.
+pub fn stroke_rendering_outset(style: StrokeRenderingStyle, primitive_scale: f64) -> f64 {
+    if primitive_scale.is_nan() || primitive_scale <= 0.0 {
+        return 0.0;
+    }
+    let maximum: f64 = match style {
+        StrokeRenderingStyle::Architect => 0.0,
+        StrokeRenderingStyle::Artist => 2.0,
+        StrokeRenderingStyle::Cartoonist => 4.0,
+    };
+    maximum.min(primitive_scale * 0.1)
+}
+
+/// Used once at creation. Stored seeds are preserved when IDs are remapped.
+pub fn stroke_rendering_seed(index: u32, generation: u32) -> u32 {
+    let mut seed = index.wrapping_add(1) ^ generation.rotate_left(16) ^ 0x9e37_79b9;
+    seed ^= seed >> 16;
+    seed = seed.wrapping_mul(0x7feb_352d);
+    seed ^= seed >> 15;
+    seed = seed.wrapping_mul(0x846c_a68b);
+    (seed ^ (seed >> 16)).max(1)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArrowType {
+    #[default]
+    Straight,
+    Curve,
+    Elbow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// Stored preference. Unsupported arrowheads render plain without changing it.
+pub enum ArrowShaftType {
+    #[default]
+    Plain,
+    Tapered,
+}
+
+impl ArrowType {
+    pub const fn is_elbow(self) -> bool {
+        matches!(self, Self::Elbow)
+    }
+
+    pub const fn is_curve(self) -> bool {
+        matches!(self, Self::Curve)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArrowheadDashMode {
+    #[serde(rename = "inherit")]
+    Inherit,
+    #[serde(rename = "solid")]
+    Solid,
+    #[serde(rename = "dotted-cap")]
+    DottedCap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArrowheadFillMode {
+    Stroke,
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArrowheadPrimitiveKind {
+    Line,
+    Polygon,
+    Circle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrowheadLinePrimitive {
+    pub kind: ArrowheadPrimitiveKind,
+    pub from: Point,
+    pub to: Point,
+    pub dash_mode: ArrowheadDashMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness_cap: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrowheadPolygonPrimitive {
+    pub kind: ArrowheadPrimitiveKind,
+    pub points: Vec<Point>,
+    pub fill_mode: ArrowheadFillMode,
+    pub dash_mode: ArrowheadDashMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness_cap: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrowheadCirclePrimitive {
+    pub kind: ArrowheadPrimitiveKind,
+    pub center: Point,
+    pub diameter: f64,
+    pub fill_mode: ArrowheadFillMode,
+    pub dash_mode: ArrowheadDashMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness_cap: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ArrowheadRenderPrimitive {
+    Line(ArrowheadLinePrimitive),
+    Polygon(ArrowheadPolygonPrimitive),
+    Circle(ArrowheadCirclePrimitive),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindableShape {
+    Rectangle,
+    Ellipse,
+    Diamond,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CurvePathOp {
+    pub op: String,
+    pub data: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FixedSegment {
+    pub start: Point,
+    pub end: Point,
+    pub index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineContext {
+    pub zoom: f64,
+    pub is_binding_enabled: bool,
+    pub bind_mode: BindMode,
+    pub max_coordinate: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialEngineContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_binding_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_mode: Option<BindMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_coordinate: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputeEndpointDragOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_key: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complex_bindings: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opposite_orbit_focus_point: Option<Point>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecomputeAfterBindableChangeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_mid_points_with_element: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateElbowArrowOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_dragging: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_invariants: Option<bool>,
+    /// Whether elbow endpoint routing may magnetize to bindable side
+    /// midpoints. Defaults to `true`; disabled while angle-locked drags
+    /// (Excalidraw's `isMidpointSnappingEnabled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midpoint_snapping_enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusPointContext {
+    pub zoom: f64,
+    pub is_binding_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusPointOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_overlap: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputeFocusPointDragOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_to_inside_binding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_size: Option<f64>,
+}
+
+pub const DEFAULT_ENGINE_CONTEXT: EngineContext = EngineContext {
+    zoom: 1.0,
+    is_binding_enabled: true,
+    bind_mode: BindMode::Orbit,
+    max_coordinate: 1e6,
+};
+
+pub fn normalize_engine_context(context: Option<&PartialEngineContext>) -> EngineContext {
+    let Some(context) = context else {
+        return DEFAULT_ENGINE_CONTEXT;
+    };
+
+    EngineContext {
+        zoom: context
+            .zoom
+            .filter(|zoom| zoom.is_finite())
+            .unwrap_or(DEFAULT_ENGINE_CONTEXT.zoom),
+        is_binding_enabled: context
+            .is_binding_enabled
+            .unwrap_or(DEFAULT_ENGINE_CONTEXT.is_binding_enabled),
+        bind_mode: context
+            .bind_mode
+            .unwrap_or(DEFAULT_ENGINE_CONTEXT.bind_mode),
+        max_coordinate: context
+            .max_coordinate
+            .filter(|max_coordinate| max_coordinate.is_finite())
+            .unwrap_or(DEFAULT_ENGINE_CONTEXT.max_coordinate),
+    }
+}
+
+/// The identity scale used by legacy documents and new arrows.
+pub const fn default_arrow_ratio() -> f64 {
+    1.0
+}
+
+/// Preserve positive render scales, including values below the toolbar's 0.5 minimum.
+pub fn normalize_arrow_ratio(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.min(3.0)
+    } else {
+        1.0
+    }
+}
+
+pub fn deserialize_arrow_ratio<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    Ok(normalize_arrow_ratio(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arrowhead, normalize_arrow_ratio};
+
+    #[test]
+    fn arrow_ratio_preserves_positive_subunit_scales() {
+        for ratio in [f64::MIN_POSITIVE, 0.01, 0.25, 0.5, 1.0, 2.3, 3.0] {
+            assert_eq!(normalize_arrow_ratio(ratio), ratio);
+        }
+        assert_eq!(normalize_arrow_ratio(4.0), 3.0);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(normalize_arrow_ratio(invalid), 1.0);
+        }
+    }
+
+    #[test]
+    fn indented_triangle_serialization_preserves_existing_triangle_names() {
+        for (style, name) in [
+            (Arrowhead::IndentedTriangle, "indented_triangle"),
+            (Arrowhead::Triangle, "triangle"),
+            (Arrowhead::TriangleOutline, "triangle_outline"),
+        ] {
+            let value = serde_json::to_value(style).unwrap();
+            assert_eq!(value, name);
+            assert_eq!(serde_json::from_value::<Arrowhead>(value).unwrap(), style);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stroke_rendering_tests {
+    use super::*;
+
+    #[test]
+    fn stroke_rendering_outset_is_bounded_and_scales_down_for_tiny_geometry() {
+        assert_eq!(
+            stroke_rendering_outset(StrokeRenderingStyle::Architect, 100.0),
+            0.0
+        );
+        for (style, maximum) in [
+            (StrokeRenderingStyle::Artist, 2.0),
+            (StrokeRenderingStyle::Cartoonist, 4.0),
+        ] {
+            assert_eq!(stroke_rendering_outset(style, f64::INFINITY), maximum);
+            assert_eq!(stroke_rendering_outset(style, 5.0), 0.5);
+            assert_eq!(stroke_rendering_outset(style, 0.0), 0.0);
+            assert_eq!(stroke_rendering_outset(style, -1.0), 0.0);
+            assert_eq!(stroke_rendering_outset(style, f64::NAN), 0.0);
+        }
+        assert_ne!(stroke_rendering_seed(1, 1), stroke_rendering_seed(2, 1));
+        assert_eq!(stroke_rendering_seed(1, 1), stroke_rendering_seed(1, 1));
+    }
+}
+
+/// Default outline colour shared with the text stroke editor.
+pub fn default_arrow_outline_color() -> crate::ColorRgba8 {
+    crate::ColorRgba8 {
+        r: 0xff,
+        g: 0xcc,
+        b: 0xc7,
+        a: 255,
+    }
+}
+
+pub fn normalize_arrow_outline_width(width: f64) -> f64 {
+    if width.is_finite() {
+        width.clamp(0.0, 72.0)
+    } else {
+        0.0
+    }
+}
+
+pub fn deserialize_arrow_outline_width<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let width = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(normalize_arrow_outline_width(width))
+}

@@ -1,0 +1,1025 @@
+#include "snow_shot/presentation/globalmousetypes.h"
+#include "snow_shot/presentation/components/globalmouserow.h"
+#include "snow_shot/presentation/components/formfields.h"
+#include "snow_shot/presentation/components/icons/iconrenderutils.h"
+#include "snow_shot/presentation/components/icons/snowshoticons.h"
+#include "snow_shot/presentation/components/settingspagewidget.h"
+#include "snow_shot/presentation/components/shortcutconfigurationbutton.h"
+#include "snow_shot/presentation/components/shortcutkeyrow.h"
+#include "snow_shot/presentation/styles/mainwindowcomponenttoken.h"
+#include "snow_shot/presentation/settings/settingsbackend.h"
+#include "snow_shot/presentation/settings/settingscatalog.h"
+#include "snow_shot/presentation/settings/settingsruntimesession.h"
+#include "snow_shot/presentation/styles/thememanager.h"
+#include "snow_shot/storage/applicationstorage.h"
+#include "snow_shot/presentation/globalshortcutmanager.h"
+
+#include "icon_core.h"
+#include "widgets/button.h"
+#include "widgets/divider.h"
+#include "widgets/form.h"
+#include "widgets/modal.h"
+#include "widgets/select.h"
+
+#include <QAbstractButton>
+#include <QApplication>
+#include <QEvent>
+#include <QEnterEvent>
+#include <QHash>
+#include <QLabel>
+#include <QLayout>
+#include <QListView>
+#include <QMouseEvent>
+#include <QPalette>
+#include <QPushButton>
+#include <QResizeEvent>
+#include <QTranslator>
+#include <QTemporaryDir>
+
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <type_traits>
+
+namespace settings = snow_shot::presentation::settings;
+namespace presentation = snow_shot::presentation;
+namespace styles = snow_shot::presentation::styles;
+namespace storage = snow_shot::storage;
+namespace fields = presentation::components::form_fields;
+
+namespace {
+static_assert(std::is_base_of_v<ActionRow, GlobalMouseRow>);
+static_assert(std::is_base_of_v<ActionRow, ShortcutKeyRow>);
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+
+struct FieldEvents {
+    int edits = 0;
+    int commits = 0;
+};
+
+void observeField(QObject& owner, const char* id, FieldEvents& events) {
+    fields::FormField* field = nullptr;
+    for (auto* candidate : owner.findChildren<fields::FormField*>()) {
+        if (candidate->metadata().id == QString::fromLatin1(id))
+            field = candidate;
+    }
+    require(field != nullptr, "configuration field exposes its shared controller");
+    QObject::connect(field, &fields::FormField::valueEdited, field, [&events] { ++events.edits; });
+    QObject::connect(field, &fields::FormField::valueCommitted, field,
+                     [&events] { ++events.commits; });
+}
+
+class StableHeightObserver final : public QObject {
+  public:
+    explicit StableHeightObserver(QWidget& widget) : m_height(widget.height()) {
+        widget.installEventFilter(this);
+    }
+
+  protected:
+    bool eventFilter(QObject*, QEvent* event) override {
+        if (event->type() == QEvent::Resize) {
+            if (static_cast<QResizeEvent*>(event)->size().height() != m_height)
+                std::cerr << "modal height changed from " << m_height << " to "
+                          << static_cast<QResizeEvent*>(event)->size().height() << '\n';
+            require(static_cast<QResizeEvent*>(event)->size().height() == m_height,
+                    "the displayed mouse editor must not resize even transiently");
+        }
+        return false;
+    }
+
+  private:
+    int m_height;
+};
+
+void flushEvents() {
+    QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QApplication::processEvents();
+}
+
+class FakeSettingsBackend final : public settings::SettingsBackend {
+  public:
+    QVariant selectValue(settings::SettingsSelectBinding) const override {
+        return {};
+    }
+    QVector<settings::SettingsRuntimeOption>
+    dynamicSelectOptions(settings::SettingsSelectBinding) const override {
+        return {};
+    }
+    bool applySelectValue(settings::SettingsSelectBinding, const QVariant&) override {
+        return false;
+    }
+    bool switchValue(settings::SettingsSwitchBinding) const override {
+        return false;
+    }
+    bool applySwitchValue(settings::SettingsSwitchBinding, bool) override {
+        return false;
+    }
+    QVariantList multiSelectValue(settings::SettingsMultiSelectBinding) const override {
+        return {};
+    }
+    bool applyMultiSelectValue(settings::SettingsMultiSelectBinding, const QVariantList&) override {
+        return false;
+    }
+    int integerValue(settings::SettingsIntegerBinding) const override {
+        return 0;
+    }
+    bool applyIntegerValue(settings::SettingsIntegerBinding, int) override {
+        return false;
+    }
+    int sliderValue(settings::SettingsSliderBinding) const override {
+        return 0;
+    }
+    bool applySliderValue(settings::SettingsSliderBinding, int) override {
+        return false;
+    }
+    QColor colorValue(settings::SettingsColorBinding) const override {
+        return {};
+    }
+    bool applyColorValue(settings::SettingsColorBinding, const QColor&) override {
+        return false;
+    }
+    QVariant radioValue(settings::SettingsRadioBinding) const override {
+        return {};
+    }
+    bool applyRadioValue(settings::SettingsRadioBinding, const QVariant&) override {
+        return false;
+    }
+    QString filePathValue(settings::SettingsFilePathBinding) const override {
+        return {};
+    }
+    bool applyFilePathValue(settings::SettingsFilePathBinding, const QString&) override {
+        return false;
+    }
+    QString directoryPathValue(settings::SettingsDirectoryPathBinding) const override {
+        return {};
+    }
+    bool applyDirectoryPathValue(settings::SettingsDirectoryPathBinding, const QString&) override {
+        return false;
+    }
+    QString textValue(settings::SettingsTextBinding) const override {
+        return {};
+    }
+    bool applyTextValue(settings::SettingsTextBinding, const QString&) override {
+        return false;
+    }
+    storage::ScreenshotToolbarLayout
+    toolbarLayout(storage::ScreenshotToolbarLayoutKind) const override {
+        return {};
+    }
+    bool applyToolbarLayout(storage::ScreenshotToolbarLayoutKind,
+                            const storage::ScreenshotToolbarLayout&) override {
+        return false;
+    }
+    presentation::GlobalShortcutRegistrationState
+    shortcutState(presentation::GlobalShortcutAction action) const override {
+        presentation::GlobalShortcutRegistrationState state;
+        state.action = action;
+        return state;
+    }
+    presentation::GlobalShortcutValidationResult
+    validateShortcut(presentation::GlobalShortcutAction,
+                     const snow_shot::shortcuts::ShortcutBinding& shortcut) const override {
+        return {shortcut.portableText, true, presentation::GlobalShortcutFailureReason::None,
+                shortcut};
+    }
+    bool applyShortcuts(presentation::GlobalShortcutAction,
+                        const snow_shot::shortcuts::ShortcutBindingList&) override {
+        return false;
+    }
+    snow_shot::shortcuts::ShortcutBindingList localShortcuts(settings::SettingsLocalShortcutScope,
+                                                             const QString&) const override {
+        return {};
+    }
+    presentation::GlobalShortcutValidationResult
+    validateLocalShortcut(settings::SettingsLocalShortcutScope, const QString&,
+                          const snow_shot::shortcuts::ShortcutBinding& shortcut) const override {
+        return {shortcut.portableText, true, presentation::GlobalShortcutFailureReason::None,
+                shortcut};
+    }
+    bool applyLocalShortcuts(settings::SettingsLocalShortcutScope, const QString&,
+                             const snow_shot::shortcuts::ShortcutBindingList&) override {
+        return false;
+    }
+    settings::SettingsGlobalMouseCombination
+    globalMouseCombination(settings::SettingsGlobalMouseAction action) const override {
+        return m_combinations.value(static_cast<int>(action));
+    }
+    bool applyGlobalMouseCombination(
+        settings::SettingsGlobalMouseAction action,
+        const settings::SettingsGlobalMouseCombination& combination) override {
+        m_combinations.insert(static_cast<int>(action), combination);
+        return true;
+    }
+    presentation::GlobalMousePermissionState permission{
+        presentation::GlobalMousePermissionState::Status::Ready, true, true, true};
+    int permissionRequests = 0;
+    int settingsOpened = 0;
+    int retries = 0;
+    presentation::GlobalMousePermissionState globalMousePermissionState() const override {
+        return permission;
+    }
+    void requestGlobalMousePermission() override {
+        ++permissionRequests;
+    }
+    void openGlobalMousePermissionSettings() override {
+        ++settingsOpened;
+    }
+    void refreshGlobalMousePermission() override {
+        ++retries;
+    }
+    void setPermission(presentation::GlobalMousePermissionState value) {
+        permission = value;
+        emit globalMousePermissionChanged();
+    }
+    settings::SettingsActionState actionState(settings::SettingsActionBinding) const override {
+        return {true, false};
+    }
+    bool triggerAction(settings::SettingsActionBinding, const QString& = {},
+                       bool = false) override {
+        return false;
+    }
+    storage::StorageStatus storageStatus() const override {
+        storage::StorageStatus status;
+        status.writeAvailable = true;
+        return status;
+    }
+    settings::SettingsResetResult
+    resetSectionWithResults(settings::SettingsSectionReset reset) override {
+        if (reset == settings::SettingsSectionReset::GlobalMouse) {
+            m_combinations.clear();
+            return true;
+        }
+        return false;
+    }
+
+  private:
+    QHash<int, settings::SettingsGlobalMouseCombination> m_combinations;
+};
+
+class GlobalMouseTranslator final : public QTranslator {
+  public:
+    bool isEmpty() const override {
+        return false;
+    }
+
+    QString translate(const char* context, const char* sourceText, const char*,
+                      int) const override {
+        if (QString::fromLatin1(context) ==
+                QStringLiteral("snow_shot::presentation::GlobalMouseManager") &&
+            QString::fromUtf8(sourceText) == QStringLiteral("Global mouse gestures are ready")) {
+            return QStringLiteral("Globale Mausgesten sind bereit.");
+        }
+        if (QString::fromLatin1(context) != QStringLiteral("GlobalMouseRow")) {
+            return {};
+        }
+        const QHash<QString, QString> translations{
+            {QStringLiteral("Mouse configuration for \"%1\""),
+             QStringLiteral("Mauskonfiguration fuer \"%1\"")},
+            {QStringLiteral("Activation keys"), QStringLiteral("Aktivierungstasten")},
+            {QStringLiteral("Mouse button"), QStringLiteral("Maustaste")},
+            {QStringLiteral("Ctrl"), QStringLiteral("Strg")},
+            {QStringLiteral("Control"), QStringLiteral("Strg")},
+            {QStringLiteral("None"), QStringLiteral("Keine")},
+            {QStringLiteral("Right-button drag"), QStringLiteral("Rechts ziehen")},
+        };
+        return translations.value(QString::fromUtf8(sourceText));
+    }
+};
+
+QStringList optionValues(const adqt::widgets::AdSelect& select) {
+    QStringList values;
+    for (const auto& option : select.options()) {
+        values.push_back(option.value.toString());
+    }
+    return values;
+}
+
+ShortcutConfigurationButton* configurationButton(GlobalMouseRow& row) {
+    return row.configurationButton();
+}
+
+GlobalMouseRow* rowForTitle(SettingsPageWidget& page, const QString& title) {
+    for (GlobalMouseRow* row : page.findChildren<GlobalMouseRow*>()) {
+        auto* label = row->findChild<QLabel*>(QStringLiteral("globalMouseActionLabel"));
+        if (label != nullptr && label->text() == title) {
+            return row;
+        }
+    }
+    return nullptr;
+}
+
+template <typename Widget> Widget* namedWidget(const QString& objectName) {
+    for (QWidget* widget : QApplication::allWidgets()) {
+        if (widget->objectName() == objectName) {
+            if (auto* result = dynamic_cast<Widget*>(widget); result != nullptr) {
+                return result;
+            }
+        }
+    }
+    return nullptr;
+}
+
+template <typename Object> Object* namedObject(QObject& parent, const QString& objectName) {
+    return dynamic_cast<Object*>(parent.findChild<QObject*>(objectName));
+}
+
+int selectCount(const QWidget& parent) {
+    int count = 0;
+    for (QWidget* child : parent.findChildren<QWidget*>()) {
+        if (dynamic_cast<adqt::widgets::AdSelect*>(child) != nullptr) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void globalMousePageRendersActionButtons() {
+    const settings::SettingsRegistry& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+
+    const auto rows = page.findChildren<GlobalMouseRow*>();
+    const auto dividers = page.findChildren<adqt::widgets::AdDivider*>();
+    require(rows.size() == 8, "Global mouse must render eight action rows");
+    require(dividers.isEmpty(), "Global mouse action buttons must use the quick-action layout");
+
+    QStringList remainingTitles{
+        QStringLiteral("Copy to clipboard"), QStringLiteral("Pin to screen"),
+        QStringLiteral("Text recognition"),  QStringLiteral("Copy after text recognition"),
+        QStringLiteral("Text translation"),  QStringLiteral("Save as file"),
+        QStringLiteral("Quick save"),        QStringLiteral("Screen recording")};
+    for (GlobalMouseRow* row : rows) {
+        auto* label = row->findChild<QLabel*>(QStringLiteral("globalMouseActionLabel"));
+        auto* icon = row->findChild<QLabel*>(QStringLiteral("globalMouseActionIcon"));
+        auto* button = configurationButton(*row);
+        QLayout* layout = row->layout();
+        require(dynamic_cast<QAbstractButton*>(row) != nullptr,
+                "Global mouse action rows must be button containers");
+        const bool correctlyOrdered =
+            label != nullptr && icon != nullptr && button != nullptr && layout != nullptr &&
+            label->mapTo(row, QPoint()).x() + label->width() <= icon->mapTo(row, QPoint()).x() &&
+            icon->mapTo(row, QPoint()).x() + icon->width() <= button->x();
+        if (!correctlyOrdered) {
+            std::cerr << "row=" << row->objectName().toStdString()
+                      << " label=" << (label != nullptr) << " button=" << (button != nullptr)
+                      << " layout=" << (layout != nullptr)
+                      << " count=" << (layout != nullptr ? layout->count() : -1) << '\n';
+        }
+        require(correctlyOrdered,
+                "Global mouse rows must place the action label left of the configuration button");
+        require(!icon->pixmap().isNull() && icon->testAttribute(Qt::WA_TransparentForMouseEvents),
+                "Every global mouse action must display an icon without intercepting clicks");
+        if (label->text() == QStringLiteral("Quick save")) {
+            const QPixmap expected = presentation::icons::renderTintedIconPixmap(
+                presentation::icons::custom::outlined::QuickSave(), icon->size(),
+                row->devicePixelRatioF(), label->palette().color(QPalette::WindowText));
+            require(icon->pixmap().toImage() == expected.toImage(),
+                    "Quick save must display the supplied quick-save icon");
+        }
+        require(remainingTitles.removeOne(label->text()),
+                "Global mouse rows must expose each declared action label exactly once");
+        require(
+            button->buttonStyle() == adqt::widgets::AdButton::ButtonStyle::Dashed &&
+                adqt::icons::describeIcon(button->iconRef()).key.name ==
+                    QStringLiteral("wheel-mouse") &&
+                button->accessibleName().contains(label->text()),
+            "Global mouse buttons must reuse the dashed trigger with a mouse icon and action name");
+    }
+    require(remainingTitles.isEmpty(), "Global mouse page is missing a declared action label");
+}
+
+void globalMouseModalEditsOnlyOnAcceptedUniquePairs() {
+    using Action = settings::SettingsGlobalMouseAction;
+    using Combination = settings::SettingsGlobalMouseCombination;
+    const settings::SettingsRegistry& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+
+    GlobalMouseRow* copyRow = rowForTitle(page, QStringLiteral("Copy to clipboard"));
+    require(copyRow != nullptr, "Copy to clipboard row must exist");
+    auto* copyButton = configurationButton(*copyRow);
+    copyButton->click();
+    auto* initialContent = namedWidget<QWidget>(QStringLiteral("globalMouseConfigurationContent"));
+    StableHeightObserver initialHeightObserver(*initialContent);
+    const int initialHeight = initialContent->height();
+    for (int i = 0; i < 8; ++i) {
+        flushEvents();
+        require(initialContent->height() == initialHeight,
+                "opening the mouse modal must not change its content height after display");
+    }
+    flushEvents();
+
+    auto* modal = namedObject<adqt::widgets::AdModal>(
+        *copyRow, QStringLiteral("globalMouseConfigurationModal"));
+    auto* activation =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+    auto* mouseButton =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseButtonSelect"));
+    require(modal != nullptr && modal->contentWidget() != nullptr && activation != nullptr &&
+                mouseButton != nullptr && selectCount(*modal->contentWidget()) == 2 &&
+                modal->contentWidget()->findChild<QWidget*>(
+                    QStringLiteral("shortcutConfigContent")) == nullptr &&
+                modal->contentWidget()->findChild<QWidget*>(
+                    QStringLiteral("shortcutConfigKeyButton")) == nullptr,
+            "mouse configuration must contain exactly two selects and no key recorder");
+    require(activation->searchEnabled() && mouseButton->searchEnabled(),
+            "custom mouse settings selects support input filtering");
+    const auto originalKeys = activation->currentValues();
+    const auto originalButton = mouseButton->currentValue();
+    activation->setSearchText(QStringLiteral("shift"));
+    mouseButton->setSearchText(QStringLiteral("drag"));
+    require(activation->currentValues() == originalKeys &&
+                mouseButton->currentValue() == originalButton,
+            "filtering custom settings does not change their values");
+    activation->setSearchText(QString());
+    mouseButton->setSearchText(QString());
+    require(optionValues(*activation) ==
+                    QStringList{snow_shot::presentation::globalMouseActivationKeys().at(0),
+                                snow_shot::presentation::globalMouseActivationKeys().at(1),
+                                snow_shot::presentation::globalMouseActivationKeys().at(2),
+                                QStringLiteral("shift")} &&
+                optionValues(*mouseButton) ==
+                    QStringList{QStringLiteral("left_drag"), QStringLiteral("right_drag"),
+                                QStringLiteral("wheel_drag"), QStringLiteral("side_button_1_drag"),
+                                QStringLiteral("side_button_2_drag"), QStringLiteral("none")} &&
+                activation->currentValues() ==
+                    QVariantList{snow_shot::presentation::globalMouseActivationKeys().at(0)} &&
+                mouseButton->currentValues().isEmpty() && !modal->acceptButton()->isEnabled(),
+            "an Unset mouse modal must default only Windows and require a mouse selection");
+
+#ifdef Q_OS_MACOS
+    QStringList labels;
+    for (const auto& item : activation->options())
+        labels.push_back(item.label);
+    require(labels == QStringList{QStringLiteral("Command"), QStringLiteral("Control"),
+                                  QStringLiteral("Option"), QStringLiteral("Shift")},
+            "macOS must display physical native modifier names");
+#endif
+    auto* form = modal->contentWidget()->findChild<adqt::widgets::AdForm*>(
+        QStringLiteral("globalMouseConfigurationForm"));
+    require(activation->mode() == adqt::widgets::AdSelect::Mode::Multiple && form != nullptr,
+            "activation keys must be a multiple select in the unified AdForm");
+    require(form->formLayout() == adqt::widgets::AdForm::FormLayout::Vertical &&
+                form->items().size() == 2 && form->items().at(0)->controlWidget() == activation &&
+                form->items().at(0)->label() == QStringLiteral("Activation keys") &&
+                form->items().at(1)->controlWidget() == mouseButton &&
+                form->items().at(1)->label() == QStringLiteral("Mouse button"),
+            "both mouse selectors must use labeled fields managed by the unified vertical form");
+    FieldEvents cancelled;
+    observeField(*modal->contentWidget(), "activationKeys", cancelled);
+    observeField(*modal->contentWidget(), "mouseButton", cancelled);
+    activation->setCurrentValues({snow_shot::presentation::globalMouseActivationKeys().at(2)});
+    mouseButton->setCurrentValue(QStringLiteral("wheel_drag"));
+    require(cancelled.edits == 2 && cancelled.commits == 0,
+            "mouse selector drafts emit edits while waiting for explicit confirmation");
+    copyRow->retranslateUi();
+    require(cancelled.edits == 2 && cancelled.commits == 0,
+            "mouse editor retranslation preserves drafts without shared events");
+    modal->rejectButton()->click();
+    flushEvents();
+    require(session.globalMouseCombination(Action::ScreenshotCopy).isUnset() &&
+                copyButton->text() == QStringLiteral("Unset"),
+            "Cancel must leave an Unset global mouse field unchanged");
+    require(cancelled.commits == 0, "cancelling a mouse editor never commits its field drafts");
+
+    copyButton->click();
+    flushEvents();
+    modal = namedObject<adqt::widgets::AdModal>(*copyRow,
+                                                QStringLiteral("globalMouseConfigurationModal"));
+    activation =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+    mouseButton = namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseButtonSelect"));
+    FieldEvents savedActivation;
+    FieldEvents savedMouse;
+    observeField(*modal->contentWidget(), "activationKeys", savedActivation);
+    observeField(*modal->contentWidget(), "mouseButton", savedMouse);
+    activation->setCurrentValues(
+        {QStringLiteral("shift"), snow_shot::presentation::globalMouseActivationKeys().at(1)});
+    mouseButton->setCurrentValue(QStringLiteral("right_drag"));
+    require(savedActivation.edits == 1 && savedMouse.edits == 1 && savedActivation.commits == 0 &&
+                savedMouse.commits == 0,
+            "each changed mouse selector publishes one draft without an early commit");
+    modal->acceptButton()->click();
+    flushEvents();
+    const Combination saved{
+        {snow_shot::presentation::globalMouseActivationKeys().at(1), QStringLiteral("shift")},
+        QStringLiteral("right_drag")};
+    require(session.globalMouseCombination(Action::ScreenshotCopy) == saved &&
+                copyButton->text() == (
+#ifdef Q_OS_MACOS
+                                          QStringLiteral("Control + Shift + Right-button drag")
+#else
+                                          QStringLiteral("Ctrl + Shift + Right-button drag")
+#endif
+                                              ),
+            "OK must persist the structured pair and refresh the button label");
+    require(savedActivation.commits == 1 && savedMouse.commits == 1,
+            "successful mouse confirmation commits each changed field exactly once");
+
+    GlobalMouseRow* fixedRow = rowForTitle(page, QStringLiteral("Pin to screen"));
+    require(fixedRow != nullptr, "Pin to screen row must exist");
+    auto* fixedButton = configurationButton(*fixedRow);
+    fixedButton->click();
+    flushEvents();
+    modal = namedObject<adqt::widgets::AdModal>(*fixedRow,
+                                                QStringLiteral("globalMouseConfigurationModal"));
+    activation =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+    mouseButton = namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseButtonSelect"));
+    auto* validation = namedWidget<QLabel>(QStringLiteral("globalMouseValidationMessage"));
+    const int editorHeight = modal->contentWidget()->height();
+    StableHeightObserver validationHeightObserver(*modal->contentWidget());
+    activation->setCurrentValues(
+        {snow_shot::presentation::globalMouseActivationKeys().at(1), QStringLiteral("shift")});
+    mouseButton->setCurrentValue(saved.mouseButton);
+    flushEvents();
+    require(validation != nullptr && validation->isVisible() && !modal->acceptButton()->isEnabled(),
+            "a duplicate combination must show validation and disable OK");
+    const int validationGap = validation->mapTo(modal->contentWidget(), QPoint()).y() -
+                              mouseButton->mapTo(modal->contentWidget(), QPoint()).y() -
+                              mouseButton->height();
+    qInfo("Mouse validation gap: %d", validationGap);
+    require(validationGap >= 0 &&
+                validationGap <=
+                    styles::ThemeManager::instance().themeColorScheme().metricAlias.marginXS,
+            "mouse validation must sit directly below its selector with a compact theme gap");
+    require(modal->contentWidget()->height() == editorHeight,
+            "a wrapped validation message must not resize the displayed mouse editor");
+    mouseButton->setCurrentValue(QStringLiteral("wheel_drag"));
+    flushEvents();
+    require(!validation->isVisible() && modal->acceptButton()->isEnabled(),
+            "choosing a unique pair must clear duplicate validation");
+    require(modal->contentWidget()->height() == editorHeight,
+            "clearing validation must preserve the mouse editor height");
+    activation->setCurrentValues({});
+    flushEvents();
+    require(validation->isVisible() && !modal->acceptButton()->isEnabled(),
+            "an empty activation-key selection must not be saved");
+    require(modal->contentWidget()->height() == editorHeight,
+            "changing validation messages must preserve the mouse editor height");
+    modal->rejectButton()->click();
+    flushEvents();
+}
+
+void noneClearsAssignedMouseBinding() {
+    using Action = settings::SettingsGlobalMouseAction;
+    const auto& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    const settings::SettingsGlobalMouseCombination assigned{
+        {snow_shot::presentation::globalMouseActivationKeys().at(0)}, QStringLiteral("left_drag")};
+    require(session.applyGlobalMouseCombination(Action::ScreenshotCopy, assigned),
+            "None fixture must assign a binding");
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+    auto* row = rowForTitle(page, QStringLiteral("Copy to clipboard"));
+    for (const bool accept : {false, true}) {
+        row->configurationButton()->click();
+        flushEvents();
+        auto* modal = namedObject<adqt::widgets::AdModal>(
+            *row, QStringLiteral("globalMouseConfigurationModal"));
+        auto* mouse =
+            namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseButtonSelect"));
+        auto* keys =
+            namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+        bool hasNone = false;
+        for (const auto& item : mouse->options()) {
+            hasNone |= item.value == QStringLiteral("none") && item.label == QStringLiteral("None");
+        }
+        require(hasNone, "mouse actions must offer None");
+        mouse->setCurrentValue(QStringLiteral("none"));
+        require(modal->acceptButton()->isEnabled() && !keys->isEnabled(),
+                "None must ignore existing activation keys and disable their editor");
+        keys->setCurrentValues({});
+        mouse->setCurrentValue(QStringLiteral("left_drag"));
+        require(keys->isEnabled() && !modal->acceptButton()->isEnabled(),
+                "switching back to a drag must restore activation-key validation");
+        mouse->setCurrentValue(QStringLiteral("none"));
+        flushEvents();
+        require(modal->acceptButton()->isEnabled(), "None must be valid without activation keys");
+        (accept ? modal->acceptButton() : modal->rejectButton())->click();
+        flushEvents();
+        require(accept ? session.globalMouseCombination(Action::ScreenshotCopy).isUnset()
+                       : session.globalMouseCombination(Action::ScreenshotCopy) == assigned,
+                "None must clear the binding only when accepted");
+    }
+    require(row->configurationButton()->text() == QStringLiteral("Unset"),
+            "clearing a binding must refresh its row");
+}
+
+void globalMouseAndGlobalHotkeyRowsSharePresentation() {
+    const auto& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    auto scheme = styles::ThemeManager::instance().themeColorScheme();
+    scheme.map.colorBgContainer = QColor(QStringLiteral("#e1eee5"));
+    GlobalMouseRow mouse(QStringLiteral("Action"),
+                         settings::SettingsGlobalMouseAction::ScreenshotCopy, session, scheme);
+    SettingsPageWidget globalHotkeysPage(registry, QStringLiteral("global-hotkeys"), session);
+    auto* quickRow = globalHotkeysPage.findChild<ShortcutKeyRow*>();
+    require(quickRow != nullptr, "Quick Actions must provide an action row for comparison");
+    // Isolate the real row from its page's layout and background during pixel comparison.
+    quickRow->setParent(nullptr);
+    const std::unique_ptr<ShortcutKeyRow> quickRowOwner(quickRow);
+    auto& shortcut = *quickRow;
+    shortcut.applyTheme(scheme);
+    mouse.resize(601, mouse.height());
+    shortcut.resize(mouse.size());
+    const auto renderSurface = [](QWidget& widget, qreal dpr) {
+        QImage image(QSize(qRound(widget.width() * dpr), qRound(widget.height() * dpr)),
+                     QImage::Format_ARGB32_Premultiplied);
+        image.setDevicePixelRatio(dpr);
+        image.fill(Qt::transparent);
+        widget.render(&image, QPoint(), QRegion(), QWidget::DrawWindowBackground);
+        return image;
+    };
+    auto* shortcutButton = shortcut.findChild<ShortcutConfigurationButton*>();
+    require(shortcutButton != nullptr, "Quick Actions must provide a configuration button");
+    for (const bool hovered : {false, true}) {
+        mouse.setAttribute(Qt::WA_UnderMouse, hovered);
+        shortcut.setAttribute(Qt::WA_UnderMouse, hovered);
+        for (const bool pressed : {false, true}) {
+            mouse.setDown(pressed);
+            shortcut.setDown(pressed);
+            for (const bool configurationActive : {false, true}) {
+                mouse.configurationButton()->setDown(configurationActive);
+                shortcutButton->setDown(configurationActive);
+                for (const qreal dpr : {1.0, 1.25, 1.5, 1.75, 2.0}) {
+                    const QImage mouseSurface = renderSurface(mouse, dpr);
+                    const QImage shortcutSurface = renderSurface(shortcut, dpr);
+                    if (mouseSurface != shortcutSurface) {
+                        std::cerr << "Row comparison: hovered=" << hovered << " pressed=" << pressed
+                                  << " configurationActive=" << configurationActive
+                                  << " mouse=" << mouseSurface.width() << 'x'
+                                  << mouseSurface.height() << " quick=" << shortcutSurface.width()
+                                  << 'x' << shortcutSurface.height() << '\n';
+                    }
+                    require(
+                        mouseSurface == shortcutSurface,
+                        "global mouse and global-hotkey action surfaces must render identically "
+                        "in normal, hovered, pressed, and configuration-active states");
+                }
+            }
+        }
+    }
+}
+
+void globalMouseAndHotkeyTitlesRenderIdentically() {
+    const auto& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    auto scheme = styles::ThemeManager::instance().themeColorScheme();
+    GlobalMouseRow mouse(QStringLiteral("Copy to clipboard"),
+                         settings::SettingsGlobalMouseAction::ScreenshotCopy, session, scheme);
+    ShortcutKeyRowConfig config;
+    config.title = QStringLiteral("Copy to clipboard");
+    config.iconRef = presentation::icons::custom::outlined::ScreenshotCopy();
+    config.useStableBorder = true;
+    ShortcutKeyRow shortcut(config, scheme.metricAlias,
+                            styles::buildMainWindowComponentMetricToken(scheme));
+    auto* mouseTitle = mouse.findChild<QLabel*>(QStringLiteral("globalMouseActionLabel"));
+    auto* shortcutTitle = shortcut.findChild<QLabel*>(QStringLiteral("shortcutTitleLabel"));
+    auto* shortcutButton = shortcut.findChild<ShortcutConfigurationButton*>();
+    require(mouseTitle != nullptr && shortcutTitle != nullptr && shortcutButton != nullptr,
+            "Both action rows must expose a title and configuration button");
+    // Keep configuration widths equal, but retain their different icons and behavior.
+    mouse.configurationButton()->setFixedWidth(180);
+    shortcutButton->setFixedWidth(180);
+    mouse.resize(601, mouse.height());
+    shortcut.resize(mouse.size());
+    mouse.show();
+    shortcut.show();
+    flushEvents();
+
+    const auto sendHover = [](QWidget& widget, bool hovered) {
+        widget.setAttribute(Qt::WA_UnderMouse, hovered);
+        if (hovered) {
+            QEnterEvent event(QPointF(1, 1), QPointF(1, 1), QPointF(1, 1));
+            QApplication::sendEvent(&widget, &event);
+        } else {
+            QEvent event(QEvent::Leave);
+            QApplication::sendEvent(&widget, &event);
+        }
+    };
+    const auto renderTitleArea = [](QWidget& widget, qreal dpr) {
+        QImage image(QSize(qRound(widget.width() * dpr), qRound(widget.height() * dpr)),
+                     QImage::Format_ARGB32_Premultiplied);
+        image.setDevicePixelRatio(dpr);
+        image.fill(Qt::transparent);
+        widget.render(&image); // Include the title and icon child widgets.
+        return image.copy(0, 0, qRound(350 * dpr), image.height());
+    };
+    for (const bool dark : {false, true}) {
+        scheme.map.colorBgContainer = QColor(dark ? "#171d23" : "#f3f7fa");
+        scheme.map.colorText = QColor(dark ? "#f0f2f4" : "#17212a");
+        scheme.map.colorPrimaryHover = QColor(dark ? "#85beff" : "#246ac7");
+        scheme.map.colorPrimaryActive = QColor(dark ? "#549be8" : "#174b9a");
+        mouse.applyTheme(scheme);
+        shortcut.applyTheme(scheme);
+        for (const bool hovered : {false, true}) {
+            for (const bool pressed : {false, true}) {
+                for (const int configurationState : {0, 1, 2}) {
+                    mouse.setDown(pressed);
+                    shortcut.setDown(pressed);
+                    mouse.configurationButton()->setDown(configurationState == 2);
+                    shortcutButton->setDown(configurationState == 2);
+                    sendHover(*mouse.configurationButton(), configurationState == 1);
+                    sendHover(*shortcutButton, configurationState == 1);
+                    sendHover(mouse, hovered);
+                    sendHover(shortcut, hovered);
+                    const QColor expected = configurationState != 0 ? scheme.map.colorText
+                                            : pressed               ? scheme.map.colorPrimaryActive
+                                            : hovered               ? scheme.map.colorPrimaryHover
+                                                                    : scheme.map.colorText;
+                    require(mouseTitle->palette().color(QPalette::WindowText) == expected &&
+                                shortcutTitle->palette().color(QPalette::WindowText) == expected,
+                            "Both titles must use the hotkey color for every interaction state");
+                    for (const qreal dpr : {1.0, 1.25, 1.5, 1.75, 2.0}) {
+                        require(renderTitleArea(mouse, dpr) == renderTitleArea(shortcut, dpr),
+                                "Action titles, icons, and backgrounds must render identically "
+                                "across themes, hover/press states, and scale factors");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void globalMouseLanguageAndThemeChangesRefreshOpenUi() {
+    using Action = settings::SettingsGlobalMouseAction;
+    const settings::SettingsRegistry& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    require(
+        session.applyGlobalMouseCombination(
+            Action::ScreenshotCopy, {{snow_shot::presentation::globalMouseActivationKeys().at(1)},
+                                     QStringLiteral("right_drag")}),
+        "language test fixture must save a mouse combination");
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+
+    GlobalMouseRow* row = rowForTitle(page, QStringLiteral("Copy to clipboard"));
+    require(row != nullptr, "Copy to clipboard row must exist for language updates");
+    auto* button = configurationButton(*row);
+    button->click();
+    flushEvents();
+    auto* modal =
+        namedObject<adqt::widgets::AdModal>(*row, QStringLiteral("globalMouseConfigurationModal"));
+    auto* activation =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+    auto* mouseButton =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseButtonSelect"));
+
+    GlobalMouseTranslator translator;
+    require(QApplication::installTranslator(&translator), "Global mouse translator must install");
+    flushEvents();
+    auto* form = modal->contentWidget()->findChild<adqt::widgets::AdForm*>(
+        QStringLiteral("globalMouseConfigurationForm"));
+    require(form != nullptr &&
+                form->items().at(0)->label() == QStringLiteral("Aktivierungstasten") &&
+                form->items().at(1)->label() == QStringLiteral("Maustaste") &&
+                activation->accessibleName() == QStringLiteral("Aktivierungstasten") &&
+                mouseButton->accessibleName() == QStringLiteral("Maustaste"),
+            "language changes must refresh unified form labels and selector accessible names");
+    require(button->text() == QStringLiteral("Strg + Rechts ziehen") &&
+                modal->windowTitle() ==
+                    QStringLiteral("Mauskonfiguration fuer \"Copy to clipboard\"") &&
+                activation->options().at(1).label == QStringLiteral("Strg") &&
+                mouseButton->options().at(1).label == QStringLiteral("Rechts ziehen") &&
+                mouseButton->options().last().label == QStringLiteral("Keine"),
+            "language changes must refresh button and open-modal text without losing selection");
+
+    styles::ThemeColorScheme scheme = styles::ThemeManager::instance().themeColorScheme();
+    scheme.map.colorText = QColor(QStringLiteral("#123456"));
+    page.applyTheme(scheme);
+    auto* label = row->findChild<QLabel*>(QStringLiteral("globalMouseActionLabel"));
+    require(label != nullptr &&
+                label->palette().color(QPalette::WindowText) == scheme.map.colorText,
+            "theme changes must refresh Global mouse row presentation");
+
+    QApplication::removeTranslator(&translator);
+    flushEvents();
+    modal->rejectButton()->click();
+    flushEvents();
+}
+
+void actionButtonPressDispatchesBeforeRelease() {
+    const auto& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+    int requests = 0;
+    settings::SettingsGlobalMouseAction action =
+        settings::SettingsGlobalMouseAction::ScreenshotCopy;
+    QObject::connect(&page, &SettingsPageWidget::commandRequested, &page,
+                     [&](const settings::SettingsCommand& command) {
+                         require(command.kind ==
+                                     settings::SettingsCommandKind::BeginGlobalMouseDrag,
+                                 "the action button must dispatch a direct drag command");
+                         action = command.globalMouseAction;
+                         ++requests;
+                     });
+    auto* row = rowForTitle(page, QStringLiteral("Text recognition"));
+    require(row != nullptr, "OCR action button must exist");
+    const QPointF local(20, row->height() / 2);
+    const auto sendMouse = [&](QWidget* target, QEvent::Type type, Qt::MouseButton button,
+                               Qt::MouseButtons buttons) {
+        QMouseEvent event(type, local, target->mapToGlobal(local.toPoint()), button, buttons,
+                          Qt::NoModifier);
+        QApplication::sendEvent(target, &event);
+    };
+    sendMouse(row, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton);
+    require(requests == 1 && action == settings::SettingsGlobalMouseAction::ScreenshotOcr,
+            "left press must start the correct action before releasing, with no activation key");
+    sendMouse(row, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton);
+    require(requests == 1, "releasing the action button must not dispatch another action");
+    sendMouse(row, QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton);
+    sendMouse(row, QEvent::MouseButtonRelease, Qt::RightButton, Qt::NoButton);
+    require(requests == 1, "right press must not start a direct drag");
+    sendMouse(row->configurationButton(), QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(row->configurationButton(), QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton);
+    flushEvents();
+    require(requests == 1, "configuration button must not trigger the enclosing action");
+    auto* modal =
+        namedObject<adqt::widgets::AdModal>(*row, QStringLiteral("globalMouseConfigurationModal"));
+    require(modal != nullptr, "configuration button must open its modal");
+    modal->reject();
+    flushEvents();
+    auto* saveRow = rowForTitle(page, QStringLiteral("Save as file"));
+    auto* quickSaveRow = rowForTitle(page, QStringLiteral("Quick save"));
+    require(saveRow != nullptr && quickSaveRow != nullptr &&
+                saveRow->mapTo(&page, QPoint()).y() < quickSaveRow->mapTo(&page, QPoint()).y(),
+            "Save as file must appear above Quick save");
+    sendMouse(saveRow, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton);
+    require(requests == 2 && action == settings::SettingsGlobalMouseAction::ScreenshotSave,
+            "Save as file must dispatch its distinct capture action");
+    sendMouse(saveRow, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton);
+    require(requests == 2, "Save as file must dispatch only once per drag");
+}
+
+void globalMousePopupStaysAboveModalDuringLayout() {
+    const auto& registry = settings::builtInSettingsRegistry();
+    FakeSettingsBackend backend;
+    settings::SettingsRuntimeSession session(registry, backend);
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+    auto* row = rowForTitle(page, QStringLiteral("Copy to clipboard"));
+    require(row != nullptr, "popup fixture requires the copy row");
+    row->configurationButton()->click();
+    flushEvents();
+    auto* select =
+        namedWidget<adqt::widgets::AdSelect>(QStringLiteral("globalMouseActivationKeySelect"));
+    require(select != nullptr, "popup fixture requires activation select");
+    select->showPopup();
+    flushEvents();
+    QWidget* viewport = select->view()->viewport();
+    require(select->popupLayerMode() == adqt::widgets::AdSelect::PopupLayerMode::QtTool &&
+                viewport->window()->isWindow() && viewport->window()->windowType() == Qt::Tool,
+            "modal selectors use a separate QtTool popup surface");
+    for (int i = 0; i < 3; ++i) {
+        const QPointF local = viewport->rect().center();
+        QEnterEvent hover(local, viewport->mapTo(viewport->window(), local.toPoint()),
+                          viewport->mapToGlobal(local.toPoint()));
+        QApplication::sendEvent(viewport, &hover);
+        QEvent layout(QEvent::LayoutRequest);
+        QApplication::sendEvent(&page, &layout);
+        QWidget* immediateHit =
+            QApplication::widgetAt(viewport->mapToGlobal(viewport->rect().center()));
+        require(select->popupVisible() && viewport->window()->isVisible() &&
+                    (immediateHit == viewport || viewport->isAncestorOf(immediateHit)),
+                "modal relayout must not temporarily cover the open select popup");
+        flushEvents();
+        QWidget* hit = QApplication::widgetAt(viewport->mapToGlobal(viewport->rect().center()));
+        require(select->popupVisible() && viewport->window()->isVisible() &&
+                    (hit == viewport || viewport->isAncestorOf(hit)),
+                "select popup must remain above the modal during hover and layout updates");
+    }
+    select->hidePopup();
+    auto* modal =
+        namedObject<adqt::widgets::AdModal>(*row, QStringLiteral("globalMouseConfigurationModal"));
+    modal->reject();
+    flushEvents();
+}
+
+void builtInGlobalMouseResetRestoresDefaults() {
+    using Action = settings::SettingsGlobalMouseAction;
+    using Combination = settings::SettingsGlobalMouseCombination;
+    QTemporaryDir temporary;
+    require(temporary.isValid(), "reset fixture requires temporary storage");
+    auto& applicationStorage = storage::ApplicationStorage::instance();
+    applicationStorage.shutdown();
+    static_cast<void>(applicationStorage.initialize(
+        {temporary.filePath(QStringLiteral("bin")), temporary.path()}));
+    require(applicationStorage.isInitialized(), "reset fixture storage must initialize");
+    {
+        snow_shot::presentation::GlobalShortcutManager shortcuts;
+        settings::BuiltInSettingsBackend backend(shortcuts);
+        const Combination custom{{snow_shot::presentation::globalMouseActivationKeys().at(2)},
+                                 QStringLiteral("side_button_1_drag")};
+        require(backend.applyGlobalMouseCombination(Action::ScreenshotCopy, {}) &&
+                    backend.globalMouseCombination(Action::ScreenshotOcrCopy).isUnset() &&
+                    backend.applyGlobalMouseCombination(Action::ScreenshotOcrCopy, custom) &&
+                    backend.globalMouseCombination(Action::ScreenshotOcrCopy) == custom &&
+                    backend.globalMouseCombination(Action::ScreenRecording).isUnset() &&
+                    backend.applyGlobalMouseCombination(Action::ScreenRecording, custom) &&
+                    backend.globalMouseCombination(Action::ScreenRecording) == custom &&
+                    backend.applyGlobalMouseCombination(Action::ScreenshotSave, custom) &&
+                    backend.globalMouseCombination(Action::ScreenshotSave) == custom,
+                "Save as file must persist through the built-in backend");
+        require(backend.resetSection(settings::SettingsSectionReset::GlobalMouse),
+                "built-in global mouse reset must succeed");
+#ifdef Q_OS_MACOS
+        const Combination copyDefault;
+        const Combination fixedDefault;
+        const Combination ocrDefault;
+#else
+        const Combination copyDefault{{snow_shot::presentation::globalMouseActivationKeys().at(0)},
+                                      QStringLiteral("left_drag")};
+        const Combination fixedDefault{{snow_shot::presentation::globalMouseActivationKeys().at(0)},
+                                       QStringLiteral("wheel_drag")};
+        const Combination ocrDefault{{snow_shot::presentation::globalMouseActivationKeys().at(0)},
+                                     QStringLiteral("right_drag")};
+#endif
+        require(backend.globalMouseCombination(Action::ScreenshotCopy) == copyDefault &&
+                    backend.globalMouseCombination(Action::ScreenshotFixed) == fixedDefault &&
+                    backend.globalMouseCombination(Action::ScreenshotOcr) == ocrDefault &&
+                    backend.globalMouseCombination(Action::ScreenshotOcrCopy).isUnset() &&
+                    backend.globalMouseCombination(Action::ScreenshotTranslation).isUnset() &&
+                    backend.globalMouseCombination(Action::ScreenshotSave).isUnset() &&
+                    backend.globalMouseCombination(Action::ScreenshotQuickSave).isUnset() &&
+                    backend.globalMouseCombination(Action::ScreenRecording).isUnset(),
+                "reset must restore platform mouse defaults and clear the other actions");
+    }
+    applicationStorage.shutdown();
+}
+void globalMousePermissionGuidance() {
+#ifdef Q_OS_MACOS
+    using Status = presentation::GlobalMousePermissionState::Status;
+    FakeSettingsBackend backend;
+    backend.permission = {Status::ListenRequired};
+    const auto& registry = settings::builtInSettingsRegistry();
+    settings::SettingsRuntimeSession session(registry, backend);
+    SettingsPageWidget page(registry, QStringLiteral("global-mouse"), session);
+    page.resize(900, 720);
+    page.show();
+    flushEvents();
+    require(!page.findChild<QLabel*>(QStringLiteral("globalMousePermissionLabel")),
+            "legacy permission hints are replaced by App Permissions alerts");
+    require(session.applyGlobalMouseCombination(
+                settings::SettingsGlobalMouseAction::ScreenshotCopy,
+                {{QStringLiteral("command")}, QStringLiteral("left_drag")}),
+            "configuration remains editable without permission");
+    auto* row = rowForTitle(page, QStringLiteral("Copy to clipboard"));
+    require(configurationButton(*row)->property("registrationStatus").toInt() ==
+                static_cast<int>(presentation::GlobalShortcutStatus::Failed),
+            "an unavailable binding must not claim to be registered");
+    backend.setPermission({Status::AccessibilityRequired, true});
+    backend.setPermission({Status::Ready, true, true, true});
+    require(configurationButton(*row)->property("registrationStatus").toInt() ==
+                static_cast<int>(presentation::GlobalShortcutStatus::Registered),
+            "granted permissions must refresh binding status");
+#endif
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication application(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("SnowShotTests"));
+    QCoreApplication::setApplicationName(QStringLiteral("global-mouse-page-tests"));
+    globalMousePermissionGuidance();
+    globalMousePageRendersActionButtons();
+    noneClearsAssignedMouseBinding();
+    globalMouseAndGlobalHotkeyRowsSharePresentation();
+    globalMouseAndHotkeyTitlesRenderIdentically();
+    globalMouseModalEditsOnlyOnAcceptedUniquePairs();
+    globalMouseLanguageAndThemeChangesRefreshOpenUi();
+    globalMousePopupStaysAboveModalDuringLayout();
+    actionButtonPressDispatchesBeforeRelease();
+    builtInGlobalMouseResetRestoresDefaults();
+    storage::ApplicationStorage::instance().shutdown();
+    return 0;
+}

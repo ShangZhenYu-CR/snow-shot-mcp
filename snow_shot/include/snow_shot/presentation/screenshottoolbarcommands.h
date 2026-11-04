@@ -1,0 +1,187 @@
+#ifndef SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARCOMMANDS_H
+#define SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARCOMMANDS_H
+
+#include "snow_shot/presentation/screenshotselectiondisplayunit.h"
+#include "snow_shot/presentation/screenshotselectionaspectratio.h"
+#include "snow_shot/presentation/screenshotselectionparams.h"
+#include "snow_draw_engine_qt/snow_canvas_style_edit.h"
+#include "snow_shot/presentation/screenshotscrollingtypes.h"
+
+#include <QString>
+#include <QByteArray>
+#include <QPoint>
+#include <QVector>
+
+#include <optional>
+
+namespace adqt::widgets {
+class AdColorPicker;
+}
+
+class SnowCanvasWidget;
+
+class ScreenshotToolbarCommandSink {
+  public:
+    virtual void replicateStyleEdit(const SnowCanvasStyleEdit&, SnowCanvasWidget*) {}
+    virtual ~ScreenshotToolbarCommandSink() = default;
+
+    virtual void undoCanvasEdit() {}
+    virtual void redoCanvasEdit() {}
+    virtual void setScreenshotRegionType(int) {}
+    virtual void setLayoutCompaction(bool, int) {}
+    virtual void setSelectionBackgroundOpacityPercent(int) {}
+    virtual void adjustSelectionBackgroundOpacityFromWheel(int) {}
+    virtual void setSelectionBackgroundPreviewVisible(bool) {}
+    virtual void addScreenshotRegion() {}
+    virtual void subtractScreenshotRegion() {}
+    virtual void requestRecapture() {}
+    virtual bool screenshotCursorVisible() const {
+        return false;
+    }
+    virtual bool screenshotCursorAvailable() const {
+        return false;
+    }
+    virtual bool setScreenshotCursorVisible(bool) {
+        return false;
+    }
+    virtual void setSelectionDisplayUnit(ScreenshotSelectionDisplayUnit) {}
+    virtual void setSelectionToolbarHidden(bool) {}
+    virtual void setMoveTool() = 0;
+    virtual void setSelectTool() = 0;
+    virtual void setShapeTool() = 0;
+    virtual void setSpeechBubbleTool() {}
+    virtual void setArrowTool() = 0;
+    virtual void setLineTool() = 0;
+    virtual void setDistanceTool() {}
+    virtual void setAngleTool() {}
+    virtual void setBracketTool() {}
+    virtual void setFreeDrawTool() = 0;
+    virtual void setHighlightTool() = 0;
+    virtual void setPenHighlightTool() = 0;
+    virtual void setSpotlightTool() {}
+    virtual void setMagnifierTool() {}
+    virtual void setEraserTool() = 0;
+    virtual void setRectangleEraserTool() {}
+    virtual void setBrushEraserTool() {}
+    virtual void setFilterTool() = 0;
+    virtual void setRectangleFilterTool() {
+        setFilterTool();
+    }
+    virtual void setPenFilterTool() {}
+    virtual void setAutoFilterTool() {}
+    virtual void fillAutoFilterCategory(const QString&) {}
+    virtual void setWatermarkTool() = 0;
+    virtual void setWatermarkConfigFromToolbar(const SnowCanvasWatermarkConfig& config) = 0;
+    virtual void previewWatermarkFromToolbar(const SnowCanvasWatermarkConfig& config) = 0;
+    virtual void setSpotlightConfigFromToolbar(const SnowCanvasSpotlightConfig&) {}
+    virtual void previewSpotlightFromToolbar(const SnowCanvasSpotlightConfig&) {}
+    virtual void setFilterStyleFromToolbar(const SnowCanvasFilterStyle& style,
+                                           quint32 properties) = 0;
+    virtual void setTextTool() = 0;
+    virtual void setSerialNumberTool() = 0;
+    virtual void setOcrTool() = 0;
+    virtual void setTextTranslationTool() {
+        setOcrTool();
+    }
+    virtual void setTableTool() {}
+    virtual void setQrTool() {}
+    virtual void setLatexTool() {}
+    virtual void setRecognitionModel(const QString&) {}
+    virtual void setMarkdownTool() {}
+    virtual void setHtmlTool() {}
+    virtual void openImageConversionSettings() {}
+    virtual void mergeTableSelection() {}
+    virtual void splitTableSelection() {}
+    virtual void resetTable() {}
+    virtual void openSpreadsheetFile() {}
+    virtual void setShowOriginalImage(bool) {}
+    virtual void beginTextEditing() {}
+    virtual void toggleTextEditing() {
+        beginTextEditing();
+    }
+    virtual void beginTextTranslation() {}
+    virtual void toggleTextTranslation() {
+        beginTextTranslation();
+    }
+    virtual void jumpToTranslationPage() {}
+    virtual void resetTextEditing() {}
+    virtual void openTextTranslationSettings() {}
+    virtual void applyTextFormatting(const QString&) {}
+    virtual void applyTextPunctuation(const QString&) {}
+    virtual void applyTextTargetLanguage(const QString&) {}
+    virtual void requestTextTranslationServices() {}
+    virtual void applyTextTranslationService(const QString&) {}
+    virtual void startScrollingScreenshot() = 0;
+    virtual void restartScrollingScreenshot() {}
+    virtual void splitScrollingScreenshot() {}
+    virtual void editScrollingScreenshot() {}
+    virtual void setScrollingScreenshotRecognitionMode(ScreenshotScrollingRecognitionMode) {}
+    virtual void setScrollingScreenshotAutoScroll(bool) {}
+    virtual void setScrollingScreenshotAutoScrollIntervalMs(int) {}
+    virtual void beginScrollingSelectionMove(ScreenshotScrollingRecognitionMode, QPoint) {}
+    virtual void updateScrollingSelectionMove(QPoint) {}
+    virtual void endScrollingSelectionMove() {}
+    virtual void pinSelectionToScreen() = 0;
+    virtual void pinWindowSelectionToScreen() {}
+    virtual void printSelection() {}
+    virtual void airDropSelection() {}
+    virtual void saveSelectionToFile() {}
+    virtual void quickSaveSelection() {}
+    virtual void uploadSelectionToCloud() {}
+    virtual void cancelCapture() = 0;
+    virtual void copySelectionToClipboard() = 0;
+    virtual void startScreenRecording() = 0;
+    virtual void setShapeStyleFromToolbar(const SnowCanvasShapeStyle& style, quint32 properties,
+                                          SnowCanvasShapeKind kind) = 0;
+    virtual void setTextStyleFromToolbar(const SnowCanvasTextStyle& style, quint32 properties) = 0;
+    virtual void setSerialNumberStyleFromToolbar(const SnowCanvasSerialNumberStyle& style) = 0;
+    virtual void decrementSelectedSerialNumbers() = 0;
+    virtual void incrementSelectedSerialNumbers() = 0;
+    virtual void createTextForSelectedSerialNumber() = 0;
+    virtual void reorderSelectedElements(SnowCanvasSelectionOrder) {}
+    virtual void alignSelectedElements(SnowCanvasSelectionAlignment) {}
+    virtual void setSelectedElementsOpacity(qreal) {}
+    virtual void duplicateSelectedElements() {}
+    virtual QByteArray selectedDrawTemplatePayload() {
+        return {};
+    }
+    virtual void insertDrawTemplate(const QByteArray&) {}
+    virtual void deleteSelectedElements() {}
+    virtual void deleteAllElements() {}
+    virtual void repositionToolbarForContentChange() = 0;
+    // Presentation changes may require placement while selection editing is unavailable.
+    virtual void repositionToolbarForPresentationChange() {
+        repositionToolbarForContentChange();
+    }
+    virtual void hideColorPickersForScreenshotUi() = 0;
+    virtual void updateGuideLinesForScreenshotUi(const QPoint&) {}
+    virtual void beginCanvasColorSampling(adqt::widgets::AdColorPicker*) {}
+};
+
+struct ScreenshotSelectionToolbarQuickSets {
+    std::optional<ScreenshotSelectionParams> previous;
+    QVector<ScreenshotSelectionPreset> presets;
+};
+
+class ScreenshotSelectionToolbarCommandSink {
+  public:
+    virtual ~ScreenshotSelectionToolbarCommandSink() = default;
+
+    virtual void toggleSelectionAspectRatioLockFromToolbar() = 0;
+    virtual void
+    setSelectionAspectRatioPresetFromToolbar(ScreenshotSelectionAspectRatioPreset preset) = 0;
+    virtual ScreenshotSelectionToolbarQuickSets selectionQuickSetsForToolbar() const {
+        return {};
+    }
+    virtual void applySelectionParamsFromToolbar(const ScreenshotSelectionParams&) {}
+    virtual void openSelectionResizeModalFromToolbar() = 0;
+    virtual void hideColorPickersForScreenshotUi() = 0;
+    virtual void adjustSelectionFromToolbar(int minDx, int minDy, int maxDx, int maxDy) = 0;
+    virtual void setSelectionCornerRadiusFromToolbar(int radius) = 0;
+    virtual void setSelectionEffectWidthFromToolbar(int effectWidth) = 0;
+    virtual void adjustSelectionEffectsFromWheel(int radiusDelta, int effectDelta) = 0;
+    virtual void setSelectionToolbarHovered(bool hovered) = 0;
+    virtual void setSelectionToolbarPopupVisible(bool) {}
+};
+
+#endif // SNOW_SHOT_PRESENTATION_SCREENSHOTTOOLBARCOMMANDS_H

@@ -1,0 +1,813 @@
+use super::*;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnowZoomFocus {
+    Pointer = 0,
+    Center = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnowActiveTool {
+    Select = 0,
+    Shape = 1,
+    Arrow = 2,
+    Text = 3,
+    SerialNumber = 4,
+    Line = 5,
+    FreeDraw = 6,
+    RectangleHighlight = 7,
+    Eraser = 8,
+    RectangleFilter = 9,
+    Watermark = 10,
+    PenHighlight = 11,
+    PenFilter = 12,
+    Spotlight = 13,
+    AutoFilter = 14,
+    RectangleEraser = 15,
+    BrushEraser = 16,
+    Distance = 17,
+    Angle = 18,
+    Magnifier = 19,
+    SpeechBubble = 20,
+    Bracket = 21,
+}
+
+impl SnowActiveTool {
+    #[allow(non_upper_case_globals)]
+    pub const Filter: Self = Self::RectangleFilter;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnowStyleToolbarSource {
+    DefaultRectangle = 0,
+    SelectedRectangle = 1,
+    DefaultArrow = 2,
+    SelectedArrow = 3,
+    DefaultText = 4,
+    SelectedText = 5,
+    DefaultSerialNumber = 6,
+    SelectedSerialNumber = 7,
+    DefaultLine = 8,
+    SelectedLine = 9,
+    DefaultFreeDraw = 10,
+    SelectedFreeDraw = 11,
+    DefaultRectangleHighlight = 12,
+    SelectedRectangleHighlight = 13,
+    Eraser = 14,
+    DefaultRectangleFilter = 15,
+    SelectedRectangleFilter = 16,
+    Watermark = 17,
+    DefaultPenHighlight = 18,
+    SelectedPenHighlight = 19,
+    DefaultPenFilter = 20,
+    SelectedPenFilter = 21,
+    DefaultSpotlight = 22,
+    SelectedSpotlight = 23,
+    DefaultRectangleEraser = 24,
+    DefaultBrushEraser = 25,
+    DefaultDistance = 26,
+    SelectedDistance = 27,
+    DefaultAngle = 28,
+    SelectedAngle = 29,
+    DefaultMagnifier = 30,
+    SelectedMagnifier = 31,
+    DefaultSpeechBubble = 32,
+    SelectedSpeechBubble = 33,
+    DefaultBracket = 34,
+    SelectedBracket = 35,
+}
+
+impl SnowStyleToolbarSource {
+    #[allow(non_upper_case_globals)]
+    pub const DefaultFilter: Self = Self::DefaultRectangleFilter;
+    #[allow(non_upper_case_globals)]
+    pub const SelectedFilter: Self = Self::SelectedRectangleFilter;
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowFilterType {
+        #[default]
+        Mosaic = 0,
+        GaussianBlur = 1,
+        Grayscale = 2,
+        Inversion = 3,
+        Emboss = 4,
+        SmartErase = 5,
+        Brightness = 6,
+        RestoreBackground = 7,
+    }
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowSerialNumberType {
+        #[default]
+        OutlinedCircle = 0,
+        SolidCircle = 1,
+        OutlinedSquare = 2,
+        SolidSquare = 3,
+    Circle = 4,
+    }
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowSerialNumberNumericType {
+        #[default]
+        Arabic = 0,
+        Roman = 1,
+        LowercaseLetters = 2,
+        UppercaseLetters = 3,
+        Chinese = 4,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SnowFilterStyle {
+    pub filter_type: SnowFilterType,
+    pub strength: f64,
+    pub opacity: f64,
+    pub stroke_width: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnowColorRgba8 {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SnowCornerRadii {
+    pub top_left: f64,
+    pub top_right: f64,
+    pub bottom_right: f64,
+    pub bottom_left: f64,
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowDistanceUnit {
+        #[default]
+        Px = 0,
+        Cm = 1,
+        M = 2,
+        Km = 3,
+        Mm = 4,
+        Pt = 5,
+        In = 6,
+        Ft = 7,
+        Um = 8,
+    }
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowAngleUnit {
+        #[default]
+        Degrees = 0,
+        Radians = 1,
+    }
+}
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowAngleType {
+        #[default]
+        Directed = 0,
+        Interior = 1,
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowBracketStyle {
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowAngleStyle {
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub unit: SnowAngleUnit,
+    pub decimal_places: u32,
+    pub angle_type: SnowAngleType,
+}
+pub const SNOW_ANGLE_STYLE_PROPERTY_STROKE: u32 = 1;
+pub const SNOW_ANGLE_STYLE_PROPERTY_STROKE_WIDTH: u32 = 2;
+pub const SNOW_ANGLE_STYLE_PROPERTY_UNIT: u32 = 4;
+pub const SNOW_ANGLE_STYLE_PROPERTY_DECIMAL_PLACES: u32 = 8;
+pub const SNOW_ANGLE_STYLE_PROPERTY_TYPE: u32 = 16;
+pub const SNOW_ANGLE_STYLE_MIXED_TYPE: u32 = 16;
+pub const SNOW_ANGLE_STYLE_PROPERTY_ALL: u32 = 31;
+pub const SNOW_ANGLE_STYLE_MIXED_STROKE: u32 = 1;
+pub const SNOW_ANGLE_STYLE_MIXED_STROKE_WIDTH: u32 = 2;
+pub const SNOW_ANGLE_STYLE_MIXED_UNIT: u32 = 4;
+pub const SNOW_ANGLE_STYLE_MIXED_DECIMAL_PLACES: u32 = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowDistanceStyle {
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub factor: f64,
+    pub unit: SnowDistanceUnit,
+    pub decimal_places: u32,
+    pub endpoint_scale: f64,
+    pub endpoint_style: SnowArrowhead,
+}
+
+pub const SNOW_DISTANCE_STYLE_PROPERTY_STROKE: u32 = 1 << 0;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_STROKE_WIDTH: u32 = 1 << 1;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_FACTOR: u32 = 1 << 2;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_UNIT: u32 = 1 << 3;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_DECIMAL_PLACES: u32 = 1 << 4;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_SCALE: u32 = 1 << 5;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_STYLE: u32 = 1 << 6;
+pub const SNOW_DISTANCE_STYLE_PROPERTY_ALL: u32 = (1 << 7) - 1;
+
+pub const SNOW_DISTANCE_STYLE_MIXED_STROKE: u32 = SNOW_DISTANCE_STYLE_PROPERTY_STROKE;
+pub const SNOW_DISTANCE_STYLE_MIXED_STROKE_WIDTH: u32 = SNOW_DISTANCE_STYLE_PROPERTY_STROKE_WIDTH;
+pub const SNOW_DISTANCE_STYLE_MIXED_FACTOR: u32 = SNOW_DISTANCE_STYLE_PROPERTY_FACTOR;
+pub const SNOW_DISTANCE_STYLE_MIXED_UNIT: u32 = SNOW_DISTANCE_STYLE_PROPERTY_UNIT;
+pub const SNOW_DISTANCE_STYLE_MIXED_DECIMAL_PLACES: u32 =
+    SNOW_DISTANCE_STYLE_PROPERTY_DECIMAL_PLACES;
+pub const SNOW_DISTANCE_STYLE_MIXED_ENDPOINT_SCALE: u32 =
+    SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_SCALE;
+pub const SNOW_DISTANCE_STYLE_MIXED_ENDPOINT_STYLE: u32 =
+    SNOW_DISTANCE_STYLE_PROPERTY_ENDPOINT_STYLE;
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowBrushMode {
+        #[default]
+        Regular = 0,
+        PressureSensitive = 1,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowShapeStyle {
+    pub fill: SnowColorRgba8,
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub corner_radii: SnowCornerRadii,
+    pub start_arrowhead: SnowArrowhead,
+    pub end_arrowhead: SnowArrowhead,
+    pub stroke_style: SnowStrokeStyle,
+    pub stroke_rendering_style: SnowStrokeRenderingStyle,
+    pub arrow_type: SnowArrowType,
+    pub arrow_shaft_type: SnowArrowShaftType,
+    pub arrow_ratio: f64,
+    pub fill_style: SnowFillStyle,
+    pub opacity: f64,
+    pub highlight_shape: SnowHighlightShape,
+    pub shape: SnowRectangleShape,
+    pub brush_mode: SnowBrushMode,
+    pub arrow_outline_color: SnowColorRgba8,
+    pub arrow_outline_width: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnowWatermarkTemplateApplicationTime {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub reserved0: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowWatermarkConfig {
+    pub color: SnowColorRgba8,
+    pub text_utf8_len: u32,
+    pub text_utf8: [std::ffi::c_char; SNOW_WATERMARK_TEXT_UTF8_CAPACITY],
+    pub font_size: f64,
+    pub font_family_utf8_len: u32,
+    pub font_family_utf8: [std::ffi::c_char; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+    pub angle: f64,
+    pub gap: f64,
+    pub opacity: f64,
+    pub template_value_utf8_len: u32,
+    pub template_value_utf8: [std::ffi::c_char; SNOW_WATERMARK_TEMPLATE_UTF8_CAPACITY],
+    pub has_template_application_time: u8,
+    pub reserved0: [u8; 3],
+    pub template_application_time: SnowWatermarkTemplateApplicationTime,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SnowSpotlightConfig {
+    pub color: SnowColorRgba8,
+    pub opacity: f64,
+}
+
+impl Default for SnowWatermarkConfig {
+    fn default() -> Self {
+        Self {
+            color: SnowColorRgba8::default(),
+            text_utf8_len: 0,
+            text_utf8: [0; SNOW_WATERMARK_TEXT_UTF8_CAPACITY],
+            font_size: 16.0,
+            font_family_utf8_len: 0,
+            font_family_utf8: [0; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+            angle: 30.0,
+            gap: 56.0,
+            opacity: 0.16,
+            template_value_utf8_len: 0,
+            template_value_utf8: [0; SNOW_WATERMARK_TEMPLATE_UTF8_CAPACITY],
+            has_template_application_time: 0,
+            reserved0: [0; 3],
+            template_application_time: SnowWatermarkTemplateApplicationTime::default(),
+        }
+    }
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowHighlightShape {
+        #[default]
+        Rectangle = 0,
+        Ellipse = 1,
+    }
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowRectangleShape {
+        #[default]
+        Rectangle = 0,
+        Ellipse = 1,
+        Diamond = 2,
+        ThoughtBubble = 3,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowRectangleShapeStyle {
+    pub fill: SnowColorRgba8,
+    pub fill_style: SnowFillStyle,
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub stroke_style: SnowStrokeStyle,
+    pub stroke_rendering_style: SnowStrokeRenderingStyle,
+    pub corner_radii: SnowCornerRadii,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnowShapeKind {
+    Rectangle = 0,
+    Arrow = 1,
+    Line = 2,
+    FreeDraw = 3,
+    RectangleHighlight = 4,
+    PenHighlight = 5,
+    Spotlight = 6,
+    SpeechBubble = 7,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowArrowStyle {
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub start_arrowhead: SnowArrowhead,
+    pub end_arrowhead: SnowArrowhead,
+    pub stroke_style: SnowStrokeStyle,
+    pub stroke_rendering_style: SnowStrokeRenderingStyle,
+    pub arrow_type: SnowArrowType,
+    pub arrow_shaft_type: SnowArrowShaftType,
+    pub arrow_ratio: f64,
+    pub reserved0: [u8; 4],
+    pub arrow_outline_color: SnowColorRgba8,
+    pub arrow_outline_width: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowTextStyle {
+    pub color: SnowColorRgba8,
+    pub font_size: f64,
+    pub fill: SnowColorRgba8,
+    pub fill_style: SnowFillStyle,
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub corner_radii: SnowCornerRadii,
+    pub horizontal_align: SnowTextHorizontalAlign,
+    pub vertical_align: SnowTextVerticalAlign,
+    pub opacity: f64,
+    pub reserved0: [u8; 4],
+    pub font_family_utf8_len: u32,
+    pub font_family_truncated: u8,
+    pub bold: u8,
+    pub italic: u8,
+    pub reserved1: [u8; 1],
+    pub font_family_utf8: [std::ffi::c_char; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+}
+
+#[cfg(test)]
+mod spotlight_abi_tests {
+    use super::*;
+
+    #[test]
+    fn spotlight_values_are_append_only_and_config_layout_is_stable() {
+        assert_eq!(SnowActiveTool::PenFilter as i32, 12);
+        assert_eq!(SnowActiveTool::Spotlight as i32, 13);
+        assert_eq!(SnowStyleToolbarSource::SelectedPenFilter as i32, 21);
+        assert_eq!(SnowStyleToolbarSource::DefaultSpotlight as i32, 22);
+        assert_eq!(SnowStyleToolbarSource::SelectedSpotlight as i32, 23);
+        assert_eq!(SnowShapeKind::PenHighlight as i32, 5);
+        assert_eq!(SnowShapeKind::Spotlight as i32, 6);
+        assert_eq!(std::mem::size_of::<SnowSpotlightConfig>(), 16);
+        assert_eq!(std::mem::offset_of!(SnowSpotlightConfig, color), 0);
+        assert_eq!(std::mem::offset_of!(SnowSpotlightConfig, opacity), 8);
+        assert_eq!(std::mem::size_of::<SnowSpotlightCutout>(), 80);
+        assert_eq!(std::mem::offset_of!(SnowSpotlightCutout, corner_radii), 48);
+        assert_eq!(std::mem::offset_of!(SnowSpotlightCutout, rotation), 32);
+        assert_eq!(std::mem::offset_of!(SnowSpotlightCutout, shape), 40);
+        assert_eq!(SnowSerialNumberType::OutlinedCircle as i32, 0);
+        assert_eq!(SnowSerialNumberType::SolidCircle as i32, 1);
+        assert_eq!(SnowSerialNumberType::OutlinedSquare as i32, 2);
+        assert_eq!(SnowSerialNumberType::SolidSquare as i32, 3);
+        assert_eq!(SnowSerialNumberType::Circle as i32, 4);
+        assert_eq!(std::mem::size_of::<SnowSerialNumberStyle>(), 208);
+        assert_eq!(
+            std::mem::offset_of!(SnowSerialNumberStyle, stroke_rendering_style),
+            200
+        );
+        assert_eq!(std::mem::align_of::<SnowSerialNumberStyle>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(SnowSerialNumberStyle, numeric_type),
+            196
+        );
+        assert_eq!(SnowSerialNumberNumericType::Arabic as i32, 0);
+        assert_eq!(SnowSerialNumberNumericType::Chinese as i32, 4);
+        assert_eq!(
+            std::mem::offset_of!(SnowSerialNumberStyle, serial_number_type),
+            56
+        );
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowSerialNumberStyle {
+    pub number: i64,
+    pub color: SnowColorRgba8,
+    pub fill: SnowColorRgba8,
+    pub fill_style: SnowFillStyle,
+    pub font_size: f64,
+    pub stroke_width: f64,
+    pub stroke_style: SnowStrokeStyle,
+    pub opacity: f64,
+    pub serial_number_type: SnowSerialNumberType,
+    pub font_family_utf8_len: u32,
+    pub font_family_truncated: u8,
+    pub reserved1: [u8; 3],
+    pub font_family_utf8: [std::ffi::c_char; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+    pub numeric_type: SnowSerialNumberNumericType,
+    pub stroke_rendering_style: SnowStrokeRenderingStyle,
+}
+
+snow_c_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum SnowMagnifierConnectionType {
+        None = 0,
+        LeaderLine = 1,
+        #[default]
+        Gradient = 2,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowMagnifierStyle {
+    pub shape: SnowRectangleShape,
+    pub stroke: SnowColorRgba8,
+    pub stroke_width: f64,
+    pub factor: f64,
+    pub connection_type: SnowMagnifierConnectionType,
+    pub source_outline: u8,
+    pub reserved: [u8; 3],
+    pub leader_arrowhead: SnowArrowhead,
+    pub corner_radii: SnowCornerRadii,
+    pub arrow_ratio: f64,
+}
+impl Default for SnowMagnifierStyle {
+    fn default() -> Self {
+        snow_draw_engine::MagnifierStyle::default().into()
+    }
+}
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_SHAPE: u32 = 1;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_STROKE: u32 = 2;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_STROKE_WIDTH: u32 = 4;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_FACTOR: u32 = 8;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_CONNECTION_TYPE: u32 = 16;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_LEADER_ARROWHEAD: u32 = 32;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_CORNER_RADII: u32 = 64;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_ARROW_RATIO: u32 = 128;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_SOURCE_OUTLINE: u32 = 256;
+pub const SNOW_MAGNIFIER_STYLE_PROPERTY_ALL: u32 = 511;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowStyleToolbarState {
+    pub source: SnowStyleToolbarSource,
+    pub selected_element_count: u32,
+    pub shape_style: SnowShapeStyle,
+    pub text_style: SnowTextStyle,
+    pub serial_number_style: SnowSerialNumberStyle,
+    pub text_style_mixed: u32,
+    pub serial_number_style_mixed: u32,
+    pub shape_style_mixed: u32,
+    pub filter_style: SnowFilterStyle,
+    pub filter_style_mixed: u32,
+    pub brush_eraser_style: SnowBrushEraserStyle,
+    pub distance_style: SnowDistanceStyle,
+    pub distance_style_mixed: u32,
+    pub angle_style: SnowAngleStyle,
+    pub bracket_style: SnowBracketStyle,
+    pub angle_style_mixed: u32,
+    pub bracket_style_mixed: u32,
+    pub distance_measured_length: f64,
+    pub magnifier_style: SnowMagnifierStyle,
+    pub magnifier_style_mixed: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowStyleDefaults {
+    pub rectangle: SnowShapeStyle,
+    pub arrow: SnowShapeStyle,
+    pub line: SnowShapeStyle,
+    pub free_draw: SnowShapeStyle,
+    pub rectangle_highlight: SnowShapeStyle,
+    pub pen_highlight: SnowShapeStyle,
+    pub rectangle_filter: SnowFilterStyle,
+    pub pen_filter: SnowFilterStyle,
+    pub text: SnowTextStyle,
+    pub serial_number: SnowSerialNumberStyle,
+    pub watermark: SnowWatermarkConfig,
+    pub spotlight: SnowSpotlightConfig,
+    pub brush_eraser: SnowBrushEraserStyle,
+    pub spotlight_shape: SnowRectangleShape,
+    pub distance: SnowDistanceStyle,
+    pub angle: SnowAngleStyle,
+    pub bracket: SnowBracketStyle,
+    pub spotlight_corner_radii: SnowCornerRadii,
+    pub magnifier: SnowMagnifierStyle,
+    pub speech_bubble: SnowShapeStyle,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowRuntimeConfig {
+    pub style_defaults: *const SnowStyleDefaults,
+}
+
+impl Default for SnowRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            style_defaults: std::ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SnowSerialNumberToolbarState {
+    pub visible: u8,
+    pub can_decrease: u8,
+    pub can_increase: u8,
+    pub can_create_text: u8,
+    pub reserved0: [u8; 4],
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnowHistoryState {
+    pub can_undo: u8,
+    pub can_redo: u8,
+    pub reserved0: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnowModifiers {
+    pub ctrl: u8,
+    pub shift: u8,
+    pub alt: u8,
+    pub meta: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowSnapConfig {
+    pub enabled: u8,
+    pub enable_point_snaps: u8,
+    pub enable_gap_snaps: u8,
+    pub show_guides: u8,
+    pub show_gap_size: u8,
+    pub reserved0: [u8; 3],
+    pub distance: f64,
+    pub line_color: SnowColorRgba8,
+    pub line_width: f64,
+    pub marker_size: f64,
+    pub gap_dash_length: f64,
+    pub gap_dash_gap: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowGridConfig {
+    pub enabled: u8,
+    pub reserved0: [u8; 7],
+    pub size: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowEngineConfig {
+    pub min_zoom: f64,
+    pub max_zoom: f64,
+    pub zoom_focus: SnowZoomFocus,
+    pub wheel_zoom_sensitivity: f64,
+    pub clear_color: SnowColorRgba8,
+    pub snap: SnowSnapConfig,
+    pub grid: SnowGridConfig,
+    pub enable_pointer_capture: u8,
+    pub reserved: [u8; 7],
+}
+
+impl Default for SnowSnapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            enable_point_snaps: 1,
+            enable_gap_snaps: 1,
+            show_guides: 1,
+            show_gap_size: 0,
+            reserved0: [0; 3],
+            distance: 8.0,
+            line_color: SnowColorRgba8 {
+                r: 255,
+                g: 107,
+                b: 107,
+                a: 255,
+            },
+            line_width: 1.0,
+            marker_size: 8.0,
+            gap_dash_length: 4.0,
+            gap_dash_gap: 4.0,
+        }
+    }
+}
+
+impl Default for SnowShapeStyle {
+    fn default() -> Self {
+        Self {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color().into(),
+            arrow_outline_width: 0.0,
+            stroke_rendering_style: SnowStrokeRenderingStyle::Architect,
+
+            fill: SnowColorRgba8::default(),
+            stroke: SnowColorRgba8::default(),
+            stroke_width: 0.0,
+            corner_radii: SnowCornerRadii::default(),
+            start_arrowhead: SnowArrowhead::None,
+            end_arrowhead: SnowArrowhead::None,
+            stroke_style: SnowStrokeStyle::Solid,
+            arrow_type: SnowArrowType::Straight,
+            arrow_shaft_type: SnowArrowShaftType::Plain,
+            arrow_ratio: 1.0,
+            fill_style: SnowFillStyle::Solid,
+            opacity: 1.0,
+            highlight_shape: SnowHighlightShape::Rectangle,
+            shape: SnowRectangleShape::Rectangle,
+            brush_mode: SnowBrushMode::Regular,
+        }
+    }
+}
+
+impl Default for SnowRectangleShapeStyle {
+    fn default() -> Self {
+        Self {
+            stroke_rendering_style: SnowStrokeRenderingStyle::Architect,
+
+            fill: SnowColorRgba8::default(),
+            fill_style: SnowFillStyle::Solid,
+            stroke: SnowColorRgba8::default(),
+            stroke_width: 0.0,
+            stroke_style: SnowStrokeStyle::Solid,
+            corner_radii: SnowCornerRadii::default(),
+        }
+    }
+}
+
+impl Default for SnowArrowStyle {
+    fn default() -> Self {
+        Self {
+            arrow_outline_color: snow_draw_engine_core::arrow::default_arrow_outline_color().into(),
+            arrow_outline_width: 0.0,
+            stroke_rendering_style: SnowStrokeRenderingStyle::Architect,
+
+            stroke: SnowColorRgba8::default(),
+            stroke_width: 0.0,
+            start_arrowhead: SnowArrowhead::None,
+            end_arrowhead: SnowArrowhead::None,
+            stroke_style: SnowStrokeStyle::Solid,
+            arrow_type: SnowArrowType::Straight,
+            arrow_shaft_type: SnowArrowShaftType::Plain,
+            arrow_ratio: 1.0,
+            reserved0: [0; 4],
+        }
+    }
+}
+
+impl Default for SnowTextStyle {
+    fn default() -> Self {
+        Self {
+            color: SnowColorRgba8::default(),
+            font_size: 0.0,
+            fill: SnowColorRgba8::default(),
+            fill_style: SnowFillStyle::Solid,
+            stroke: SnowColorRgba8::default(),
+            stroke_width: 0.0,
+            corner_radii: SnowCornerRadii::default(),
+            horizontal_align: SnowTextHorizontalAlign::Left,
+            vertical_align: SnowTextVerticalAlign::Center,
+            opacity: 1.0,
+            reserved0: [0; 4],
+            font_family_utf8_len: 0,
+            font_family_truncated: 0,
+            bold: 0,
+            italic: 0,
+            reserved1: [0; 1],
+            font_family_utf8: [0; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+        }
+    }
+}
+
+impl Default for SnowSerialNumberStyle {
+    fn default() -> Self {
+        Self {
+            stroke_rendering_style: SnowStrokeRenderingStyle::Architect,
+            number: 0,
+            color: SnowColorRgba8::default(),
+            fill: SnowColorRgba8::default(),
+            fill_style: SnowFillStyle::Solid,
+            font_size: 0.0,
+            stroke_width: 0.0,
+            stroke_style: SnowStrokeStyle::Solid,
+            opacity: 1.0,
+            serial_number_type: SnowSerialNumberType::OutlinedCircle,
+            numeric_type: SnowSerialNumberNumericType::Arabic,
+            font_family_utf8_len: 0,
+            font_family_truncated: 0,
+            reserved1: [0; 3],
+            font_family_utf8: [0; SNOW_FONT_FAMILY_UTF8_CAPACITY],
+        }
+    }
+}
+
+impl Default for SnowGridConfig {
+    fn default() -> Self {
+        Self {
+            enabled: 0,
+            reserved0: [0; 7],
+            size: 20.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnowBrushEraserStyle {
+    pub stroke_width: f64,
+}
+
+impl Default for SnowBrushEraserStyle {
+    fn default() -> Self {
+        Self { stroke_width: 30.0 }
+    }
+}
+
+pub const SNOW_BRUSH_ERASER_STYLE_PROPERTY_STROKE_WIDTH: u32 = 1 << 0;

@@ -1,0 +1,674 @@
+#include "snow_shot/platform/windowcaptureexclusion.h"
+#include "snow_shot/presentation/screenshotoverlaycoordinator.h"
+
+#include "snow_shot/presentation/screenshotdisplaysession.h"
+#include "snow_shot/presentation/screenshotcolorpickerwindow.h"
+#include "snow_shot/presentation/screenshotgeometry.h"
+#include "snow_shot/presentation/screenshottoolbarwindow.h"
+#include "snow_shot/presentation/screenshotoverlayeventsink.h"
+#include "snow_shot/presentation/screenshotoverlaywindow.h"
+#include "snow_draw_engine_qt/snow_canvas_widget.h"
+#include "../pinned/screenshotpintoperfinstrumentation.h"
+
+#include <QGuiApplication>
+#include <QScreen>
+#include <QWidget>
+
+#include <algorithm>
+#include <limits>
+
+ScreenshotOverlayCoordinator::ScreenshotOverlayCoordinator(
+    ScreenshotOverlayEventSink& eventSink, SnowCanvasRuntime& canvasRuntime,
+    snow_shot::presentation::WindowShortcutManager& shortcutManager)
+    : m_overlayPool(
+          eventSink, canvasRuntime, shortcutManager,
+          ScreenshotOverlayPoolCallbacks{
+              [this](ScreenshotOverlayWindow* overlay) { detachOverlayTransientUi(overlay); },
+              [this](ScreenshotOverlayWindow* overlay) { clearOverlayCanvas(overlay); },
+          }),
+      m_canvasPresenter([this](ScreenshotOverlayWindow* overlay) {
+          return m_overlayPool.ensureOverlay(overlay);
+      }) {}
+
+ScreenshotOverlayCoordinator::~ScreenshotOverlayCoordinator() {
+    destroyUiResources();
+}
+
+void ScreenshotOverlayCoordinator::setToolbarCommandSinks(
+    ScreenshotToolbarCommandSink& toolbarCommands,
+    ScreenshotSelectionToolbarCommandSink& selectionToolbarCommands) {
+    m_uiHost.setToolbarCommandSinks(toolbarCommands, selectionToolbarCommands);
+}
+
+void ScreenshotOverlayCoordinator::prewarmDisplayPool(ScreenshotDisplaySession& displaySession,
+                                                      int displayCount) {
+    m_overlayPool.prewarmDisplayPool(displaySession, displayCount);
+}
+
+void ScreenshotOverlayCoordinator::clearOverlayCanvas(ScreenshotOverlayWindow* overlay) const {
+    if (overlay != nullptr) {
+        overlay->setScrollingCaptureMode(false);
+    }
+    m_canvasPresenter.clearOverlayCanvas(overlay);
+    m_uiHost.hideColorPickerForOverlay(overlay);
+}
+
+void ScreenshotOverlayCoordinator::detachOverlayTransientUi(ScreenshotOverlayWindow* overlay) {
+    m_uiHost.detachOverlayTransientUi(overlay);
+}
+
+void ScreenshotOverlayCoordinator::clearOverlayCanvases(
+    const ScreenshotDisplaySession& displaySession) const {
+    m_overlayPool.clearOverlayCanvases(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::clearDisplays(ScreenshotDisplaySession& displaySession) {
+    m_overlayPool.clearDisplays(displaySession);
+    m_uiHost.resetColorPickerForNewCapture();
+}
+
+void ScreenshotOverlayCoordinator::destroyDisplayPool(ScreenshotDisplaySession& displaySession) {
+    m_overlayPool.destroyDisplayPool(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::resetForNewCapture(ScreenshotDisplaySession& displaySession) {
+    flushDeferredOverlayMaintenance(displaySession);
+    m_overlayPool.resetForNewCapture(displaySession);
+    m_uiHost.resetColorPickerForNewCapture();
+    m_uiHost.hideShortcutHints();
+
+    resetToolbarForNewCapture();
+}
+
+void ScreenshotOverlayCoordinator::prepareDisplayModels(ScreenshotDisplaySession& displaySession) {
+    m_canvasPresenter.prepareDisplayModels(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::prepareOverlayBackingStores(
+    const ScreenshotDisplaySession& displaySession) {
+    displaySession.forEachActiveOverlay(
+        [](qsizetype, const CapturedDisplayModel&, ScreenshotOverlayWindow* overlay) {
+            overlay->prepareBackingStore();
+        });
+}
+
+void ScreenshotOverlayCoordinator::applyDisplayModels(ScreenshotDisplaySession& displaySession) {
+    // Acquisition has finished. Let image attachment and the first complete frame
+    // take priority over any queued page preparation, even if selection is pending.
+    displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr)
+            overlay->cancelBackingStorePreparation();
+    });
+    m_canvasPresenter.applyDisplayModels(displaySession);
+    ++m_presentationRevision;
+}
+
+bool ScreenshotOverlayCoordinator::preparePreCaptureOverlayWindows(
+    ScreenshotDisplaySession& displaySession) {
+    const QList<QScreen*> screens = QGuiApplication::screens();
+    if (screens.isEmpty()) {
+        return false;
+    }
+
+    const qsizetype screenCount = screens.size();
+    const int prewarmCount = screenCount > std::numeric_limits<int>::max()
+                                 ? std::numeric_limits<int>::max()
+                                 : static_cast<int>(screenCount);
+    m_overlayPool.prewarmDisplayPool(displaySession, prewarmCount);
+    for (qsizetype index = 0; index < displaySession.size(); ++index) {
+        CapturedDisplayModel& display = displaySession.displayAt(index);
+        if (index >= screenCount) {
+            display.active = false;
+            continue;
+        }
+
+        QScreen* screen = screens.at(index);
+        if (screen == nullptr) {
+            display.active = false;
+            continue;
+        }
+
+        display = ScreenshotGeometryMapper::preCaptureDisplayModel(*screen);
+
+        ScreenshotOverlayWindow* overlay =
+            displaySession.ensureOverlayAt(index, [this](ScreenshotOverlayWindow* existingOverlay) {
+                return m_overlayPool.ensureOverlay(existingOverlay);
+            });
+        if (overlay == nullptr) {
+            continue;
+        }
+        if (overlay->screen() != screen) {
+            overlay->setScreen(screen);
+        }
+        overlay->setCaptureGeometry(display.logicalRect);
+        overlay->setCanvasClearBackgroundEnabled(false);
+        overlay->setScreenshotMaskVisible(true);
+    }
+
+    return true;
+}
+
+void ScreenshotOverlayCoordinator::showOverlayWindows(
+    const ScreenshotDisplaySession& displaySession, ScreenshotOverlayShowMode mode) {
+    flushDeferredOverlayMaintenance(displaySession);
+    m_canvasPresenter.showOverlayWindows(displaySession, mode);
+}
+
+void ScreenshotOverlayCoordinator::hideOverlayWindowsImmediately(
+    const ScreenshotDisplaySession& displaySession) {
+    // Detach the compositor frame before the first hide. Renderer/backing-store
+    // destruction can wait for export, but a hidden native window can retain its
+    // last presented frame even after the deferred maintenance pass destroys it.
+    m_uiHost.hideToolbar();
+    m_uiHost.hideShortcutHints();
+    SNOW_SHOT_PIN_PERF_MILESTONE("overlay.toolbar_hidden");
+    displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay == nullptr) {
+            return;
+        }
+        overlay->hideForNativeSurfaceRelease();
+    });
+    m_overlayMaintenancePending = true;
+    SNOW_SHOT_PIN_PERF_MILESTONE("overlay.overlays_hidden");
+}
+
+void ScreenshotOverlayCoordinator::hideOverlayWindows(
+    const ScreenshotDisplaySession& displaySession) {
+    // The full hide is used once an active export has settled. Clear each
+    // overlay's render state, then synchronously retire its native surface and
+    // desktop-sized backing store. The pooled QWidget graph remains reusable.
+    if (m_overlayMaintenancePending) {
+        flushDeferredOverlayMaintenance(displaySession);
+        return;
+    }
+
+    m_uiHost.resetToolbarForNewCapture();
+    m_uiHost.hideToolbar();
+    m_uiHost.hideShortcutHints();
+    displaySession.forEachOverlay([this](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay == nullptr) {
+            return;
+        }
+        overlay->setCanvasClearBackgroundEnabled(false);
+        m_canvasPresenter.clearOverlayCanvas(overlay);
+        overlay->releaseNativeSurface();
+    });
+    m_uiHost.releaseToolbarNativeSurface();
+    m_overlayMaintenancePending = false;
+}
+
+void ScreenshotOverlayCoordinator::flushDeferredOverlayMaintenance(
+    const ScreenshotDisplaySession& displaySession) {
+    if (!m_overlayMaintenancePending) {
+        return;
+    }
+    displaySession.forEachOverlay([this](qsizetype, ScreenshotOverlayWindow* overlay) {
+        m_canvasPresenter.clearOverlayCanvas(overlay);
+        overlay->releaseNativeSurface();
+    });
+    m_uiHost.resetToolbarForNewCapture();
+    m_uiHost.releaseToolbarNativeSurface();
+    m_overlayMaintenancePending = false;
+}
+
+void ScreenshotOverlayCoordinator::updateOverlayState(
+    const ScreenshotDisplaySession& displaySession,
+    const ScreenshotSelectionVisualState& selectionState, bool intelligentSelecting,
+    bool manualSelecting, bool dragging, bool updateCursors) {
+    m_canvasPresenter.updateOverlayState(displaySession, selectionState, intelligentSelecting,
+                                         manualSelecting, dragging, updateCursors);
+}
+
+void ScreenshotOverlayCoordinator::setScrollingCaptureMode(
+    const ScreenshotDisplaySession& displaySession, bool enabled) {
+    displaySession.forEachActiveOverlay(
+        [enabled](qsizetype, const CapturedDisplayModel&, ScreenshotOverlayWindow* overlay) {
+            if (overlay == nullptr) {
+                return;
+            }
+            SnowCanvasWidget* canvas = overlay->canvas();
+            if (enabled) {
+                if (canvas != nullptr) {
+                    canvas->clearCursorForLayer(SnowCanvasCursorLayer::Host);
+                }
+                overlay->setScrollingCaptureMode(true);
+                return;
+            }
+
+            overlay->setScrollingCaptureMode(false);
+        });
+}
+
+void ScreenshotOverlayCoordinator::setScrollingResultPreview(
+    const ScreenshotDisplaySession& displaySession, const QImage& image, const QRectF& canvasRect,
+    std::optional<Qt::Orientation> cropGuide) {
+    const QRectF selection = canvasRect.normalized();
+    if (image.isNull() || !selection.isValid() || selection.isEmpty()) {
+        clearScrollingResultPreview(displaySession);
+        return;
+    }
+    ScreenshotOverlayWindow* statusOwner = nullptr;
+    bool foundBottomLeftOwner = false;
+    const QPointF bottomLeft(selection.left() + std::min(qreal(0.5), selection.width() / 2),
+                             selection.bottom() - std::min(qreal(0.5), selection.height() / 2));
+    displaySession.forEachActiveOverlay(
+        [&](qsizetype, const CapturedDisplayModel& display, ScreenshotOverlayWindow* overlay) {
+            const QRectF displayRect = ScreenshotGeometryMapper::displayCanvasRect(display);
+            if (overlay == nullptr || !selection.intersects(displayRect)) {
+                return;
+            }
+            if (statusOwner == nullptr) {
+                statusOwner = overlay;
+            }
+            if (!foundBottomLeftOwner && displayRect.contains(bottomLeft)) {
+                statusOwner = overlay;
+                foundBottomLeftOwner = true;
+            }
+        });
+    displaySession.forEachActiveOverlay([&](qsizetype, const CapturedDisplayModel& display,
+                                            ScreenshotOverlayWindow* overlay) {
+        if (overlay == nullptr) {
+            return;
+        }
+        if (selection.intersects(ScreenshotGeometryMapper::displayCanvasRect(display))) {
+            overlay->setScrollingResultPreview(image, selection, overlay == statusOwner, cropGuide);
+        } else {
+            overlay->clearScrollingResultPreview();
+        }
+    });
+}
+
+void ScreenshotOverlayCoordinator::clearScrollingResultPreview(
+    const ScreenshotDisplaySession& displaySession) {
+    displaySession.forEachOverlay([](qsizetype, ScreenshotOverlayWindow* overlay) {
+        if (overlay != nullptr) {
+            overlay->clearScrollingResultPreview();
+        }
+    });
+}
+
+void ScreenshotOverlayCoordinator::updateOverlayCursors(
+    const ScreenshotDisplaySession& displaySession, bool selecting, bool dragging) const {
+    m_canvasPresenter.updateOverlayCursors(displaySession, selecting, dragging);
+}
+
+void ScreenshotOverlayCoordinator::setSelectionBorderColor(
+    const ScreenshotDisplaySession& displaySession, const QColor& color) const {
+    displaySession.forEachOverlay([&color](qsizetype, ScreenshotOverlayWindow* overlay) {
+        overlay->setScreenshotSelectionBorderColor(color);
+    });
+}
+
+void ScreenshotOverlayCoordinator::setSelectionMaskColor(
+    const ScreenshotDisplaySession& displaySession, const QColor& color) const {
+    displaySession.forEachOverlay([&color](qsizetype, ScreenshotOverlayWindow* overlay) {
+        overlay->setScreenshotMaskColor(color);
+    });
+}
+
+void ScreenshotOverlayCoordinator::updateGuideLines(const ScreenshotDisplaySession& displaySession,
+                                                    ScreenshotOverlayWindow* owner,
+                                                    const QPointF& localPosition, bool selecting,
+                                                    const QColor& cursorColor,
+                                                    const QColor& monitorCenterColor,
+                                                    const QColor& selectionCenterColor) const {
+    m_canvasPresenter.updateGuideLines(displaySession, owner, localPosition, selecting, cursorColor,
+                                       monitorCenterColor, selectionCenterColor);
+}
+
+void ScreenshotOverlayCoordinator::updateGuideLinesAtGlobalPosition(
+    const ScreenshotDisplaySession& displaySession, const QPoint& globalPosition, bool selecting,
+    const QColor& cursorColor, const QColor& monitorCenterColor,
+    const QColor& selectionCenterColor) const {
+    m_canvasPresenter.updateGuideLinesAtGlobalPosition(displaySession, globalPosition, selecting,
+                                                       cursorColor, monitorCenterColor,
+                                                       selectionCenterColor);
+}
+
+void ScreenshotOverlayCoordinator::clearGuideLines(
+    const ScreenshotDisplaySession& displaySession) const {
+    m_canvasPresenter.clearGuideLines(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::setOverlayCursor(ScreenshotOverlayWindow* overlay,
+                                                    ScreenshotSelectionDragMode dragMode) const {
+    m_canvasPresenter.setOverlayCursor(overlay, dragMode);
+}
+
+void ScreenshotOverlayCoordinator::setCanvasInteractionEnabled(
+    const ScreenshotDisplaySession& displaySession, bool enabled) const {
+    m_canvasPresenter.setCanvasInteractionEnabled(displaySession, enabled);
+}
+
+void ScreenshotOverlayCoordinator::setCanvasTool(const ScreenshotDisplaySession& displaySession,
+                                                 SnowCanvasTool tool) {
+    m_canvasPresenter.setCanvasTool(displaySession, tool);
+}
+
+void ScreenshotOverlayCoordinator::refreshCanvasCreationStyles(
+    const ScreenshotDisplaySession& displaySession, const SnowCanvasStyleDefaults& defaults) const {
+    m_canvasPresenter.refreshCanvasCreationStyles(displaySession, defaults);
+    if (ScreenshotToolbarWindow* toolbarWindow = toolbar()) {
+        if (ScreenshotToolPalette* palette = toolbarWindow->palette()) {
+            palette->setCreationStyleDefaults(defaults);
+        }
+    }
+}
+
+bool ScreenshotOverlayCoordinator::resetEditingState(
+    const ScreenshotDisplaySession& displaySession) const {
+    return m_canvasPresenter.resetEditingState(displaySession);
+}
+
+bool ScreenshotOverlayCoordinator::tryCurrentRectangleStyle(
+    const ScreenshotDisplaySession& displaySession, SnowCanvasShapeStyle* outStyle) const {
+    return m_canvasPresenter.tryCurrentRectangleStyle(displaySession, outStyle);
+}
+
+SnowCanvasShapeStyle ScreenshotOverlayCoordinator::currentRectangleStyle(
+    const ScreenshotDisplaySession& displaySession) const {
+    return m_canvasPresenter.currentRectangleStyle(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::setShapeStylePatch(
+    const ScreenshotDisplaySession& displaySession, const SnowCanvasShapeStyle& style,
+    quint32 properties, SnowCanvasShapeKind kind) {
+    m_canvasPresenter.setShapeStylePatch(displaySession, style, properties, kind);
+}
+
+void ScreenshotOverlayCoordinator::setFilterStyle(const ScreenshotDisplaySession& displaySession,
+                                                  const SnowCanvasFilterStyle& style,
+                                                  quint32 properties) {
+    m_canvasPresenter.setFilterStyle(displaySession, style, properties);
+}
+
+void ScreenshotOverlayCoordinator::setWatermarkConfig(
+    const ScreenshotDisplaySession& displaySession, const SnowCanvasWatermarkConfig& config) {
+    m_canvasPresenter.setWatermarkConfig(displaySession, config);
+}
+
+void ScreenshotOverlayCoordinator::previewWatermarkConfig(
+    const ScreenshotDisplaySession& displaySession, const SnowCanvasWatermarkConfig& config) {
+    m_canvasPresenter.previewWatermarkConfig(displaySession, config);
+}
+
+void ScreenshotOverlayCoordinator::setTextStyle(const ScreenshotDisplaySession& displaySession,
+                                                const SnowCanvasTextStyle& style,
+                                                quint32 properties) {
+    m_canvasPresenter.setTextStyle(displaySession, style, properties);
+}
+
+void ScreenshotOverlayCoordinator::setSerialNumberStyle(
+    const ScreenshotDisplaySession& displaySession, const SnowCanvasSerialNumberStyle& style,
+    std::optional<quint32> properties) {
+    m_canvasPresenter.setSerialNumberStyle(displaySession, style, properties);
+}
+
+void ScreenshotOverlayCoordinator::adjustSelectedSerialNumbers(
+    const ScreenshotDisplaySession& displaySession, qint64 delta) {
+    m_canvasPresenter.adjustSelectedSerialNumbers(displaySession, delta);
+}
+
+void ScreenshotOverlayCoordinator::createTextForSelectedSerialNumber(
+    const ScreenshotDisplaySession& displaySession) {
+    m_canvasPresenter.createTextForSelectedSerialNumber(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::reorderSelectedElements(
+    const ScreenshotDisplaySession& displaySession, SnowCanvasSelectionOrder order) {
+    m_canvasPresenter.reorderSelectedElements(displaySession, order);
+}
+
+void ScreenshotOverlayCoordinator::alignSelectedElements(
+    const ScreenshotDisplaySession& displaySession, SnowCanvasSelectionAlignment alignment) {
+    m_canvasPresenter.alignSelectedElements(displaySession, alignment);
+}
+
+void ScreenshotOverlayCoordinator::setSelectedElementsOpacity(
+    const ScreenshotDisplaySession& displaySession, qreal opacity) {
+    m_canvasPresenter.setSelectedElementsOpacity(displaySession, opacity);
+}
+
+void ScreenshotOverlayCoordinator::duplicateSelectedElements(
+    const ScreenshotDisplaySession& displaySession) {
+    m_canvasPresenter.duplicateSelectedElements(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::deleteSelectedElements(
+    const ScreenshotDisplaySession& displaySession) {
+    m_canvasPresenter.deleteSelectedElements(displaySession);
+}
+
+void ScreenshotOverlayCoordinator::deleteAllElements(
+    const ScreenshotDisplaySession& displaySession) {
+    m_canvasPresenter.deleteAllElements(displaySession);
+}
+
+ScreenshotToolbarWindow* ScreenshotOverlayCoordinator::ensureToolbar() {
+    return m_uiHost.ensureToolbar();
+}
+
+void ScreenshotOverlayCoordinator::setSpotlightConfig(ScreenshotDisplaySession& displaySession,
+                                                      const SnowCanvasSpotlightConfig& config) {
+    m_canvasPresenter.setSpotlightConfig(displaySession, config);
+}
+
+void ScreenshotOverlayCoordinator::previewSpotlightConfig(ScreenshotDisplaySession& displaySession,
+                                                          const SnowCanvasSpotlightConfig& config) {
+    m_canvasPresenter.previewSpotlightConfig(displaySession, config);
+}
+
+ScreenshotToolbarWindow* ScreenshotOverlayCoordinator::toolbar() const {
+    return m_uiHost.toolbar();
+}
+
+void ScreenshotOverlayCoordinator::attachToolbarToOverlay(ScreenshotOverlayWindow* overlay) {
+    m_uiHost.attachToolbarToOverlay(overlay);
+}
+
+void ScreenshotOverlayCoordinator::prewarmToolbarSurface(
+    const ScreenshotDisplaySession& displaySession) {
+    ScreenshotOverlayWindow* ownerOverlay = displaySession.firstActiveOverlay();
+    if (ownerOverlay == nullptr || m_uiHost.ensureToolbar() == nullptr) {
+        return;
+    }
+
+    // The editing toolbar is first needed when a region is confirmed, but its
+    // widget graph, native surface, and layout are expensive on that reveal.
+    // Build them against a pooled overlay while the capture worker is still
+    // acquiring the frame; the toolbar stays hidden until the presenter shows
+    // it, and moveToolbar re-attaches it to the selection's overlay later.
+    m_uiHost.attachToolbarToOverlay(ownerOverlay);
+    if (ScreenshotToolbarWindow* toolbar = m_uiHost.toolbar()) {
+        toolbar->prepareForDisplay();
+    }
+}
+
+void ScreenshotOverlayCoordinator::undoCanvasEdit() {
+    m_uiHost.undoCanvasEdit();
+}
+
+void ScreenshotOverlayCoordinator::redoCanvasEdit() {
+    m_uiHost.redoCanvasEdit();
+}
+
+ScreenshotColorPickerWindow* ScreenshotOverlayCoordinator::colorPicker() const {
+    return m_uiHost.colorPicker();
+}
+
+void ScreenshotOverlayCoordinator::sampleColorPicker(const QImage& image, const QRect& physicalRect,
+                                                     const QPoint& physicalPoint,
+                                                     const QImage& cursorPatch,
+                                                     const QRect& cursorPixelRect) {
+    m_uiHost.sampleColorPicker(image, physicalRect, physicalPoint, cursorPatch, cursorPixelRect);
+}
+
+void ScreenshotOverlayCoordinator::updateColorPicker(
+    ScreenshotOverlayWindow* overlay, const QImage& image, const QRect& physicalRect,
+    const QPoint& physicalPoint, const QPointF& localPosition,
+    const ScreenshotCoordinateDisplayValues& displayValues, const QImage& cursorPatch,
+    const QRect& cursorPixelRect) {
+    m_uiHost.updateColorPicker(overlay, image, physicalRect, physicalPoint, localPosition,
+                               displayValues, cursorPatch, cursorPixelRect);
+}
+
+void ScreenshotOverlayCoordinator::hideColorPicker() {
+    m_uiHost.hideColorPicker();
+}
+
+void ScreenshotOverlayCoordinator::setColorPickerCenterGuideLineColor(const QColor& color) {
+    m_uiHost.setColorPickerCenterGuideLineColor(color);
+}
+
+void ScreenshotOverlayCoordinator::updateShortcutHints(ScreenshotOverlayWindow* overlay,
+                                                       const ScreenshotShortcutHintContext& context,
+                                                       qreal opacity, const QRectF& selectionGlobal,
+                                                       const QPoint& cursorPosition) {
+    m_uiHost.updateShortcutHints(overlay, context, opacity, selectionGlobal, cursorPosition);
+}
+
+void ScreenshotOverlayCoordinator::updateShortcutHintPointer(ScreenshotOverlayWindow* overlay,
+                                                             const QPoint& cursorPosition) {
+    m_uiHost.updateShortcutHintPointer(overlay, cursorPosition);
+}
+
+bool ScreenshotOverlayCoordinator::screenshotUiContainsGlobalPoint(const QPoint& position) const {
+    return m_uiHost.screenshotUiContainsGlobalPoint(position);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarStrokeWidth(int direction) {
+    return m_uiHost.stepToolbarStrokeWidth(direction);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarSelectionOpacity(int direction) {
+    return m_uiHost.stepToolbarSelectionOpacity(direction);
+}
+
+ScreenshotSelectionToolbarWidget* ScreenshotOverlayCoordinator::selectionToolbar() const {
+    return m_uiHost.selectionToolbar();
+}
+
+void ScreenshotOverlayCoordinator::attachSelectionToolbarToOverlay(
+    ScreenshotOverlayWindow* overlay) {
+    m_uiHost.attachSelectionToolbarToOverlay(overlay);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarSpotlightOpacity(int direction) {
+    return m_uiHost.stepToolbarSpotlightOpacity(direction);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarFilterIntensity(int direction) {
+    return m_uiHost.stepToolbarFilterIntensity(direction);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarPenFilterStrokeWidth(int direction) {
+    return m_uiHost.stepToolbarPenFilterStrokeWidth(direction);
+}
+
+bool ScreenshotOverlayCoordinator::stepToolbarWatermarkFontSize(int direction) {
+    return m_uiHost.stepToolbarWatermarkFontSize(direction);
+}
+
+void ScreenshotOverlayCoordinator::resetToolbarForNewCapture() {
+    m_uiHost.resetToolbarForNewCapture();
+}
+
+void ScreenshotOverlayCoordinator::hideToolbar() {
+    m_uiHost.hideToolbar();
+}
+
+void ScreenshotOverlayCoordinator::showToolbar() {
+    m_uiHost.showToolbar();
+}
+
+void ScreenshotOverlayCoordinator::hideSelectionToolbar() {
+    m_uiHost.hideSelectionToolbar();
+}
+
+void ScreenshotOverlayCoordinator::setSelectionToolbarHidden(bool hidden) {
+    m_uiHost.setSelectionToolbarHidden(hidden);
+}
+
+void ScreenshotOverlayCoordinator::showSelectionToolbar() {
+    m_uiHost.showSelectionToolbar();
+}
+
+void ScreenshotOverlayCoordinator::raiseSelectionToolbar() {
+    m_uiHost.raiseSelectionToolbar();
+}
+
+void ScreenshotOverlayCoordinator::destroyUiResources() {
+    m_uiHost.destroyUiResources();
+}
+
+QVector<QWidget*> ScreenshotOverlayCoordinator::visibleRecaptureWindows(
+    const ScreenshotDisplaySession& displaySession) const {
+    QVector<QWidget*> windows;
+    const auto appendVisible = [&windows](QWidget* window) {
+        if (window != nullptr && window->isVisible() && !windows.contains(window)) {
+            windows.push_back(window);
+        }
+    };
+    displaySession.forEachOverlay(
+        [&appendVisible](qsizetype, ScreenshotOverlayWindow* overlay) { appendVisible(overlay); });
+    appendVisible(m_uiHost.toolbar());
+    appendVisible(m_uiHost.colorPicker());
+    return windows;
+}
+
+QVector<std::uintptr_t>
+ScreenshotOverlayCoordinator::excludedHwnds(const ScreenshotDisplaySession& displaySession) const {
+    QVector<std::uintptr_t> hwnds;
+    hwnds.reserve(displaySession.size() + 2);
+
+    const auto appendWidgetHwnd = [&hwnds](QWidget* widget) {
+        if (widget == nullptr) {
+            return;
+        }
+        // Exclusion discovery must not rematerialize a toolbar or overlay whose
+        // native surface was deliberately retired at the end of a capture.
+        const WId id = widget->internalWinId();
+        if (id != 0) {
+#ifdef Q_OS_MACOS
+            if (const auto windowId = snow_shot::platform::captureWindowId(widget))
+                hwnds.push_back(*windowId);
+#else
+            hwnds.push_back(static_cast<std::uintptr_t>(id));
+#endif
+        }
+    };
+
+    displaySession.forEachOverlay([&appendWidgetHwnd](qsizetype, ScreenshotOverlayWindow* overlay) {
+        appendWidgetHwnd(overlay);
+    });
+    appendWidgetHwnd(m_uiHost.toolbar());
+    appendWidgetHwnd(m_uiHost.colorPicker());
+    return hwnds;
+}
+
+void ScreenshotOverlayCoordinator::createColorPicker(const QPoint& initialCursorGlobalPosition) {
+    m_colorPickerInitialCursorGlobalPosition = initialCursorGlobalPosition;
+    m_uiHost.createColorPicker();
+}
+
+void ScreenshotOverlayCoordinator::prepareColorPickerSurface(
+    const ScreenshotDisplaySession& displaySession) {
+    ScreenshotOverlayWindow* owner = displaySession.startupOverlay();
+    if (owner == nullptr) {
+        displaySession.forEachActiveOverlay(
+            [&](qsizetype, const CapturedDisplayModel& display, ScreenshotOverlayWindow* overlay) {
+                if (owner == nullptr &&
+                    display.logicalRect.contains(m_colorPickerInitialCursorGlobalPosition))
+                    owner = overlay;
+            });
+    }
+    // The invocation display may have disappeared during capture preparation.
+    if (owner == nullptr) {
+        owner = displaySession.firstActiveOverlay();
+    }
+    m_uiHost.prepareColorPickerSurface(owner);
+}
+
+void ScreenshotOverlayCoordinator::releaseColorPicker() {
+    m_uiHost.releaseColorPicker();
+}

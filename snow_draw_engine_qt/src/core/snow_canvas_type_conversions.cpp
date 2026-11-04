@@ -1,0 +1,1025 @@
+#include "snow_canvas_type_conversions.h"
+
+#include "snow_canvas_utf8.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iterator>
+#include <type_traits>
+
+namespace snow_canvas_types {
+namespace {
+
+std::uint8_t toFlag(bool value) {
+    return value ? 1 : 0;
+}
+
+bool fromFlag(std::uint8_t value) {
+    return value != 0;
+}
+
+QString fontFamilyFromEngine(const char* utf8, std::uint32_t length, std::uint32_t capacity) {
+    return snow_canvas_utf8::stringFromField(utf8, length, capacity);
+}
+
+void copyFontFamilyToEngine(const QString& fontFamily, char* target, std::uint32_t& length,
+                            std::uint8_t& truncated, std::uint32_t capacity) {
+    snow_canvas_utf8::copyStringToField(fontFamily.trimmed(), target, length, truncated, capacity);
+}
+
+template <typename Enum> bool enumInRange(Enum value, Enum first, Enum last) {
+    using Underlying = std::underlying_type_t<Enum>;
+    const Underlying raw = static_cast<Underlying>(value);
+    return raw >= static_cast<Underlying>(first) && raw <= static_cast<Underlying>(last);
+}
+
+bool validFillStyle(SnowCanvasFillStyle style) {
+    return enumInRange(style, SnowCanvasFillStyle::Line, SnowCanvasFillStyle::Border);
+}
+
+bool validShapeStyleEnums(const SnowCanvasShapeStyle& style) {
+    return validFillStyle(style.fillStyle) &&
+           enumInRange(style.startArrowhead, SnowCanvasArrowhead::None,
+                       SnowCanvasArrowhead::IndentedTriangle) &&
+           enumInRange(style.endArrowhead, SnowCanvasArrowhead::None,
+                       SnowCanvasArrowhead::IndentedTriangle) &&
+           enumInRange(style.strokeStyle, SnowCanvasStrokeStyle::Solid,
+                       SnowCanvasStrokeStyle::Dotted) &&
+           enumInRange(style.strokeRenderingStyle, SnowCanvasStrokeRenderingStyle::Architect,
+                       SnowCanvasStrokeRenderingStyle::Cartoonist) &&
+           enumInRange(style.arrowShaftType, SnowCanvasArrowShaftType::Plain,
+                       SnowCanvasArrowShaftType::Tapered) &&
+           enumInRange(style.arrowType, SnowCanvasArrowType::Straight,
+                       SnowCanvasArrowType::Elbow) &&
+           enumInRange(style.highlightShape, SnowCanvasHighlightShape::Rectangle,
+                       SnowCanvasHighlightShape::Ellipse) &&
+           enumInRange(style.shape, SnowCanvasRectangleShape::Rectangle,
+                       SnowCanvasRectangleShape::ThoughtBubble) &&
+           enumInRange(style.brushMode, SnowCanvasBrushMode::Regular,
+                       SnowCanvasBrushMode::PressureSensitive);
+}
+
+} // namespace
+
+QColor toQColor(const SnowColorRgba8& color) {
+    return QColor(color.r, color.g, color.b, color.a);
+}
+
+SnowColorRgba8 toEngineColor(const QColor& color) {
+    const QColor rgba = color.isValid() ? color.toRgb() : QColor(0, 0, 0, 0);
+    return SnowColorRgba8{
+        static_cast<std::uint8_t>(rgba.red()),
+        static_cast<std::uint8_t>(rgba.green()),
+        static_cast<std::uint8_t>(rgba.blue()),
+        static_cast<std::uint8_t>(rgba.alpha()),
+    };
+}
+
+SnowCanvasTool toCanvasTool(SnowActiveTool tool) {
+    switch (tool) {
+    case SNOW_ACTIVE_TOOL_SELECT:
+        return SnowCanvasTool::Select;
+    case SNOW_ACTIVE_TOOL_SHAPE:
+        return SnowCanvasTool::Shape;
+    case SNOW_ACTIVE_TOOL_ARROW:
+        return SnowCanvasTool::Arrow;
+    case SNOW_ACTIVE_TOOL_LINE:
+        return SnowCanvasTool::Line;
+    case SNOW_ACTIVE_TOOL_FREE_DRAW:
+        return SnowCanvasTool::FreeDraw;
+    case SNOW_ACTIVE_TOOL_RECTANGLE_HIGHLIGHT:
+        return SnowCanvasTool::RectangleHighlight;
+    case SNOW_ACTIVE_TOOL_PEN_HIGHLIGHT:
+        return SnowCanvasTool::PenHighlight;
+    case SNOW_ACTIVE_TOOL_ERASER:
+        return SnowCanvasTool::Eraser;
+    case SNOW_ACTIVE_TOOL_RECTANGLE_FILTER:
+        return SnowCanvasTool::RectangleFilter;
+    case SNOW_ACTIVE_TOOL_PEN_FILTER:
+        return SnowCanvasTool::PenFilter;
+    case SNOW_ACTIVE_TOOL_WATERMARK:
+        return SnowCanvasTool::Watermark;
+    case SNOW_ACTIVE_TOOL_TEXT:
+        return SnowCanvasTool::Text;
+    case SNOW_ACTIVE_TOOL_SERIAL_NUMBER:
+        return SnowCanvasTool::SerialNumber;
+    case SNOW_ACTIVE_TOOL_AUTO_FILTER:
+        return SnowCanvasTool::AutoFilter;
+    case SNOW_ACTIVE_TOOL_SPOTLIGHT:
+        return SnowCanvasTool::Spotlight;
+    case SNOW_ACTIVE_TOOL_RECTANGLE_ERASER:
+        return SnowCanvasTool::RectangleEraser;
+    case SNOW_ACTIVE_TOOL_BRUSH_ERASER:
+        return SnowCanvasTool::BrushEraser;
+    case SNOW_ACTIVE_TOOL_DISTANCE:
+        return SnowCanvasTool::Distance;
+    case SNOW_ACTIVE_TOOL_ANGLE:
+        return SnowCanvasTool::Angle;
+    case SNOW_ACTIVE_TOOL_BRACKET:
+        return SnowCanvasTool::Bracket;
+    case SNOW_ACTIVE_TOOL_MAGNIFIER:
+        return SnowCanvasTool::Magnifier;
+    case SNOW_ACTIVE_TOOL_SPEECH_BUBBLE:
+        return SnowCanvasTool::SpeechBubble;
+    }
+    return SnowCanvasTool::Select;
+}
+
+SnowActiveTool toEngineTool(SnowCanvasTool tool) {
+    switch (tool) {
+    case SnowCanvasTool::Select:
+        return SNOW_ACTIVE_TOOL_SELECT;
+    case SnowCanvasTool::Shape:
+        return SNOW_ACTIVE_TOOL_SHAPE;
+    case SnowCanvasTool::Arrow:
+        return SNOW_ACTIVE_TOOL_ARROW;
+    case SnowCanvasTool::Line:
+        return SNOW_ACTIVE_TOOL_LINE;
+    case SnowCanvasTool::FreeDraw:
+        return SNOW_ACTIVE_TOOL_FREE_DRAW;
+    case SnowCanvasTool::RectangleHighlight:
+        return SNOW_ACTIVE_TOOL_RECTANGLE_HIGHLIGHT;
+    case SnowCanvasTool::PenHighlight:
+        return SNOW_ACTIVE_TOOL_PEN_HIGHLIGHT;
+    case SnowCanvasTool::Eraser:
+        return SNOW_ACTIVE_TOOL_ERASER;
+    case SnowCanvasTool::RectangleFilter:
+        return SNOW_ACTIVE_TOOL_RECTANGLE_FILTER;
+    case SnowCanvasTool::PenFilter:
+        return SNOW_ACTIVE_TOOL_PEN_FILTER;
+    case SnowCanvasTool::Watermark:
+        return SNOW_ACTIVE_TOOL_WATERMARK;
+    case SnowCanvasTool::Text:
+        return SNOW_ACTIVE_TOOL_TEXT;
+    case SnowCanvasTool::SerialNumber:
+        return SNOW_ACTIVE_TOOL_SERIAL_NUMBER;
+    case SnowCanvasTool::AutoFilter:
+        return SNOW_ACTIVE_TOOL_AUTO_FILTER;
+    case SnowCanvasTool::Spotlight:
+        return SNOW_ACTIVE_TOOL_SPOTLIGHT;
+    case SnowCanvasTool::RectangleEraser:
+        return SNOW_ACTIVE_TOOL_RECTANGLE_ERASER;
+    case SnowCanvasTool::BrushEraser:
+        return SNOW_ACTIVE_TOOL_BRUSH_ERASER;
+    case SnowCanvasTool::Distance:
+        return SNOW_ACTIVE_TOOL_DISTANCE;
+    case SnowCanvasTool::Angle:
+        return SNOW_ACTIVE_TOOL_ANGLE;
+    case SnowCanvasTool::Bracket:
+        return SNOW_ACTIVE_TOOL_BRACKET;
+    case SnowCanvasTool::Magnifier:
+        return SNOW_ACTIVE_TOOL_MAGNIFIER;
+    case SnowCanvasTool::SpeechBubble:
+        return SNOW_ACTIVE_TOOL_SPEECH_BUBBLE;
+    }
+    return SNOW_ACTIVE_TOOL_SELECT;
+}
+
+SnowCanvasStyleToolbarSource toCanvasStyleToolbarSource(SnowStyleToolbarSource source) {
+    switch (source) {
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE:
+        return SnowCanvasStyleToolbarSource::DefaultRectangle;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE:
+        return SnowCanvasStyleToolbarSource::SelectedRectangle;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_ARROW:
+        return SnowCanvasStyleToolbarSource::DefaultArrow;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_ARROW:
+        return SnowCanvasStyleToolbarSource::SelectedArrow;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_LINE:
+        return SnowCanvasStyleToolbarSource::DefaultLine;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_LINE:
+        return SnowCanvasStyleToolbarSource::SelectedLine;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_FREE_DRAW:
+        return SnowCanvasStyleToolbarSource::DefaultFreeDraw;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_FREE_DRAW:
+        return SnowCanvasStyleToolbarSource::SelectedFreeDraw;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_HIGHLIGHT:
+        return SnowCanvasStyleToolbarSource::DefaultRectangleHighlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_HIGHLIGHT:
+        return SnowCanvasStyleToolbarSource::SelectedRectangleHighlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_PEN_HIGHLIGHT:
+        return SnowCanvasStyleToolbarSource::DefaultPenHighlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_PEN_HIGHLIGHT:
+        return SnowCanvasStyleToolbarSource::SelectedPenHighlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_ERASER:
+        return SnowCanvasStyleToolbarSource::Eraser;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_FILTER:
+        return SnowCanvasStyleToolbarSource::DefaultRectangleFilter;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_RECTANGLE_FILTER:
+        return SnowCanvasStyleToolbarSource::SelectedRectangleFilter;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_PEN_FILTER:
+        return SnowCanvasStyleToolbarSource::DefaultPenFilter;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_PEN_FILTER:
+        return SnowCanvasStyleToolbarSource::SelectedPenFilter;
+    case SNOW_STYLE_TOOLBAR_SOURCE_WATERMARK:
+        return SnowCanvasStyleToolbarSource::Watermark;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_TEXT:
+        return SnowCanvasStyleToolbarSource::DefaultText;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_TEXT:
+        return SnowCanvasStyleToolbarSource::SelectedText;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SERIAL_NUMBER:
+        return SnowCanvasStyleToolbarSource::DefaultSerialNumber;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SERIAL_NUMBER:
+        return SnowCanvasStyleToolbarSource::SelectedSerialNumber;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SPOTLIGHT:
+        return SnowCanvasStyleToolbarSource::DefaultSpotlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SPOTLIGHT:
+        return SnowCanvasStyleToolbarSource::SelectedSpotlight;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_RECTANGLE_ERASER:
+        return SnowCanvasStyleToolbarSource::DefaultRectangleEraser;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_BRUSH_ERASER:
+        return SnowCanvasStyleToolbarSource::DefaultBrushEraser;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_DISTANCE:
+        return SnowCanvasStyleToolbarSource::DefaultDistance;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_DISTANCE:
+        return SnowCanvasStyleToolbarSource::SelectedDistance;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_ANGLE:
+        return SnowCanvasStyleToolbarSource::DefaultAngle;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_BRACKET:
+        return SnowCanvasStyleToolbarSource::DefaultBracket;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_ANGLE:
+        return SnowCanvasStyleToolbarSource::SelectedAngle;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_BRACKET:
+        return SnowCanvasStyleToolbarSource::SelectedBracket;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_MAGNIFIER:
+        return SnowCanvasStyleToolbarSource::DefaultMagnifier;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_MAGNIFIER:
+        return SnowCanvasStyleToolbarSource::SelectedMagnifier;
+    case SNOW_STYLE_TOOLBAR_SOURCE_DEFAULT_SPEECH_BUBBLE:
+        return SnowCanvasStyleToolbarSource::DefaultSpeechBubble;
+    case SNOW_STYLE_TOOLBAR_SOURCE_SELECTED_SPEECH_BUBBLE:
+        return SnowCanvasStyleToolbarSource::SelectedSpeechBubble;
+    }
+    return SnowCanvasStyleToolbarSource::DefaultRectangle;
+}
+
+SnowShapeKind toEngineShapeKind(SnowCanvasShapeKind kind) {
+    switch (kind) {
+    case SnowCanvasShapeKind::Rectangle:
+        return SNOW_SHAPE_KIND_RECTANGLE;
+    case SnowCanvasShapeKind::Arrow:
+        return SNOW_SHAPE_KIND_ARROW;
+    case SnowCanvasShapeKind::Line:
+        return SNOW_SHAPE_KIND_LINE;
+    case SnowCanvasShapeKind::FreeDraw:
+        return SNOW_SHAPE_KIND_FREE_DRAW;
+    case SnowCanvasShapeKind::RectangleHighlight:
+        return SNOW_SHAPE_KIND_RECTANGLE_HIGHLIGHT;
+    case SnowCanvasShapeKind::PenHighlight:
+        return SNOW_SHAPE_KIND_PEN_HIGHLIGHT;
+    case SnowCanvasShapeKind::Spotlight:
+        return SNOW_SHAPE_KIND_SPOTLIGHT;
+    case SnowCanvasShapeKind::SpeechBubble:
+        return SNOW_SHAPE_KIND_SPEECH_BUBBLE;
+    }
+    return SNOW_SHAPE_KIND_RECTANGLE;
+}
+
+SnowCanvasArrowhead toCanvasArrowhead(SnowArrowhead arrowhead) {
+    switch (arrowhead) {
+    case SNOW_ARROWHEAD_SQUARE:
+    case SNOW_ARROWHEAD_INVERTED_TRIANGLE:
+    case SNOW_ARROWHEAD_NONE:
+        return SnowCanvasArrowhead::None;
+    case SNOW_ARROWHEAD_ARROW:
+        return SnowCanvasArrowhead::Arrow;
+    case SNOW_ARROWHEAD_BAR:
+        return SnowCanvasArrowhead::Bar;
+    case SNOW_ARROWHEAD_DOT:
+        return SnowCanvasArrowhead::Dot;
+    case SNOW_ARROWHEAD_CIRCLE:
+        return SnowCanvasArrowhead::Circle;
+    case SNOW_ARROWHEAD_CIRCLE_OUTLINE:
+        return SnowCanvasArrowhead::CircleOutline;
+    case SNOW_ARROWHEAD_INDENTED_TRIANGLE:
+        return SnowCanvasArrowhead::IndentedTriangle;
+    case SNOW_ARROWHEAD_TRIANGLE:
+        return SnowCanvasArrowhead::Triangle;
+    case SNOW_ARROWHEAD_TRIANGLE_OUTLINE:
+        return SnowCanvasArrowhead::TriangleOutline;
+    case SNOW_ARROWHEAD_DIAMOND:
+        return SnowCanvasArrowhead::Diamond;
+    case SNOW_ARROWHEAD_DIAMOND_OUTLINE:
+        return SnowCanvasArrowhead::DiamondOutline;
+    case SNOW_ARROWHEAD_CROWFOOT_ONE:
+        return SnowCanvasArrowhead::CrowfootOne;
+    case SNOW_ARROWHEAD_CROWFOOT_MANY:
+        return SnowCanvasArrowhead::CrowfootMany;
+    case SNOW_ARROWHEAD_CROWFOOT_ONE_OR_MANY:
+        return SnowCanvasArrowhead::CrowfootOneOrMany;
+    }
+    return SnowCanvasArrowhead::None;
+}
+
+SnowArrowhead toEngineArrowhead(SnowCanvasArrowhead arrowhead) {
+    switch (arrowhead) {
+    case SnowCanvasArrowhead::None:
+        return SNOW_ARROWHEAD_NONE;
+    case SnowCanvasArrowhead::Arrow:
+        return SNOW_ARROWHEAD_ARROW;
+    case SnowCanvasArrowhead::Bar:
+        return SNOW_ARROWHEAD_BAR;
+    case SnowCanvasArrowhead::Dot:
+        return SNOW_ARROWHEAD_DOT;
+    case SnowCanvasArrowhead::Circle:
+        return SNOW_ARROWHEAD_CIRCLE;
+    case SnowCanvasArrowhead::CircleOutline:
+        return SNOW_ARROWHEAD_CIRCLE_OUTLINE;
+    case SnowCanvasArrowhead::IndentedTriangle:
+        return SNOW_ARROWHEAD_INDENTED_TRIANGLE;
+    case SnowCanvasArrowhead::Triangle:
+        return SNOW_ARROWHEAD_TRIANGLE;
+    case SnowCanvasArrowhead::TriangleOutline:
+        return SNOW_ARROWHEAD_TRIANGLE_OUTLINE;
+    case SnowCanvasArrowhead::Diamond:
+        return SNOW_ARROWHEAD_DIAMOND;
+    case SnowCanvasArrowhead::DiamondOutline:
+        return SNOW_ARROWHEAD_DIAMOND_OUTLINE;
+    case SnowCanvasArrowhead::CrowfootOne:
+        return SNOW_ARROWHEAD_CROWFOOT_ONE;
+    case SnowCanvasArrowhead::CrowfootMany:
+        return SNOW_ARROWHEAD_CROWFOOT_MANY;
+    case SnowCanvasArrowhead::CrowfootOneOrMany:
+        return SNOW_ARROWHEAD_CROWFOOT_ONE_OR_MANY;
+    }
+    return SNOW_ARROWHEAD_NONE;
+}
+
+SnowCanvasArrowType toCanvasArrowType(SnowArrowType arrowType) {
+    switch (arrowType) {
+    case SNOW_ARROW_TYPE_STRAIGHT:
+        return SnowCanvasArrowType::Straight;
+    case SNOW_ARROW_TYPE_CURVE:
+        return SnowCanvasArrowType::Curve;
+    case SNOW_ARROW_TYPE_ELBOW:
+        return SnowCanvasArrowType::Elbow;
+    }
+    return SnowCanvasArrowType::Straight;
+}
+
+SnowArrowType toEngineArrowType(SnowCanvasArrowType arrowType) {
+    switch (arrowType) {
+    case SnowCanvasArrowType::Straight:
+        return SNOW_ARROW_TYPE_STRAIGHT;
+    case SnowCanvasArrowType::Curve:
+        return SNOW_ARROW_TYPE_CURVE;
+    case SnowCanvasArrowType::Elbow:
+        return SNOW_ARROW_TYPE_ELBOW;
+    }
+    return SNOW_ARROW_TYPE_STRAIGHT;
+}
+
+SnowCanvasTextHorizontalAlign toCanvasTextHorizontalAlign(SnowTextHorizontalAlign align) {
+    switch (align) {
+    case SNOW_TEXT_HORIZONTAL_ALIGN_LEFT:
+        return SnowCanvasTextHorizontalAlign::Left;
+    case SNOW_TEXT_HORIZONTAL_ALIGN_CENTER:
+        return SnowCanvasTextHorizontalAlign::Center;
+    case SNOW_TEXT_HORIZONTAL_ALIGN_RIGHT:
+        return SnowCanvasTextHorizontalAlign::Right;
+    }
+    return SnowCanvasTextHorizontalAlign::Left;
+}
+
+SnowTextHorizontalAlign toEngineTextHorizontalAlign(SnowCanvasTextHorizontalAlign align) {
+    switch (align) {
+    case SnowCanvasTextHorizontalAlign::Left:
+        return SNOW_TEXT_HORIZONTAL_ALIGN_LEFT;
+    case SnowCanvasTextHorizontalAlign::Center:
+        return SNOW_TEXT_HORIZONTAL_ALIGN_CENTER;
+    case SnowCanvasTextHorizontalAlign::Right:
+        return SNOW_TEXT_HORIZONTAL_ALIGN_RIGHT;
+    }
+    return SNOW_TEXT_HORIZONTAL_ALIGN_LEFT;
+}
+
+SnowCanvasTextVerticalAlign toCanvasTextVerticalAlign(SnowTextVerticalAlign align) {
+    switch (align) {
+    case SNOW_TEXT_VERTICAL_ALIGN_TOP:
+        return SnowCanvasTextVerticalAlign::Top;
+    case SNOW_TEXT_VERTICAL_ALIGN_CENTER:
+        return SnowCanvasTextVerticalAlign::Center;
+    case SNOW_TEXT_VERTICAL_ALIGN_BOTTOM:
+        return SnowCanvasTextVerticalAlign::Bottom;
+    }
+    return SnowCanvasTextVerticalAlign::Center;
+}
+
+SnowTextVerticalAlign toEngineTextVerticalAlign(SnowCanvasTextVerticalAlign align) {
+    switch (align) {
+    case SnowCanvasTextVerticalAlign::Top:
+        return SNOW_TEXT_VERTICAL_ALIGN_TOP;
+    case SnowCanvasTextVerticalAlign::Center:
+        return SNOW_TEXT_VERTICAL_ALIGN_CENTER;
+    case SnowCanvasTextVerticalAlign::Bottom:
+        return SNOW_TEXT_VERTICAL_ALIGN_BOTTOM;
+    }
+    return SNOW_TEXT_VERTICAL_ALIGN_CENTER;
+}
+
+SnowCanvasFillStyle toCanvasFillStyle(SnowFillStyle fillStyle) {
+    switch (fillStyle) {
+    case SNOW_FILL_STYLE_LINE:
+        return SnowCanvasFillStyle::Line;
+    case SNOW_FILL_STYLE_CROSS_LINE:
+        return SnowCanvasFillStyle::CrossLine;
+    case SNOW_FILL_STYLE_SOLID:
+        return SnowCanvasFillStyle::Solid;
+    case SNOW_FILL_STYLE_BORDER:
+        return SnowCanvasFillStyle::Border;
+    }
+    return SnowCanvasFillStyle::Solid;
+}
+
+SnowFillStyle toEngineFillStyle(SnowCanvasFillStyle fillStyle) {
+    switch (fillStyle) {
+    case SnowCanvasFillStyle::Line:
+        return SNOW_FILL_STYLE_LINE;
+    case SnowCanvasFillStyle::CrossLine:
+        return SNOW_FILL_STYLE_CROSS_LINE;
+    case SnowCanvasFillStyle::Solid:
+        return SNOW_FILL_STYLE_SOLID;
+    case SnowCanvasFillStyle::Border:
+        return SNOW_FILL_STYLE_BORDER;
+    }
+    return SNOW_FILL_STYLE_SOLID;
+}
+
+SnowCanvasStrokeStyle toCanvasStrokeStyle(SnowStrokeStyle strokeStyle) {
+    switch (strokeStyle) {
+    case SNOW_STROKE_STYLE_SOLID:
+        return SnowCanvasStrokeStyle::Solid;
+    case SNOW_STROKE_STYLE_DASHED:
+        return SnowCanvasStrokeStyle::Dashed;
+    case SNOW_STROKE_STYLE_DOTTED:
+        return SnowCanvasStrokeStyle::Dotted;
+    }
+    return SnowCanvasStrokeStyle::Solid;
+}
+
+SnowStrokeStyle toEngineStrokeStyle(SnowCanvasStrokeStyle strokeStyle) {
+    switch (strokeStyle) {
+    case SnowCanvasStrokeStyle::Solid:
+        return SNOW_STROKE_STYLE_SOLID;
+    case SnowCanvasStrokeStyle::Dashed:
+        return SNOW_STROKE_STYLE_DASHED;
+    case SnowCanvasStrokeStyle::Dotted:
+        return SNOW_STROKE_STYLE_DOTTED;
+    }
+    return SNOW_STROKE_STYLE_SOLID;
+}
+
+SnowCanvasStrokeRenderingStyle toCanvasStrokeRenderingStyle(SnowStrokeRenderingStyle style) {
+    switch (style) {
+    case SNOW_STROKE_RENDERING_STYLE_ARTIST:
+        return SnowCanvasStrokeRenderingStyle::Artist;
+    case SNOW_STROKE_RENDERING_STYLE_CARTOONIST:
+        return SnowCanvasStrokeRenderingStyle::Cartoonist;
+    case SNOW_STROKE_RENDERING_STYLE_ARCHITECT:
+        return SnowCanvasStrokeRenderingStyle::Architect;
+    }
+    return SnowCanvasStrokeRenderingStyle::Architect;
+}
+
+SnowStrokeRenderingStyle toEngineStrokeRenderingStyle(SnowCanvasStrokeRenderingStyle style) {
+    switch (style) {
+    case SnowCanvasStrokeRenderingStyle::Artist:
+        return SNOW_STROKE_RENDERING_STYLE_ARTIST;
+    case SnowCanvasStrokeRenderingStyle::Cartoonist:
+        return SNOW_STROKE_RENDERING_STYLE_CARTOONIST;
+    case SnowCanvasStrokeRenderingStyle::Architect:
+        return SNOW_STROKE_RENDERING_STYLE_ARCHITECT;
+    }
+    return SNOW_STROKE_RENDERING_STYLE_ARCHITECT;
+}
+
+SnowCanvasCornerRadii toCanvasCornerRadii(const SnowCornerRadii& cornerRadii) {
+    return SnowCanvasCornerRadii{
+        cornerRadii.top_left,
+        cornerRadii.top_right,
+        cornerRadii.bottom_right,
+        cornerRadii.bottom_left,
+    };
+}
+
+SnowCornerRadii toEngineCornerRadii(const SnowCanvasCornerRadii& cornerRadii) {
+    return SnowCornerRadii{
+        cornerRadii.topLeft,
+        cornerRadii.topRight,
+        cornerRadii.bottomRight,
+        cornerRadii.bottomLeft,
+    };
+}
+
+SnowCanvasShapeStyle toCanvasShapeStyle(const SnowShapeStyle& style) {
+    return SnowCanvasShapeStyle{
+        toQColor(style.fill),
+        toCanvasFillStyle(style.fill_style),
+        toQColor(style.stroke),
+        style.stroke_width,
+        toCanvasCornerRadii(style.corner_radii),
+        toCanvasArrowhead(style.start_arrowhead),
+        toCanvasArrowhead(style.end_arrowhead),
+        toCanvasStrokeStyle(style.stroke_style),
+        toCanvasArrowType(style.arrow_type),
+        static_cast<SnowCanvasArrowShaftType>(style.arrow_shaft_type),
+        style.arrow_ratio,
+        style.opacity,
+        style.highlight_shape == SNOW_HIGHLIGHT_SHAPE_ELLIPSE ? SnowCanvasHighlightShape::Ellipse
+                                                              : SnowCanvasHighlightShape::Rectangle,
+        style.shape == SNOW_RECTANGLE_SHAPE_THOUGHT_BUBBLE ? SnowCanvasRectangleShape::ThoughtBubble
+        : style.shape == SNOW_RECTANGLE_SHAPE_ELLIPSE      ? SnowCanvasRectangleShape::Ellipse
+        : style.shape == SNOW_RECTANGLE_SHAPE_DIAMOND      ? SnowCanvasRectangleShape::Diamond
+                                                           : SnowCanvasRectangleShape::Rectangle,
+        style.brush_mode == SNOW_BRUSH_MODE_PRESSURE_SENSITIVE
+            ? SnowCanvasBrushMode::PressureSensitive
+            : SnowCanvasBrushMode::Regular,
+        toCanvasStrokeRenderingStyle(style.stroke_rendering_style),
+        toQColor(style.arrow_outline_color),
+        style.arrow_outline_width,
+    };
+}
+
+SnowShapeStyle toEngineShapeStyle(const SnowCanvasShapeStyle& style) {
+    SnowShapeStyle engineStyle{};
+    engineStyle.fill = toEngineColor(style.fill);
+    engineStyle.fill_style = toEngineFillStyle(style.fillStyle);
+    engineStyle.stroke = toEngineColor(style.stroke);
+    engineStyle.stroke_width = style.strokeWidth;
+    engineStyle.corner_radii = toEngineCornerRadii(style.cornerRadii);
+    engineStyle.start_arrowhead = toEngineArrowhead(style.startArrowhead);
+    engineStyle.end_arrowhead = toEngineArrowhead(style.endArrowhead);
+    engineStyle.stroke_style = toEngineStrokeStyle(style.strokeStyle);
+    engineStyle.stroke_rendering_style = toEngineStrokeRenderingStyle(style.strokeRenderingStyle);
+    engineStyle.arrow_type = toEngineArrowType(style.arrowType);
+    engineStyle.arrow_shaft_type = static_cast<SnowArrowShaftType>(style.arrowShaftType);
+    engineStyle.arrow_ratio = snowCanvasNormalizeArrowRatio(style.arrowRatio);
+    engineStyle.arrow_outline_color = toEngineColor(style.arrowOutlineColor);
+    engineStyle.arrow_outline_width = std::isfinite(style.arrowOutlineWidth)
+                                          ? std::clamp(style.arrowOutlineWidth, 0.0, 72.0)
+                                          : 0.0;
+    engineStyle.opacity = style.opacity;
+    engineStyle.highlight_shape = style.highlightShape == SnowCanvasHighlightShape::Ellipse
+                                      ? SNOW_HIGHLIGHT_SHAPE_ELLIPSE
+                                      : SNOW_HIGHLIGHT_SHAPE_RECTANGLE;
+    engineStyle.shape =
+        style.shape == SnowCanvasRectangleShape::ThoughtBubble ? SNOW_RECTANGLE_SHAPE_THOUGHT_BUBBLE
+        : style.shape == SnowCanvasRectangleShape::Ellipse     ? SNOW_RECTANGLE_SHAPE_ELLIPSE
+        : style.shape == SnowCanvasRectangleShape::Diamond     ? SNOW_RECTANGLE_SHAPE_DIAMOND
+                                                               : SNOW_RECTANGLE_SHAPE_RECTANGLE;
+    engineStyle.brush_mode = style.brushMode == SnowCanvasBrushMode::PressureSensitive
+                                 ? SNOW_BRUSH_MODE_PRESSURE_SENSITIVE
+                                 : SNOW_BRUSH_MODE_REGULAR;
+    return engineStyle;
+}
+
+bool validBracketStyle(const SnowCanvasBracketStyle& style) {
+    return style.stroke.isValid() && std::isfinite(style.strokeWidth) && style.strokeWidth >= 1.0 &&
+           style.strokeWidth <= 72.0;
+}
+SnowCanvasBracketStyle toCanvasBracketStyle(const SnowBracketStyle& style) {
+    return {toQColor(style.stroke), style.stroke_width};
+}
+SnowBracketStyle toEngineBracketStyle(const SnowCanvasBracketStyle& style) {
+    return {toEngineColor(style.stroke), style.strokeWidth};
+}
+
+bool validAngleStyle(const SnowCanvasAngleStyle& style) {
+    return style.stroke.isValid() && std::isfinite(style.strokeWidth) && style.strokeWidth >= 1.0 &&
+           style.strokeWidth <= 72.0 &&
+           enumInRange(style.unit, SnowCanvasAngleUnit::Degrees, SnowCanvasAngleUnit::Radians) &&
+           style.decimalPlaces <= 3 &&
+           enumInRange(style.angleType, SnowCanvasAngleType::Directed,
+                       SnowCanvasAngleType::Interior);
+}
+
+bool validMagnifierStyle(const SnowCanvasMagnifierStyle& style) {
+    for (double radius : {style.cornerRadii.topLeft, style.cornerRadii.topRight,
+                          style.cornerRadii.bottomRight, style.cornerRadii.bottomLeft}) {
+        if (!std::isfinite(radius) || radius < 0.0)
+            return false;
+    }
+    return style.stroke.isValid() && std::isfinite(style.strokeWidth) && style.strokeWidth >= 0.0 &&
+           style.strokeWidth <= 72.0 && std::isfinite(style.factor) && style.factor >= 1.0 &&
+           style.factor <= 10.0 && std::isfinite(style.arrowRatio) && style.arrowRatio >= 0.5 &&
+           style.arrowRatio <= 3.0 &&
+           enumInRange(style.shape, SnowCanvasRectangleShape::Rectangle,
+                       SnowCanvasRectangleShape::Diamond) &&
+           enumInRange(style.connectionType, SnowCanvasMagnifierConnectionType::None,
+                       SnowCanvasMagnifierConnectionType::Gradient) &&
+           enumInRange(style.leaderArrowhead, SnowCanvasArrowhead::None,
+                       SnowCanvasArrowhead::IndentedTriangle);
+}
+
+SnowCanvasMagnifierStyle toCanvasMagnifierStyle(const SnowMagnifierStyle& style) {
+    return {static_cast<SnowCanvasRectangleShape>(style.shape),
+            toQColor(style.stroke),
+            style.stroke_width,
+            style.factor,
+            static_cast<SnowCanvasMagnifierConnectionType>(style.connection_type),
+            style.source_outline != 0,
+            toCanvasArrowhead(style.leader_arrowhead),
+            toCanvasCornerRadii(style.corner_radii),
+            style.arrow_ratio};
+}
+
+SnowMagnifierStyle toEngineMagnifierStyle(const SnowCanvasMagnifierStyle& style) {
+    SnowMagnifierStyle result{};
+    result.shape = static_cast<SnowRectangleShape>(style.shape);
+    result.stroke = toEngineColor(style.stroke);
+    result.stroke_width = style.strokeWidth;
+    result.factor = style.factor;
+    result.connection_type = static_cast<SnowMagnifierConnectionType>(style.connectionType);
+    result.source_outline = style.sourceOutline ? 1 : 0;
+    result.leader_arrowhead = toEngineArrowhead(style.leaderArrowhead);
+    result.arrow_ratio = style.arrowRatio;
+    result.corner_radii = toEngineCornerRadii(style.cornerRadii);
+    return result;
+}
+
+SnowCanvasAngleStyle toCanvasAngleStyle(const SnowAngleStyle& style) {
+    return {toQColor(style.stroke), style.stroke_width,
+            static_cast<SnowCanvasAngleUnit>(style.unit), style.decimal_places,
+            static_cast<SnowCanvasAngleType>(style.angle_type)};
+}
+
+SnowAngleStyle toEngineAngleStyle(const SnowCanvasAngleStyle& style) {
+    SnowAngleStyle result{};
+    result.stroke = toEngineColor(style.stroke);
+    result.stroke_width = style.strokeWidth;
+    result.angle_type = static_cast<SnowAngleType>(style.angleType);
+    result.unit = static_cast<SnowAngleUnit>(style.unit);
+    result.decimal_places = style.decimalPlaces;
+    return result;
+}
+
+bool validDistanceStyle(const SnowCanvasDistanceStyle& style) {
+    return style.stroke.isValid() && std::isfinite(style.strokeWidth) && style.strokeWidth >= 1.0 &&
+           style.strokeWidth <= 72.0 && std::isfinite(style.factor) && style.factor >= 0.01 &&
+           style.factor <= 1000.0 &&
+           enumInRange(style.unit, SnowCanvasDistanceUnit::Px, SnowCanvasDistanceUnit::Um) &&
+           style.decimalPlaces >= 0 && style.decimalPlaces <= 3 &&
+           std::isfinite(style.endpointScale) && style.endpointScale >= 0.5 &&
+           style.endpointScale <= 3.0 &&
+           enumInRange(style.endpointStyle, SnowCanvasArrowhead::None,
+                       SnowCanvasArrowhead::IndentedTriangle);
+}
+
+SnowCanvasDistanceStyle toCanvasDistanceStyle(const SnowDistanceStyle& style) {
+    return {toQColor(style.stroke),
+            style.stroke_width,
+            style.factor,
+            static_cast<SnowCanvasDistanceUnit>(style.unit),
+            static_cast<int>(style.decimal_places),
+            style.endpoint_scale,
+            toCanvasArrowhead(style.endpoint_style)};
+}
+
+SnowDistanceStyle toEngineDistanceStyle(const SnowCanvasDistanceStyle& style) {
+    SnowDistanceStyle result{};
+    result.stroke = toEngineColor(style.stroke);
+    result.stroke_width = style.strokeWidth;
+    result.factor = style.factor;
+    result.unit = static_cast<SnowDistanceUnit>(style.unit);
+    result.decimal_places = static_cast<std::uint32_t>(style.decimalPlaces);
+    result.endpoint_scale = style.endpointScale;
+    result.endpoint_style = toEngineArrowhead(style.endpointStyle);
+    return result;
+}
+
+SnowCanvasTextStyle toCanvasTextStyle(const SnowTextStyle& style) {
+    return SnowCanvasTextStyle{
+        toQColor(style.color),
+        style.font_size,
+        fontFamilyFromEngine(style.font_family_utf8, style.font_family_utf8_len,
+                             SNOW_FONT_FAMILY_UTF8_CAPACITY),
+        toQColor(style.fill),
+        toCanvasFillStyle(style.fill_style),
+        toQColor(style.stroke),
+        style.stroke_width,
+        toCanvasCornerRadii(style.corner_radii),
+        toCanvasTextHorizontalAlign(style.horizontal_align),
+        toCanvasTextVerticalAlign(style.vertical_align),
+        style.opacity,
+        style.bold != 0,
+        style.italic != 0,
+    };
+}
+
+SnowTextStyle toEngineTextStyle(const SnowCanvasTextStyle& style) {
+    SnowTextStyle engineStyle{};
+    engineStyle.color = toEngineColor(style.color);
+    engineStyle.font_size = style.fontSize;
+    engineStyle.bold = style.bold ? 1 : 0;
+    engineStyle.italic = style.italic ? 1 : 0;
+    copyFontFamilyToEngine(style.fontFamily, engineStyle.font_family_utf8,
+                           engineStyle.font_family_utf8_len, engineStyle.font_family_truncated,
+                           SNOW_FONT_FAMILY_UTF8_CAPACITY);
+    engineStyle.fill = toEngineColor(style.fill);
+    engineStyle.fill_style = toEngineFillStyle(style.fillStyle);
+    engineStyle.stroke = toEngineColor(style.stroke);
+    engineStyle.stroke_width = style.strokeWidth;
+    engineStyle.corner_radii = toEngineCornerRadii(style.cornerRadii);
+    engineStyle.horizontal_align = toEngineTextHorizontalAlign(style.horizontalAlign);
+    engineStyle.vertical_align = toEngineTextVerticalAlign(style.verticalAlign);
+    engineStyle.opacity = style.opacity;
+    return engineStyle;
+}
+
+SnowCanvasSerialNumberStyle toCanvasSerialNumberStyle(const SnowSerialNumberStyle& style) {
+    return SnowCanvasSerialNumberStyle{
+        static_cast<qint64>(style.number),
+        static_cast<SnowCanvasSerialNumberType>(style.serial_number_type),
+        static_cast<SnowCanvasSerialNumberNumericType>(style.numeric_type),
+        toQColor(style.color),
+        toQColor(style.fill),
+        toCanvasFillStyle(style.fill_style),
+        style.font_size,
+        fontFamilyFromEngine(style.font_family_utf8, style.font_family_utf8_len,
+                             SNOW_FONT_FAMILY_UTF8_CAPACITY),
+        style.stroke_width,
+        toCanvasStrokeStyle(style.stroke_style),
+        style.opacity,
+        toCanvasStrokeRenderingStyle(style.stroke_rendering_style),
+    };
+}
+
+SnowSerialNumberStyle toEngineSerialNumberStyle(const SnowCanvasSerialNumberStyle& style) {
+    SnowSerialNumberStyle engineStyle{};
+    engineStyle.number = static_cast<std::int64_t>(style.number);
+    engineStyle.serial_number_type = static_cast<SnowSerialNumberType>(style.type);
+    engineStyle.numeric_type = static_cast<SnowSerialNumberNumericType>(style.numericType);
+    engineStyle.color = toEngineColor(style.color);
+    engineStyle.fill = toEngineColor(style.fill);
+    engineStyle.fill_style = toEngineFillStyle(style.fillStyle);
+    engineStyle.font_size = style.fontSize;
+    copyFontFamilyToEngine(style.fontFamily, engineStyle.font_family_utf8,
+                           engineStyle.font_family_utf8_len, engineStyle.font_family_truncated,
+                           SNOW_FONT_FAMILY_UTF8_CAPACITY);
+    engineStyle.stroke_width = style.strokeWidth;
+    engineStyle.stroke_style = toEngineStrokeStyle(style.strokeStyle);
+    engineStyle.stroke_rendering_style = toEngineStrokeRenderingStyle(style.strokeRenderingStyle);
+    engineStyle.opacity = style.opacity;
+    return engineStyle;
+}
+
+SnowCanvasStyleToolbarState toCanvasStyleToolbarState(const SnowStyleToolbarState& state) {
+    return SnowCanvasStyleToolbarState{
+        toCanvasStyleToolbarSource(state.source),
+        state.selected_element_count,
+        toCanvasShapeStyle(state.shape_style),
+        toCanvasTextStyle(state.text_style),
+        toCanvasSerialNumberStyle(state.serial_number_style),
+        state.text_style_mixed,
+        state.serial_number_style_mixed,
+        state.shape_style_mixed,
+        SnowCanvasFilterStyle{
+            static_cast<SnowCanvasFilterType>(state.filter_style.filter_type),
+            state.filter_style.strength,
+            state.filter_style.opacity,
+            state.filter_style.stroke_width,
+        },
+        state.filter_style_mixed,
+        false,
+        SnowCanvasBrushEraserStyle{state.brush_eraser_style.stroke_width},
+        toCanvasDistanceStyle(state.distance_style),
+        state.distance_style_mixed,
+        toCanvasAngleStyle(state.angle_style),
+        toCanvasBracketStyle(state.bracket_style),
+        state.angle_style_mixed,
+        state.bracket_style_mixed,
+        state.distance_measured_length,
+        toCanvasMagnifierStyle(state.magnifier_style),
+        state.magnifier_style_mixed,
+    };
+}
+
+SnowCanvasHistoryState toCanvasHistoryState(const SnowHistoryState& state) {
+    return SnowCanvasHistoryState{
+        fromFlag(state.can_undo),
+        fromFlag(state.can_redo),
+    };
+}
+
+SnowCanvasSnapConfig toCanvasSnapConfig(const SnowSnapConfig& config) {
+    return SnowCanvasSnapConfig{
+        fromFlag(config.enabled),
+        fromFlag(config.enable_point_snaps),
+        fromFlag(config.enable_gap_snaps),
+        fromFlag(config.show_guides),
+        fromFlag(config.show_gap_size),
+        config.distance,
+        toQColor(config.line_color),
+        config.line_width,
+        config.marker_size,
+        config.gap_dash_length,
+        config.gap_dash_gap,
+    };
+}
+
+SnowSnapConfig toEngineSnapConfig(const SnowCanvasSnapConfig& config) {
+    SnowSnapConfig engineConfig{};
+    engineConfig.enabled = toFlag(config.enabled);
+    engineConfig.enable_point_snaps = toFlag(config.enablePointSnaps);
+    engineConfig.enable_gap_snaps = toFlag(config.enableGapSnaps);
+    engineConfig.show_guides = toFlag(config.showGuides);
+    engineConfig.show_gap_size = toFlag(config.showGapSize);
+    engineConfig.distance = config.distance;
+    engineConfig.line_color = toEngineColor(config.lineColor);
+    engineConfig.line_width = config.lineWidth;
+    engineConfig.marker_size = config.markerSize;
+    engineConfig.gap_dash_length = config.gapDashLength;
+    engineConfig.gap_dash_gap = config.gapDashGap;
+    return engineConfig;
+}
+
+SnowCanvasGridConfig toCanvasGridConfig(const SnowGridConfig& config) {
+    return SnowCanvasGridConfig{
+        fromFlag(config.enabled),
+        config.size,
+    };
+}
+
+SnowGridConfig toEngineGridConfig(const SnowCanvasGridConfig& config) {
+    SnowGridConfig engineConfig{};
+    engineConfig.enabled = toFlag(config.enabled);
+    engineConfig.size = config.size;
+    return engineConfig;
+}
+
+SnowCanvasSpotlightConfig toCanvasSpotlightConfig(const SnowSpotlightConfig& config) {
+    return SnowCanvasSpotlightConfig{toQColor(config.color), config.opacity};
+}
+
+SnowSpotlightConfig toEngineSpotlightConfig(const SnowCanvasSpotlightConfig& config) {
+    return SnowSpotlightConfig{toEngineColor(config.color), config.opacity};
+}
+
+SnowCanvasWatermarkConfig toCanvasWatermarkConfig(const SnowWatermarkConfig& config) {
+    SnowCanvasWatermarkConfig canvasConfig;
+    canvasConfig.color = toQColor(config.color);
+    canvasConfig.text = snow_canvas_utf8::stringFromField(config.text_utf8, config.text_utf8_len,
+                                                          sizeof(config.text_utf8));
+    canvasConfig.templateValue = snow_canvas_utf8::stringFromField(
+        config.template_value_utf8, config.template_value_utf8_len,
+        sizeof(config.template_value_utf8));
+    if (config.has_template_application_time != 0) {
+        canvasConfig.templateApplicationTime = SnowCanvasWatermarkTemplateApplicationTime{
+            config.template_application_time.year,   config.template_application_time.month,
+            config.template_application_time.day,    config.template_application_time.hour,
+            config.template_application_time.minute, config.template_application_time.second,
+        };
+    }
+    canvasConfig.fontSize = config.font_size;
+    canvasConfig.fontFamily = snow_canvas_utf8::stringFromField(
+        config.font_family_utf8, config.font_family_utf8_len, sizeof(config.font_family_utf8));
+    canvasConfig.angle = config.angle;
+    canvasConfig.gap = config.gap;
+    canvasConfig.opacity = config.opacity;
+    return canvasConfig;
+}
+
+SnowWatermarkConfig toEngineWatermarkConfig(const SnowCanvasWatermarkConfig& config) {
+    SnowWatermarkConfig engineConfig{};
+    engineConfig.color = toEngineColor(config.color);
+    std::uint8_t truncated = 0;
+    snow_canvas_utf8::copyStringToField(config.text.trimmed(), engineConfig.text_utf8,
+                                        engineConfig.text_utf8_len, truncated,
+                                        sizeof(engineConfig.text_utf8));
+    snow_canvas_utf8::copyStringToField(config.templateValue, engineConfig.template_value_utf8,
+                                        engineConfig.template_value_utf8_len, truncated,
+                                        sizeof(engineConfig.template_value_utf8));
+    engineConfig.font_size = config.fontSize;
+    copyFontFamilyToEngine(config.fontFamily, engineConfig.font_family_utf8,
+                           engineConfig.font_family_utf8_len, truncated,
+                           sizeof(engineConfig.font_family_utf8));
+    engineConfig.angle = config.angle;
+    engineConfig.gap = config.gap;
+    engineConfig.opacity = config.opacity;
+    if (config.templateApplicationTime.has_value()) {
+        const SnowCanvasWatermarkTemplateApplicationTime& time = *config.templateApplicationTime;
+        engineConfig.has_template_application_time = 1;
+        engineConfig.template_application_time = SnowWatermarkTemplateApplicationTime{
+            time.year,
+            static_cast<std::uint8_t>(time.month),
+            static_cast<std::uint8_t>(time.day),
+            static_cast<std::uint8_t>(time.hour),
+            static_cast<std::uint8_t>(time.minute),
+            static_cast<std::uint8_t>(time.second),
+            {0, 0, 0},
+        };
+    }
+    return engineConfig;
+}
+
+bool toEngineStyleDefaults(const SnowCanvasStyleDefaults& defaults,
+                           SnowStyleDefaults& engineDefaults) {
+    const SnowCanvasShapeStyle* shapes[] = {
+        &defaults.rectangle,
+        &defaults.arrow,
+        &defaults.line,
+        &defaults.freeDraw,
+        &defaults.rectangleHighlight,
+        &defaults.penHighlight,
+        &defaults.speechBubble,
+    };
+    for (const auto* style : shapes) {
+        if (style != &defaults.speechBubble &&
+            style->shape == SnowCanvasRectangleShape::ThoughtBubble)
+            return false;
+    }
+    if (std::any_of(
+            std::begin(shapes), std::end(shapes),
+            [](const SnowCanvasShapeStyle* style) { return !validShapeStyleEnums(*style); }) ||
+        !enumInRange(defaults.spotlightShape, SnowCanvasRectangleShape::Rectangle,
+                     SnowCanvasRectangleShape::Diamond) ||
+        !std::isfinite(defaults.brushEraser.strokeWidth) ||
+        defaults.brushEraser.strokeWidth < 1.0 || defaults.brushEraser.strokeWidth > 72.0 ||
+        !enumInRange(defaults.rectangleFilter.type, SnowCanvasFilterType::Mosaic,
+                     SnowCanvasFilterType::Brightness) ||
+        !enumInRange(defaults.penFilter.type, SnowCanvasFilterType::Mosaic,
+                     SnowCanvasFilterType::Brightness) ||
+        !validFillStyle(defaults.text.fillStyle) ||
+        !enumInRange(defaults.text.horizontalAlign, SnowCanvasTextHorizontalAlign::Left,
+                     SnowCanvasTextHorizontalAlign::Right) ||
+        !enumInRange(defaults.text.verticalAlign, SnowCanvasTextVerticalAlign::Top,
+                     SnowCanvasTextVerticalAlign::Bottom) ||
+        !validFillStyle(defaults.serialNumber.fillStyle) ||
+        !enumInRange(defaults.serialNumber.strokeRenderingStyle,
+                     SnowCanvasStrokeRenderingStyle::Architect,
+                     SnowCanvasStrokeRenderingStyle::Cartoonist) ||
+        !enumInRange(defaults.serialNumber.strokeStyle, SnowCanvasStrokeStyle::Solid,
+                     SnowCanvasStrokeStyle::Dotted) ||
+        !enumInRange(defaults.serialNumber.type, SnowCanvasSerialNumberType::OutlinedCircle,
+                     SnowCanvasSerialNumberType::Circle)) {
+        return false;
+    }
+
+    const QColor colors[] = {
+        defaults.rectangle.fill,
+        defaults.rectangle.stroke,
+        defaults.arrow.fill,
+        defaults.arrow.stroke,
+        defaults.line.fill,
+        defaults.line.stroke,
+        defaults.freeDraw.fill,
+        defaults.freeDraw.stroke,
+        defaults.rectangleHighlight.fill,
+        defaults.rectangleHighlight.stroke,
+        defaults.penHighlight.fill,
+        defaults.penHighlight.stroke,
+        defaults.text.color,
+        defaults.text.fill,
+        defaults.text.stroke,
+        defaults.serialNumber.color,
+        defaults.serialNumber.fill,
+        defaults.watermark.color,
+        defaults.spotlight.color,
+        defaults.speechBubble.fill,
+        defaults.speechBubble.stroke,
+    };
+    for (const QColor& color : colors) {
+        if (!color.isValid()) {
+            return false;
+        }
+    }
+
+    if (!validDistanceStyle(defaults.distance) || !validAngleStyle(defaults.angle) ||
+        !validBracketStyle(defaults.bracket) || !validMagnifierStyle(defaults.magnifier))
+        return false;
+    engineDefaults = SnowStyleDefaults{};
+    engineDefaults.rectangle = toEngineShapeStyle(defaults.rectangle);
+    engineDefaults.speech_bubble = toEngineShapeStyle(defaults.speechBubble);
+    engineDefaults.arrow = toEngineShapeStyle(defaults.arrow);
+    engineDefaults.line = toEngineShapeStyle(defaults.line);
+    engineDefaults.free_draw = toEngineShapeStyle(defaults.freeDraw);
+    engineDefaults.rectangle_highlight = toEngineShapeStyle(defaults.rectangleHighlight);
+    engineDefaults.pen_highlight = toEngineShapeStyle(defaults.penHighlight);
+    engineDefaults.rectangle_filter = SnowFilterStyle{
+        static_cast<SnowFilterType>(defaults.rectangleFilter.type),
+        defaults.rectangleFilter.strength,
+        defaults.rectangleFilter.opacity,
+        defaults.rectangleFilter.strokeWidth,
+    };
+    engineDefaults.pen_filter = SnowFilterStyle{
+        static_cast<SnowFilterType>(defaults.penFilter.type),
+        defaults.penFilter.strength,
+        defaults.penFilter.opacity,
+        defaults.penFilter.strokeWidth,
+    };
+    engineDefaults.text = toEngineTextStyle(defaults.text);
+    engineDefaults.serial_number = toEngineSerialNumberStyle(defaults.serialNumber);
+    engineDefaults.watermark = toEngineWatermarkConfig(defaults.watermark);
+    engineDefaults.spotlight = toEngineSpotlightConfig(defaults.spotlight);
+    engineDefaults.brush_eraser = SnowBrushEraserStyle{defaults.brushEraser.strokeWidth};
+    engineDefaults.spotlight_shape = static_cast<SnowRectangleShape>(defaults.spotlightShape);
+    engineDefaults.spotlight_corner_radii = toEngineCornerRadii(defaults.spotlightCornerRadii);
+    engineDefaults.distance = toEngineDistanceStyle(defaults.distance);
+    engineDefaults.angle = toEngineAngleStyle(defaults.angle);
+    engineDefaults.bracket = toEngineBracketStyle(defaults.bracket);
+    engineDefaults.magnifier = toEngineMagnifierStyle(defaults.magnifier);
+    return true;
+}
+
+} // namespace snow_canvas_types

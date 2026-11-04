@@ -1,0 +1,1698 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="en_US" sourcelanguage="en_US">
+    <context>
+        <name>ScreenshotQuickTextAnnotationToolbar</name>
+        <message>
+            <source>Highlight</source>
+            <translation>Highlight</translation>
+        </message>
+        <message>
+            <source>Strikethrough</source>
+            <translation>Strikethrough</translation>
+        </message>
+        <message>
+            <source>Underline</source>
+            <translation>Underline</translation>
+        </message>
+        <message>
+            <source>Wavy Underline</source>
+            <translation>Wavy Underline</translation>
+        </message>
+    </context>
+    <context>
+        <name>ScreenshotToolPalette</name>
+        <message>
+            <source>%1 (unavailable)</source>
+            <translation>%1 (unavailable)</translation>
+        </message>
+        <message>
+            <source>1 decimal place</source>
+            <translation>1 decimal place</translation>
+        </message>
+        <message>
+            <source>180° angle</source>
+            <translation>180° angle</translation>
+        </message>
+        <message>
+            <source>2 decimal places</source>
+            <translation>2 decimal places</translation>
+        </message>
+        <message>
+            <source>3 decimal places</source>
+            <translation>3 decimal places</translation>
+        </message>
+        <message>
+            <source>360° angle</source>
+            <translation>360° angle</translation>
+        </message>
+        <message>
+            <source>Actual distance value</source>
+            <translation>Actual distance value</translation>
+        </message>
+        <message>
+            <source>Add</source>
+            <translation>Add</translation>
+        </message>
+        <message>
+            <source>Add Template</source>
+            <translation>Add Template</translation>
+        </message>
+        <message>
+            <source>Add screenshot region</source>
+            <translation>Add screenshot region</translation>
+        </message>
+        <message>
+            <source>Add template</source>
+            <translation>Add template</translation>
+        </message>
+        <message>
+            <source>Adjust filter intensity</source>
+            <translation>Adjust filter intensity</translation>
+        </message>
+        <message>
+            <source>Adjust opacity</source>
+            <translation>Adjust opacity</translation>
+        </message>
+        <message>
+            <source>AirDrop</source>
+            <translation>AirDrop</translation>
+        </message>
+        <message>
+            <source>Align bottom</source>
+            <translation>Align bottom</translation>
+        </message>
+        <message>
+            <source>Align left</source>
+            <translation>Align left</translation>
+        </message>
+        <message>
+            <source>Align right</source>
+            <translation>Align right</translation>
+        </message>
+        <message>
+            <source>Align text center</source>
+            <translation>Align text center</translation>
+        </message>
+        <message>
+            <source>Align text left</source>
+            <translation>Align text left</translation>
+        </message>
+        <message>
+            <source>Align text right</source>
+            <translation>Align text right</translation>
+        </message>
+        <message>
+            <source>Align top</source>
+            <translation>Align top</translation>
+        </message>
+        <message>
+            <source>Angle annotation</source>
+            <translation>Angle annotation</translation>
+        </message>
+        <message>
+            <source>Angle stroke color</source>
+            <translation>Angle stroke color</translation>
+        </message>
+        <message>
+            <source>Angle stroke color %1</source>
+            <translation>Angle stroke color %1</translation>
+        </message>
+        <message>
+            <source>Angle stroke width %1</source>
+            <translation>Angle stroke width %1</translation>
+        </message>
+        <message>
+            <source>Angle type</source>
+            <translation>Angle type</translation>
+        </message>
+        <message>
+            <source>Angle unit</source>
+            <translation>Angle unit</translation>
+        </message>
+        <message>
+            <source>Animated recording formats do not contain audio</source>
+            <translation>Animated recording formats do not contain audio</translation>
+        </message>
+        <message>
+            <source>Annotation Template</source>
+            <translation>Annotation Template</translation>
+        </message>
+        <message>
+            <source>Arabic numerals</source>
+            <translation>Arabic numerals</translation>
+        </message>
+        <message>
+            <source>Architect</source>
+            <translation>Architect</translation>
+        </message>
+        <message>
+            <source>Arrow</source>
+            <translation>Arrow</translation>
+        </message>
+        <message>
+            <source>Arrow color</source>
+            <translation>Arrow color</translation>
+        </message>
+        <message>
+            <source>Arrow color %1</source>
+            <translation>Arrow color %1</translation>
+        </message>
+        <message>
+            <source>Arrow outline color %1</source>
+            <translation>Arrow outline color %1</translation>
+        </message>
+        <message>
+            <source>Arrow outline color transparent</source>
+            <translation>Arrow outline color transparent</translation>
+        </message>
+        <message>
+            <source>Arrow outline width</source>
+            <translation>Arrow outline width</translation>
+        </message>
+        <message>
+            <source>Arrow outline width %1px</source>
+            <translation>Arrow outline width %1px</translation>
+        </message>
+        <message>
+            <source>Arrow shaft type</source>
+            <translation>Arrow shaft type</translation>
+        </message>
+        <message>
+            <source>Arrow width %1</source>
+            <translation>Arrow width %1</translation>
+        </message>
+        <message>
+            <source>Arrowhead scale (scroll to adjust)</source>
+            <translation>Arrowhead scale (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Artist</source>
+            <translation>Artist</translation>
+        </message>
+        <message>
+            <source>Auto Filter</source>
+            <translation>Auto Filter</translation>
+        </message>
+        <message>
+            <source>Auto-scroll</source>
+            <translation>Auto-scroll</translation>
+        </message>
+        <message>
+            <source>Auto-scroll interval (scroll to adjust; click to reset to 200 ms)</source>
+            <translation>Auto-scroll interval (scroll to adjust; click to reset to 200 ms)</translation>
+        </message>
+        <message>
+            <source>Available for multi-region selections</source>
+            <translation>Available for multi-region selections</translation>
+        </message>
+        <message>
+            <source>Avatar</source>
+            <translation>Avatar</translation>
+        </message>
+        <message>
+            <source>Barcode recognition</source>
+            <translation>Barcode recognition</translation>
+        </message>
+        <message>
+            <source>Blue</source>
+            <translation>Blue</translation>
+        </message>
+        <message>
+            <source>Bold</source>
+            <translation>Bold</translation>
+        </message>
+        <message>
+            <source>Bracket annotation</source>
+            <translation>Bracket annotation</translation>
+        </message>
+        <message>
+            <source>Bracket stroke color</source>
+            <translation>Bracket stroke color</translation>
+        </message>
+        <message>
+            <source>Bracket stroke color %1</source>
+            <translation>Bracket stroke color %1</translation>
+        </message>
+        <message>
+            <source>Bracket stroke width %1</source>
+            <translation>Bracket stroke width %1</translation>
+        </message>
+        <message>
+            <source>Brightness</source>
+            <translation>Brightness</translation>
+        </message>
+        <message>
+            <source>Bring forward</source>
+            <translation>Bring forward</translation>
+        </message>
+        <message>
+            <source>Bring to front</source>
+            <translation>Bring to front</translation>
+        </message>
+        <message>
+            <source>Brush Eraser</source>
+            <translation>Brush Eraser</translation>
+        </message>
+        <message>
+            <source>Brush eraser width %1 (%2px)</source>
+            <translation>Brush eraser width %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Cancel</source>
+            <translation>Cancel</translation>
+        </message>
+        <message>
+            <source>Cancel screenshot</source>
+            <translation>Cancel screenshot</translation>
+        </message>
+        <message>
+            <source>Capture interface during scrolling screenshot</source>
+            <translation>Capture interface during scrolling screenshot</translation>
+        </message>
+        <message>
+            <source>Cartoonist</source>
+            <translation>Cartoonist</translation>
+        </message>
+        <message>
+            <source>Center horizontally</source>
+            <translation>Center horizontally</translation>
+        </message>
+        <message>
+            <source>Center vertically</source>
+            <translation>Center vertically</translation>
+        </message>
+        <message>
+            <source>Chinese numerals</source>
+            <translation>Chinese numerals</translation>
+        </message>
+        <message>
+            <source>Circle</source>
+            <translation>Circle</translation>
+        </message>
+        <message>
+            <source>Click-through</source>
+            <translation>Click-through</translation>
+        </message>
+        <message>
+            <source>Close recording</source>
+            <translation>Close recording</translation>
+        </message>
+        <message>
+            <source>Compact layout</source>
+            <translation>Compact layout</translation>
+        </message>
+        <message>
+            <source>Confirm edit</source>
+            <translation>Confirm edit</translation>
+        </message>
+        <message>
+            <source>Connection type</source>
+            <translation>Connection type</translation>
+        </message>
+        <message>
+            <source>Control keys</source>
+            <translation>Control keys</translation>
+        </message>
+        <message>
+            <source>Convert to HTML</source>
+            <translation>Convert to HTML</translation>
+        </message>
+        <message>
+            <source>Convert to Markdown</source>
+            <translation>Convert to Markdown</translation>
+        </message>
+        <message>
+            <source>Copy recording</source>
+            <translation>Copy recording</translation>
+        </message>
+        <message>
+            <source>Copy selected elements</source>
+            <translation>Copy selected elements</translation>
+        </message>
+        <message>
+            <source>Copy to clipboard</source>
+            <translation>Copy to clipboard</translation>
+        </message>
+        <message>
+            <source>Corner radius (scroll to adjust)</source>
+            <translation>Corner radius (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Could not capture selected elements</source>
+            <translation>Could not capture selected elements</translation>
+        </message>
+        <message>
+            <source>Could not delete the annotation template</source>
+            <translation>Could not delete the annotation template</translation>
+        </message>
+        <message>
+            <source>Could not save the annotation template</source>
+            <translation>Could not save the annotation template</translation>
+        </message>
+        <message>
+            <source>Crosshatched fill</source>
+            <translation>Crosshatched fill</translation>
+        </message>
+        <message>
+            <source>Crosshatched sequence number background</source>
+            <translation>Crosshatched sequence number background</translation>
+        </message>
+        <message>
+            <source>Crosshatched text background</source>
+            <translation>Crosshatched text background</translation>
+        </message>
+        <message>
+            <source>Current angle stroke width</source>
+            <translation>Current angle stroke width</translation>
+        </message>
+        <message>
+            <source>Current arrow width</source>
+            <translation>Current arrow width</translation>
+        </message>
+        <message>
+            <source>Current bracket stroke width</source>
+            <translation>Current bracket stroke width</translation>
+        </message>
+        <message>
+            <source>Current brush eraser width</source>
+            <translation>Current brush eraser width</translation>
+        </message>
+        <message>
+            <source>Current distance stroke width</source>
+            <translation>Current distance stroke width</translation>
+        </message>
+        <message>
+            <source>Current magnifier stroke width</source>
+            <translation>Current magnifier stroke width</translation>
+        </message>
+        <message>
+            <source>Current pen filter width</source>
+            <translation>Current pen filter width</translation>
+        </message>
+        <message>
+            <source>Current pen highlight width</source>
+            <translation>Current pen highlight width</translation>
+        </message>
+        <message>
+            <source>Current sequence number font size</source>
+            <translation>Current sequence number font size</translation>
+        </message>
+        <message>
+            <source>Current stroke width</source>
+            <translation>Current stroke width</translation>
+        </message>
+        <message>
+            <source>Current text font size</source>
+            <translation>Current text font size</translation>
+        </message>
+        <message>
+            <source>Current watermark font size</source>
+            <translation>Current watermark font size</translation>
+        </message>
+        <message>
+            <source>Cursor data is unavailable for this screenshot</source>
+            <translation>Cursor data is unavailable for this screenshot</translation>
+        </message>
+        <message>
+            <source>Curve region</source>
+            <translation>Curve region</translation>
+        </message>
+        <message>
+            <source>Curved arrow</source>
+            <translation>Curved arrow</translation>
+        </message>
+        <message>
+            <source>Curved line</source>
+            <translation>Curved line</translation>
+        </message>
+        <message>
+            <source>Dashed arrow line</source>
+            <translation>Dashed arrow line</translation>
+        </message>
+        <message>
+            <source>Dashed stroke</source>
+            <translation>Dashed stroke</translation>
+        </message>
+        <message>
+            <source>Decimal places</source>
+            <translation>Decimal places</translation>
+        </message>
+        <message>
+            <source>Dedicated Model</source>
+            <translation>Dedicated Model</translation>
+        </message>
+        <message>
+            <source>Default</source>
+            <translation>Default</translation>
+        </message>
+        <message>
+            <source>Degrees</source>
+            <translation>Degrees</translation>
+        </message>
+        <message>
+            <source>Delay recording (scroll to adjust)</source>
+            <translation>Delay recording (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Delete</source>
+            <translation>Delete</translation>
+        </message>
+        <message>
+            <source>Delete Annotation Template</source>
+            <translation>Delete Annotation Template</translation>
+        </message>
+        <message>
+            <source>Delete annotation template "%1"? This action cannot be undone</source>
+            <translation>Delete annotation template "%1"? This action cannot be undone</translation>
+        </message>
+        <message>
+            <source>Delete selected elements</source>
+            <translation>Delete selected elements</translation>
+        </message>
+        <message>
+            <source>Delete template</source>
+            <translation>Delete template</translation>
+        </message>
+        <message>
+            <source>Delete template "%1"? This action cannot be undone</source>
+            <translation>Delete template "%1"? This action cannot be undone</translation>
+        </message>
+        <message>
+            <source>Diamond</source>
+            <translation>Diamond</translation>
+        </message>
+        <message>
+            <source>Distance annotation</source>
+            <translation>Distance annotation</translation>
+        </message>
+        <message>
+            <source>Distance stroke color</source>
+            <translation>Distance stroke color</translation>
+        </message>
+        <message>
+            <source>Distance stroke color %1</source>
+            <translation>Distance stroke color %1</translation>
+        </message>
+        <message>
+            <source>Distance stroke width %1</source>
+            <translation>Distance stroke width %1</translation>
+        </message>
+        <message>
+            <source>Distance unit</source>
+            <translation>Distance unit</translation>
+        </message>
+        <message>
+            <source>Distribute horizontally</source>
+            <translation>Distribute horizontally</translation>
+        </message>
+        <message>
+            <source>Distribute vertically</source>
+            <translation>Distribute vertically</translation>
+        </message>
+        <message>
+            <source>Dotted arrow line</source>
+            <translation>Dotted arrow line</translation>
+        </message>
+        <message>
+            <source>Dotted stroke</source>
+            <translation>Dotted stroke</translation>
+        </message>
+        <message>
+            <source>Drag toolbar</source>
+            <translation>Drag toolbar</translation>
+        </message>
+        <message>
+            <source>Edit</source>
+            <translation>Edit</translation>
+        </message>
+        <message>
+            <source>Edit selection</source>
+            <translation>Edit selection</translation>
+        </message>
+        <message>
+            <source>Effect Settings</source>
+            <translation>Effect Settings</translation>
+        </message>
+        <message>
+            <source>Elbow arrow</source>
+            <translation>Elbow arrow</translation>
+        </message>
+        <message>
+            <source>Element Eraser</source>
+            <translation>Element Eraser</translation>
+        </message>
+        <message>
+            <source>Ellipse</source>
+            <translation>Ellipse</translation>
+        </message>
+        <message>
+            <source>Emboss</source>
+            <translation>Emboss</translation>
+        </message>
+        <message>
+            <source>End arrowhead</source>
+            <translation>End arrowhead</translation>
+        </message>
+        <message>
+            <source>End arrowhead bar</source>
+            <translation>End arrowhead bar</translation>
+        </message>
+        <message>
+            <source>End arrowhead circle</source>
+            <translation>End arrowhead circle</translation>
+        </message>
+        <message>
+            <source>End arrowhead circle outline</source>
+            <translation>End arrowhead circle outline</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot many</source>
+            <translation>End arrowhead crowfoot many</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot one</source>
+            <translation>End arrowhead crowfoot one</translation>
+        </message>
+        <message>
+            <source>End arrowhead crowfoot one or many</source>
+            <translation>End arrowhead crowfoot one or many</translation>
+        </message>
+        <message>
+            <source>End arrowhead diamond</source>
+            <translation>End arrowhead diamond</translation>
+        </message>
+        <message>
+            <source>End arrowhead diamond outline</source>
+            <translation>End arrowhead diamond outline</translation>
+        </message>
+        <message>
+            <source>End arrowhead dot</source>
+            <translation>End arrowhead dot</translation>
+        </message>
+        <message>
+            <source>End arrowhead indented triangle</source>
+            <translation>End arrowhead indented triangle</translation>
+        </message>
+        <message>
+            <source>End arrowhead none</source>
+            <translation>End arrowhead none</translation>
+        </message>
+        <message>
+            <source>End arrowhead standard</source>
+            <translation>End arrowhead standard</translation>
+        </message>
+        <message>
+            <source>End arrowhead triangle</source>
+            <translation>End arrowhead triangle</translation>
+        </message>
+        <message>
+            <source>End arrowhead triangle outline</source>
+            <translation>End arrowhead triangle outline</translation>
+        </message>
+        <message>
+            <source>Endpoint scale (scroll to adjust)</source>
+            <translation>Endpoint scale (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Endpoint style</source>
+            <translation>Endpoint style</translation>
+        </message>
+        <message>
+            <source>Eraser</source>
+            <translation>Eraser</translation>
+        </message>
+        <message>
+            <source>Exit</source>
+            <translation>Exit</translation>
+        </message>
+        <message>
+            <source>Export Settings</source>
+            <translation>Export Settings</translation>
+        </message>
+        <message>
+            <source>Fill color</source>
+            <translation>Fill color</translation>
+        </message>
+        <message>
+            <source>Fill color %1</source>
+            <translation>Fill color %1</translation>
+        </message>
+        <message>
+            <source>Fill color transparent</source>
+            <translation>Fill color transparent</translation>
+        </message>
+        <message>
+            <source>Fill regions</source>
+            <translation>Fill regions</translation>
+        </message>
+        <message>
+            <source>Filter</source>
+            <translation>Filter</translation>
+        </message>
+        <message>
+            <source>Filter intensity</source>
+            <translation>Filter intensity</translation>
+        </message>
+        <message>
+            <source>Filter type</source>
+            <translation>Filter type</translation>
+        </message>
+        <message>
+            <source>Font family</source>
+            <translation>Font family</translation>
+        </message>
+        <message>
+            <source>Formatting</source>
+            <translation>Formatting</translation>
+        </message>
+        <message>
+            <source>Freehand region</source>
+            <translation>Freehand region</translation>
+        </message>
+        <message>
+            <source>Gaussian blur</source>
+            <translation>Gaussian blur</translation>
+        </message>
+        <message>
+            <source>Gradient</source>
+            <translation>Gradient</translation>
+        </message>
+        <message>
+            <source>Grayscale</source>
+            <translation>Grayscale</translation>
+        </message>
+        <message>
+            <source>Green</source>
+            <translation>Green</translation>
+        </message>
+        <message>
+            <source>Hatched fill</source>
+            <translation>Hatched fill</translation>
+        </message>
+        <message>
+            <source>Hatched sequence number background</source>
+            <translation>Hatched sequence number background</translation>
+        </message>
+        <message>
+            <source>Hatched text background</source>
+            <translation>Hatched text background</translation>
+        </message>
+        <message>
+            <source>Hide selection toolbar</source>
+            <translation>Hide selection toolbar</translation>
+        </message>
+        <message>
+            <source>Highlight</source>
+            <translation>Highlight</translation>
+        </message>
+        <message>
+            <source>Highlight color</source>
+            <translation>Highlight color</translation>
+        </message>
+        <message>
+            <source>Highlight color %1</source>
+            <translation>Highlight color %1</translation>
+        </message>
+        <message>
+            <source>Highlight outline color %1</source>
+            <translation>Highlight outline color %1</translation>
+        </message>
+        <message>
+            <source>Highlight outline width</source>
+            <translation>Highlight outline width</translation>
+        </message>
+        <message>
+            <source>Highlight outline width %1px</source>
+            <translation>Highlight outline width %1px</translation>
+        </message>
+        <message>
+            <source>Horizontal Crop</source>
+            <translation>Horizontal Crop</translation>
+        </message>
+        <message>
+            <source>Horizontal scrolling</source>
+            <translation>Horizontal scrolling</translation>
+        </message>
+        <message>
+            <source>Icon</source>
+            <translation>Icon</translation>
+        </message>
+        <message>
+            <source>Image</source>
+            <translation>Image</translation>
+        </message>
+        <message>
+            <source>Image Editing</source>
+            <translation>Image Editing</translation>
+        </message>
+        <message>
+            <source>Image Splitting</source>
+            <translation>Image Splitting</translation>
+        </message>
+        <message>
+            <source>Integers</source>
+            <translation>Integers</translation>
+        </message>
+        <message>
+            <source>Inversion</source>
+            <translation>Inversion</translation>
+        </message>
+        <message>
+            <source>Italic</source>
+            <translation>Italic</translation>
+        </message>
+        <message>
+            <source>Jump to Translation Page</source>
+            <translation>Jump to Translation Page</translation>
+        </message>
+        <message>
+            <source>Keyboard Background Color</source>
+            <translation>Keyboard Background Color</translation>
+        </message>
+        <message>
+            <source>Keyboard Foreground Color</source>
+            <translation>Keyboard Foreground Color</translation>
+        </message>
+        <message>
+            <source>Keyboard Size</source>
+            <translation>Keyboard Size</translation>
+        </message>
+        <message>
+            <source>LaTeX Formula Recognition</source>
+            <translation>LaTeX Formula Recognition</translation>
+        </message>
+        <message>
+            <source>LaTeX-Specific Model</source>
+            <translation>LaTeX-Specific Model</translation>
+        </message>
+        <message>
+            <source>Laser pointer</source>
+            <translation>Laser pointer</translation>
+        </message>
+        <message>
+            <source>Layout compaction disabled</source>
+            <translation>Layout compaction disabled</translation>
+        </message>
+        <message>
+            <source>Layout compaction enabled</source>
+            <translation>Layout compaction enabled</translation>
+        </message>
+        <message>
+            <source>Layout spacing (scroll to adjust; click to reset to 0)</source>
+            <translation>Layout spacing (scroll to adjust; click to reset to 0)</translation>
+        </message>
+        <message>
+            <source>Leader line</source>
+            <translation>Leader line</translation>
+        </message>
+        <message>
+            <source>Leader line arrowhead</source>
+            <translation>Leader line arrowhead</translation>
+        </message>
+        <message>
+            <source>Letters and symbols</source>
+            <translation>Letters and symbols</translation>
+        </message>
+        <message>
+            <source>Line</source>
+            <translation>Line</translation>
+        </message>
+        <message>
+            <source>Logical Pixel Selection</source>
+            <translation>Logical Pixel Selection</translation>
+        </message>
+        <message>
+            <source>Lowercase letters</source>
+            <translation>Lowercase letters</translation>
+        </message>
+        <message>
+            <source>Magnification factor (scroll to adjust)</source>
+            <translation>Magnification factor (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Magnifier</source>
+            <translation>Magnifier</translation>
+        </message>
+        <message>
+            <source>Magnifier shape</source>
+            <translation>Magnifier shape</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke color</source>
+            <translation>Magnifier stroke color</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke color %1</source>
+            <translation>Magnifier stroke color %1</translation>
+        </message>
+        <message>
+            <source>Magnifier stroke width %1</source>
+            <translation>Magnifier stroke width %1</translation>
+        </message>
+        <message>
+            <source>Mask color</source>
+            <translation>Mask color</translation>
+        </message>
+        <message>
+            <source>Mask color %1</source>
+            <translation>Mask color %1</translation>
+        </message>
+        <message>
+            <source>Merge cells</source>
+            <translation>Merge cells</translation>
+        </message>
+        <message>
+            <source>Message box</source>
+            <translation>Message box</translation>
+        </message>
+        <message>
+            <source>Mixed</source>
+            <translation>Mixed</translation>
+        </message>
+        <message>
+            <source>More distance units</source>
+            <translation>More distance units</translation>
+        </message>
+        <message>
+            <source>Mosaic</source>
+            <translation>Mosaic</translation>
+        </message>
+        <message>
+            <source>Mouse Trail Duration</source>
+            <translation>Mouse Trail Duration</translation>
+        </message>
+        <message>
+            <source>Mouse click color</source>
+            <translation>Mouse click color</translation>
+        </message>
+        <message>
+            <source>Mouse click color %1</source>
+            <translation>Mouse click color %1</translation>
+        </message>
+        <message>
+            <source>Mouse click color transparent</source>
+            <translation>Mouse click color transparent</translation>
+        </message>
+        <message>
+            <source>Mouse highlight</source>
+            <translation>Mouse highlight</translation>
+        </message>
+        <message>
+            <source>Mouse highlight color</source>
+            <translation>Mouse highlight color</translation>
+        </message>
+        <message>
+            <source>Mouse highlight preview</source>
+            <translation>Mouse highlight preview</translation>
+        </message>
+        <message>
+            <source>Mouse highlight radius</source>
+            <translation>Mouse highlight radius</translation>
+        </message>
+        <message>
+            <source>Mouse trail color</source>
+            <translation>Mouse trail color</translation>
+        </message>
+        <message>
+            <source>Mouse trail color %1</source>
+            <translation>Mouse trail color %1</translation>
+        </message>
+        <message>
+            <source>Mouse trail color transparent</source>
+            <translation>Mouse trail color transparent</translation>
+        </message>
+        <message>
+            <source>Move selection horizontally (press and hold to drag)</source>
+            <translation>Move selection horizontally (press and hold to drag)</translation>
+        </message>
+        <message>
+            <source>Move selection vertically (press and hold to drag)</source>
+            <translation>Move selection vertically (press and hold to drag)</translation>
+        </message>
+        <message>
+            <source>No fill</source>
+            <translation>No fill</translation>
+        </message>
+        <message>
+            <source>No matching templates</source>
+            <translation>No matching templates</translation>
+        </message>
+        <message>
+            <source>No templates yet</source>
+            <translation>No templates yet</translation>
+        </message>
+        <message>
+            <source>None</source>
+            <translation>None</translation>
+        </message>
+        <message>
+            <source>Number keys</source>
+            <translation>Number keys</translation>
+        </message>
+        <message>
+            <source>Opacity</source>
+            <translation>Opacity</translation>
+        </message>
+        <message>
+            <source>Open recording folder</source>
+            <translation>Open recording folder</translation>
+        </message>
+        <message>
+            <source>Open spreadsheet file</source>
+            <translation>Open spreadsheet file</translation>
+        </message>
+        <message>
+            <source>Outlined circle</source>
+            <translation>Outlined circle</translation>
+        </message>
+        <message>
+            <source>Outlined square</source>
+            <translation>Outlined square</translation>
+        </message>
+        <message>
+            <source>Pan</source>
+            <translation>Pan</translation>
+        </message>
+        <message>
+            <source>Pause recording</source>
+            <translation>Pause recording</translation>
+        </message>
+        <message>
+            <source>Pen</source>
+            <translation>Pen</translation>
+        </message>
+        <message>
+            <source>Pen filter</source>
+            <translation>Pen filter</translation>
+        </message>
+        <message>
+            <source>Pen filter width %1 (%2px)</source>
+            <translation>Pen filter width %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Pen highlight</source>
+            <translation>Pen highlight</translation>
+        </message>
+        <message>
+            <source>Pen highlight color</source>
+            <translation>Pen highlight color</translation>
+        </message>
+        <message>
+            <source>Pen highlight color %1</source>
+            <translation>Pen highlight color %1</translation>
+        </message>
+        <message>
+            <source>Pen highlight width %1 (%2px)</source>
+            <translation>Pen highlight width %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Physical Pixel Selection</source>
+            <translation>Physical Pixel Selection</translation>
+        </message>
+        <message>
+            <source>Pick color from canvas</source>
+            <translation>Pick color from canvas</translation>
+        </message>
+        <message>
+            <source>Pin Window to Screen</source>
+            <translation>Pin Window to Screen</translation>
+        </message>
+        <message>
+            <source>Pin to screen</source>
+            <translation>Pin to screen</translation>
+        </message>
+        <message>
+            <source>Plain shaft</source>
+            <translation>Plain shaft</translation>
+        </message>
+        <message>
+            <source>Please enter a template name</source>
+            <translation>Please enter a template name</translation>
+        </message>
+        <message>
+            <source>Please enter a template value</source>
+            <translation>Please enter a template value</translation>
+        </message>
+        <message>
+            <source>Polyline region</source>
+            <translation>Polyline region</translation>
+        </message>
+        <message>
+            <source>Post-processing effects</source>
+            <translation>Post-processing effects</translation>
+        </message>
+        <message>
+            <source>Preserve keyboard shortcuts</source>
+            <translation>Preserve keyboard shortcuts</translation>
+        </message>
+        <message>
+            <source>Pressure-sensitive brush</source>
+            <translation>Pressure-sensitive brush</translation>
+        </message>
+        <message>
+            <source>Print</source>
+            <translation>Print</translation>
+        </message>
+        <message>
+            <source>Progress Bar Color</source>
+            <translation>Progress Bar Color</translation>
+        </message>
+        <message>
+            <source>Punctuation</source>
+            <translation>Punctuation</translation>
+        </message>
+        <message>
+            <source>Quick save</source>
+            <translation>Quick save</translation>
+        </message>
+        <message>
+            <source>Radians</source>
+            <translation>Radians</translation>
+        </message>
+        <message>
+            <source>Recapture</source>
+            <translation>Recapture</translation>
+        </message>
+        <message>
+            <source>Recognition model</source>
+            <translation>Recognition model</translation>
+        </message>
+        <message>
+            <source>Record microphone</source>
+            <translation>Record microphone</translation>
+        </message>
+        <message>
+            <source>Record mouse clicks</source>
+            <translation>Record mouse clicks</translation>
+        </message>
+        <message>
+            <source>Record mouse scrolling</source>
+            <translation>Record mouse scrolling</translation>
+        </message>
+        <message>
+            <source>Record screen</source>
+            <translation>Record screen</translation>
+        </message>
+        <message>
+            <source>Record speakers</source>
+            <translation>Record speakers</translation>
+        </message>
+        <message>
+            <source>Record webcam</source>
+            <translation>Record webcam</translation>
+        </message>
+        <message>
+            <source>Recording duration</source>
+            <translation>Recording duration</translation>
+        </message>
+        <message>
+            <source>Recording format</source>
+            <translation>Recording format</translation>
+        </message>
+        <message>
+            <source>Recording settings</source>
+            <translation>Recording settings</translation>
+        </message>
+        <message>
+            <source>Rectangle</source>
+            <translation>Rectangle</translation>
+        </message>
+        <message>
+            <source>Rectangle Eraser</source>
+            <translation>Rectangle Eraser</translation>
+        </message>
+        <message>
+            <source>Rectangle filter</source>
+            <translation>Rectangle filter</translation>
+        </message>
+        <message>
+            <source>Rectangle highlight</source>
+            <translation>Rectangle highlight</translation>
+        </message>
+        <message>
+            <source>Rectangle region</source>
+            <translation>Rectangle region</translation>
+        </message>
+        <message>
+            <source>Red</source>
+            <translation>Red</translation>
+        </message>
+        <message>
+            <source>Redo</source>
+            <translation>Redo</translation>
+        </message>
+        <message>
+            <source>Regular brush</source>
+            <translation>Regular brush</translation>
+        </message>
+        <message>
+            <source>Reset</source>
+            <translation>Reset</translation>
+        </message>
+        <message>
+            <source>Resize window</source>
+            <translation>Resize window</translation>
+        </message>
+        <message>
+            <source>Resume recording</source>
+            <translation>Resume recording</translation>
+        </message>
+        <message>
+            <source>Roman numerals</source>
+            <translation>Roman numerals</translation>
+        </message>
+        <message>
+            <source>Save as file</source>
+            <translation>Save as file</translation>
+        </message>
+        <message>
+            <source>Save to File</source>
+            <translation>Save to File</translation>
+        </message>
+        <message>
+            <source>Scrolling screenshot</source>
+            <translation>Scrolling screenshot</translation>
+        </message>
+        <message>
+            <source>Scrolling screenshot settings</source>
+            <translation>Scrolling screenshot settings</translation>
+        </message>
+        <message>
+            <source>Select elements</source>
+            <translation>Select elements</translation>
+        </message>
+        <message>
+            <source>Selected model (%1)</source>
+            <translation>Selected model (%1)</translation>
+        </message>
+        <message>
+            <source>Selection background opacity</source>
+            <translation>Selection background opacity</translation>
+        </message>
+        <message>
+            <source>Selection background opacity (scroll to adjust; click to reset to 0%)</source>
+            <translation>Selection background opacity (scroll to adjust; click to reset to 0%)</translation>
+        </message>
+        <message>
+            <source>Send backward</source>
+            <translation>Send backward</translation>
+        </message>
+        <message>
+            <source>Send to back</source>
+            <translation>Send to back</translation>
+        </message>
+        <message>
+            <source>Sequence number (scroll to adjust)</source>
+            <translation>Sequence number (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Sequence number background color</source>
+            <translation>Sequence number background color</translation>
+        </message>
+        <message>
+            <source>Sequence number background color %1</source>
+            <translation>Sequence number background color %1</translation>
+        </message>
+        <message>
+            <source>Sequence number background color transparent</source>
+            <translation>Sequence number background color transparent</translation>
+        </message>
+        <message>
+            <source>Sequence number color</source>
+            <translation>Sequence number color</translation>
+        </message>
+        <message>
+            <source>Sequence number color %1</source>
+            <translation>Sequence number color %1</translation>
+        </message>
+        <message>
+            <source>Sequence number font family</source>
+            <translation>Sequence number font family</translation>
+        </message>
+        <message>
+            <source>Sequence number font size %1px</source>
+            <translation>Sequence number font size %1px</translation>
+        </message>
+        <message>
+            <source>Sequence number numeric type</source>
+            <translation>Sequence number numeric type</translation>
+        </message>
+        <message>
+            <source>Sequence number type</source>
+            <translation>Sequence number type</translation>
+        </message>
+        <message>
+            <source>Serial number</source>
+            <translation>Serial number</translation>
+        </message>
+        <message>
+            <source>Settings</source>
+            <translation>Settings</translation>
+        </message>
+        <message>
+            <source>Shape</source>
+            <translation>Shape</translation>
+        </message>
+        <message>
+            <source>Show Cursor</source>
+            <translation>Show Cursor</translation>
+        </message>
+        <message>
+            <source>Show Playback Time</source>
+            <translation>Show Playback Time</translation>
+        </message>
+        <message>
+            <source>Show Progress Bar</source>
+            <translation>Show Progress Bar</translation>
+        </message>
+        <message>
+            <source>Show QR Code</source>
+            <translation>Show QR Code</translation>
+        </message>
+        <message>
+            <source>Show cursor in recording</source>
+            <translation>Show cursor in recording</translation>
+        </message>
+        <message>
+            <source>Show keystrokes in recording</source>
+            <translation>Show keystrokes in recording</translation>
+        </message>
+        <message>
+            <source>Show original image</source>
+            <translation>Show original image</translation>
+        </message>
+        <message>
+            <source>Smart Erase</source>
+            <translation>Smart Erase</translation>
+        </message>
+        <message>
+            <source>Snow Shot visual understanding</source>
+            <translation>Snow Shot visual understanding</translation>
+        </message>
+        <message>
+            <source>Solid arrow line</source>
+            <translation>Solid arrow line</translation>
+        </message>
+        <message>
+            <source>Solid circle</source>
+            <translation>Solid circle</translation>
+        </message>
+        <message>
+            <source>Solid fill</source>
+            <translation>Solid fill</translation>
+        </message>
+        <message>
+            <source>Solid sequence number background</source>
+            <translation>Solid sequence number background</translation>
+        </message>
+        <message>
+            <source>Solid square</source>
+            <translation>Solid square</translation>
+        </message>
+        <message>
+            <source>Solid stroke</source>
+            <translation>Solid stroke</translation>
+        </message>
+        <message>
+            <source>Solid text background</source>
+            <translation>Solid text background</translation>
+        </message>
+        <message>
+            <source>Source region outline</source>
+            <translation>Source region outline</translation>
+        </message>
+        <message>
+            <source>Speech Bubble</source>
+            <translation>Speech Bubble</translation>
+        </message>
+        <message>
+            <source>Split cells</source>
+            <translation>Split cells</translation>
+        </message>
+        <message>
+            <source>Spotlight</source>
+            <translation>Spotlight</translation>
+        </message>
+        <message>
+            <source>Square</source>
+            <translation>Square</translation>
+        </message>
+        <message>
+            <source>Start arrowhead</source>
+            <translation>Start arrowhead</translation>
+        </message>
+        <message>
+            <source>Start arrowhead bar</source>
+            <translation>Start arrowhead bar</translation>
+        </message>
+        <message>
+            <source>Start arrowhead circle</source>
+            <translation>Start arrowhead circle</translation>
+        </message>
+        <message>
+            <source>Start arrowhead circle outline</source>
+            <translation>Start arrowhead circle outline</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot many</source>
+            <translation>Start arrowhead crowfoot many</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot one</source>
+            <translation>Start arrowhead crowfoot one</translation>
+        </message>
+        <message>
+            <source>Start arrowhead crowfoot one or many</source>
+            <translation>Start arrowhead crowfoot one or many</translation>
+        </message>
+        <message>
+            <source>Start arrowhead diamond</source>
+            <translation>Start arrowhead diamond</translation>
+        </message>
+        <message>
+            <source>Start arrowhead diamond outline</source>
+            <translation>Start arrowhead diamond outline</translation>
+        </message>
+        <message>
+            <source>Start arrowhead dot</source>
+            <translation>Start arrowhead dot</translation>
+        </message>
+        <message>
+            <source>Start arrowhead indented triangle</source>
+            <translation>Start arrowhead indented triangle</translation>
+        </message>
+        <message>
+            <source>Start arrowhead none</source>
+            <translation>Start arrowhead none</translation>
+        </message>
+        <message>
+            <source>Start arrowhead standard</source>
+            <translation>Start arrowhead standard</translation>
+        </message>
+        <message>
+            <source>Start arrowhead triangle</source>
+            <translation>Start arrowhead triangle</translation>
+        </message>
+        <message>
+            <source>Start arrowhead triangle outline</source>
+            <translation>Start arrowhead triangle outline</translation>
+        </message>
+        <message>
+            <source>Start recording</source>
+            <translation>Start recording</translation>
+        </message>
+        <message>
+            <source>Stop recording</source>
+            <translation>Stop recording</translation>
+        </message>
+        <message>
+            <source>Straight arrow</source>
+            <translation>Straight arrow</translation>
+        </message>
+        <message>
+            <source>Straight line</source>
+            <translation>Straight line</translation>
+        </message>
+        <message>
+            <source>Stroke color</source>
+            <translation>Stroke color</translation>
+        </message>
+        <message>
+            <source>Stroke color %1</source>
+            <translation>Stroke color %1</translation>
+        </message>
+        <message>
+            <source>Stroke width %1</source>
+            <translation>Stroke width %1</translation>
+        </message>
+        <message>
+            <source>Subtract screenshot region</source>
+            <translation>Subtract screenshot region</translation>
+        </message>
+        <message>
+            <source>Table recognition</source>
+            <translation>Table recognition</translation>
+        </message>
+        <message>
+            <source>Table-Specific Model</source>
+            <translation>Table-Specific Model</translation>
+        </message>
+        <message>
+            <source>Tapered shaft</source>
+            <translation>Tapered shaft</translation>
+        </message>
+        <message>
+            <source>Tapered shafts support standard, triangle, triangle outline, and indented triangle arrowheads</source>
+            <translation>Tapered shafts support standard, triangle, triangle outline, and indented triangle arrowheads</translation>
+        </message>
+        <message>
+            <source>Target Language</source>
+            <translation>Target Language</translation>
+        </message>
+        <message>
+            <source>Template</source>
+            <translation>Template</translation>
+        </message>
+        <message>
+            <source>Template %1</source>
+            <translation>Template %1</translation>
+        </message>
+        <message>
+            <source>Template Name</source>
+            <translation>Template Name</translation>
+        </message>
+        <message>
+            <source>Template Value</source>
+            <translation>Template Value</translation>
+        </message>
+        <message>
+            <source>Text</source>
+            <translation>Text</translation>
+        </message>
+        <message>
+            <source>Text alignment</source>
+            <translation>Text alignment</translation>
+        </message>
+        <message>
+            <source>Text background color</source>
+            <translation>Text background color</translation>
+        </message>
+        <message>
+            <source>Text background color %1</source>
+            <translation>Text background color %1</translation>
+        </message>
+        <message>
+            <source>Text background color transparent</source>
+            <translation>Text background color transparent</translation>
+        </message>
+        <message>
+            <source>Text background corner radius (scroll to adjust)</source>
+            <translation>Text background corner radius (scroll to adjust)</translation>
+        </message>
+        <message>
+            <source>Text block</source>
+            <translation>Text block</translation>
+        </message>
+        <message>
+            <source>Text color</source>
+            <translation>Text color</translation>
+        </message>
+        <message>
+            <source>Text color %1</source>
+            <translation>Text color %1</translation>
+        </message>
+        <message>
+            <source>Text font family</source>
+            <translation>Text font family</translation>
+        </message>
+        <message>
+            <source>Text font size %1 (%2px)</source>
+            <translation>Text font size %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Text in box</source>
+            <translation>Text in box</translation>
+        </message>
+        <message>
+            <source>Text outline color %1</source>
+            <translation>Text outline color %1</translation>
+        </message>
+        <message>
+            <source>Text outline color transparent</source>
+            <translation>Text outline color transparent</translation>
+        </message>
+        <message>
+            <source>Text outline width</source>
+            <translation>Text outline width</translation>
+        </message>
+        <message>
+            <source>Text outline width %1px</source>
+            <translation>Text outline width %1px</translation>
+        </message>
+        <message>
+            <source>Text recognition</source>
+            <translation>Text recognition</translation>
+        </message>
+        <message>
+            <source>Text translation</source>
+            <translation>Text translation</translation>
+        </message>
+        <message>
+            <source>Thought Bubble</source>
+            <translation>Thought Bubble</translation>
+        </message>
+        <message>
+            <source>Translation service</source>
+            <translation>Translation service</translation>
+        </message>
+        <message>
+            <source>Translation settings</source>
+            <translation>Translation settings</translation>
+        </message>
+        <message>
+            <source>Transparent</source>
+            <translation>Transparent</translation>
+        </message>
+        <message>
+            <source>Trim Video</source>
+            <translation>Trim Video</translation>
+        </message>
+        <message>
+            <source>Unable to save scrolling screenshot settings</source>
+            <translation>Unable to save scrolling screenshot settings</translation>
+        </message>
+        <message>
+            <source>Undo</source>
+            <translation>Undo</translation>
+        </message>
+        <message>
+            <source>Upload to Cloud</source>
+            <translation>Upload to Cloud</translation>
+        </message>
+        <message>
+            <source>Uppercase letters</source>
+            <translation>Uppercase letters</translation>
+        </message>
+        <message>
+            <source>Vertical Crop</source>
+            <translation>Vertical Crop</translation>
+        </message>
+        <message>
+            <source>Vertical scrolling</source>
+            <translation>Vertical scrolling</translation>
+        </message>
+        <message>
+            <source>Vision Model</source>
+            <translation>Vision Model</translation>
+        </message>
+        <message>
+            <source>Watermark</source>
+            <translation>Watermark</translation>
+        </message>
+        <message>
+            <source>Watermark angle</source>
+            <translation>Watermark angle</translation>
+        </message>
+        <message>
+            <source>Watermark color</source>
+            <translation>Watermark color</translation>
+        </message>
+        <message>
+            <source>Watermark color %1</source>
+            <translation>Watermark color %1</translation>
+        </message>
+        <message>
+            <source>Watermark font family</source>
+            <translation>Watermark font family</translation>
+        </message>
+        <message>
+            <source>Watermark font size %1 (%2px)</source>
+            <translation>Watermark font size %1 (%2px)</translation>
+        </message>
+        <message>
+            <source>Watermark gap</source>
+            <translation>Watermark gap</translation>
+        </message>
+        <message>
+            <source>Watermark text</source>
+            <translation>Watermark text</translation>
+        </message>
+        <message>
+            <source>Webcam Shape</source>
+            <translation>Webcam Shape</translation>
+        </message>
+        <message>
+            <source>Webcam Size</source>
+            <translation>Webcam Size</translation>
+        </message>
+        <message>
+            <source>Yellow</source>
+            <translation>Yellow</translation>
+        </message>
+        <message>
+            <source>cm</source>
+            <translation>cm</translation>
+        </message>
+        <message>
+            <source>ft</source>
+            <translation>ft</translation>
+        </message>
+        <message>
+            <source>in</source>
+            <translation>in</translation>
+        </message>
+        <message>
+            <source>km</source>
+            <translation>km</translation>
+        </message>
+        <message>
+            <source>m</source>
+            <translation>m</translation>
+        </message>
+        <message>
+            <source>mm</source>
+            <translation>mm</translation>
+        </message>
+        <message>
+            <source>ms</source>
+            <translation>ms</translation>
+        </message>
+        <message>
+            <source>ms</source>
+            <comment>Auto-scroll interval unit</comment>
+            <translation>ms</translation>
+        </message>
+        <message>
+            <source>pt</source>
+            <translation>pt</translation>
+        </message>
+        <message>
+            <source>px</source>
+            <translation>px</translation>
+        </message>
+        <message>
+            <source>{text} represents the current watermark text; timestamp formats such as {YYYY-MM-DD_HH-mm-ss} are supported</source>
+            <translation>{text} represents the current watermark text; timestamp formats such as {YYYY-MM-DD_HH-mm-ss} are supported</translation>
+        </message>
+        <message>
+            <source>μm</source>
+            <translation>μm</translation>
+        </message>
+    </context>
+    <context>
+        <name>snow_shot::presentation::GlobalCanvasController</name>
+        <message>
+            <source>Could not change canvas click-through</source>
+            <translation>Could not change canvas click-through</translation>
+        </message>
+        <message>
+            <source>Could not show the laser pointer: %1</source>
+            <translation>Could not show the laser pointer: %1</translation>
+        </message>
+        <message>
+            <source>The laser pointer is unavailable</source>
+            <translation>The laser pointer is unavailable</translation>
+        </message>
+    </context>
+</TS>

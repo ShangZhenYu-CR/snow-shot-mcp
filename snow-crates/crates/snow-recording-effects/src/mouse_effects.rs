@@ -1,0 +1,253 @@
+use crate::mouse_hook::ObservedMouseButton;
+use crate::surface::{RgbaSurface, Surface};
+use std::collections::VecDeque;
+pub const CLICK_ANIMATION_MS: u64 = 600;
+pub const CLICK_QUEUE_DEPTH: usize = 128;
+/// Half-open pixel bounds [-radius, radius), with a one-pixel feather.
+/// Passed to the GPU compositor as well as used by the CPU/preview renderer.
+pub const HIGHLIGHT_RADIUS: i32 =
+    snow_recording_model::render::DEFAULT_MOUSE_HIGHLIGHT_RADIUS as i32;
+#[derive(Clone, Copy)]
+pub struct RenderClick {
+    pub timestamp_ms: u64,
+    pub x: i32,
+    pub y: i32,
+    pub button: ObservedMouseButton,
+}
+pub fn scale_point(x: i32, y: i32, source_size: (u32, u32), output_size: (u32, u32)) -> (i32, i32) {
+    (
+        scale_coordinate(x, source_size.0, output_size.0),
+        scale_coordinate(y, source_size.1, output_size.1),
+    )
+}
+
+pub fn scale_coordinate(value: i32, source_extent: u32, output_extent: u32) -> i32 {
+    if source_extent == 0 {
+        return value;
+    }
+    ((i64::from(value) * i64::from(output_extent) + i64::from(source_extent) / 2)
+        / i64::from(source_extent))
+    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+pub fn draw_clicks(
+    rgba: &mut [u8],
+    output_size: (u32, u32),
+    clicks: &VecDeque<RenderClick>,
+    timestamp_ms: u64,
+    color: [u8; 4],
+    source_size: (u32, u32),
+) {
+    draw_clicks_to(
+        &mut RgbaSurface {
+            pixels: rgba,
+            dimensions: output_size,
+        },
+        clicks,
+        timestamp_ms,
+        color,
+        source_size,
+    );
+}
+
+pub fn draw_clicks_to(
+    surface: &mut impl Surface,
+    clicks: &VecDeque<RenderClick>,
+    timestamp_ms: u64,
+    color: [u8; 4],
+    source_size: (u32, u32),
+) {
+    let output_size = surface.size();
+    for click in clicks {
+        let Some(age) = timestamp_ms.checked_sub(click.timestamp_ms) else {
+            continue;
+        };
+        if age > CLICK_ANIMATION_MS {
+            continue;
+        }
+        let progress = age as f32 / CLICK_ANIMATION_MS as f32;
+        let radius = 7 + (progress * 33.0).round() as i32;
+        let alpha = (f32::from(color[3]) * (1.0 - progress)).round() as u8;
+        let (x, y) = scale_point(click.x, click.y, source_size, output_size);
+        let thickness = match click.button {
+            ObservedMouseButton::Left => 3,
+            _ => 2,
+        };
+        draw_circle_outline_rgba(
+            surface,
+            x,
+            y,
+            radius,
+            [color[0], color[1], color[2], alpha],
+            thickness,
+        );
+    }
+}
+
+fn draw_circle_outline_rgba(
+    surface: &mut impl Surface,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let inner = radius.saturating_sub(thickness).max(0);
+    let outer_squared = radius * radius;
+    let inner_squared = inner * inner;
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            let distance = x * x + y * y;
+            if distance <= outer_squared && distance >= inner_squared {
+                surface.blend_pixel(center_x + x, center_y + y, color);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    #[test]
+    fn future_click_does_not_appear_in_an_earlier_output_slot() {
+        let mut pixels = vec![0; 100 * 100 * 4];
+        let clicks = VecDeque::from([RenderClick {
+            timestamp_ms: 101,
+            x: 50,
+            y: 50,
+            button: ObservedMouseButton::Left,
+        }]);
+        draw_clicks(&mut pixels, (100, 100), &clicks, 100, [255; 4], (100, 100));
+        assert!(pixels.iter().all(|pixel| *pixel == 0));
+        draw_clicks(&mut pixels, (100, 100), &clicks, 101, [255; 4], (100, 100));
+        assert!(pixels.iter().any(|pixel| *pixel != 0));
+    }
+}
+
+/// Fixed output-pixel geometry, shared by saved output and the desktop approximation.
+pub fn draw_highlight_to(
+    surface: &mut impl Surface,
+    center: (i32, i32),
+    color: [u8; 4],
+    multiply: bool,
+    radius: u32,
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let radius = radius as i32;
+    let (width, height) = surface.size();
+    for y in (center.1.saturating_sub(radius)).max(0)
+        ..(center.1.saturating_add(radius)).min(height as i32)
+    {
+        for x in (center.0.saturating_sub(radius)).max(0)
+            ..(center.0.saturating_add(radius)).min(width as i32)
+        {
+            let dx = (x - center.0) as f32 + 0.5;
+            let dy = (y - center.1) as f32 + 0.5;
+            let coverage = (radius as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            // Ties round to even so the CPU reference matches HLSL round() in recording_cursor.hlsl.
+            let alpha = (f32::from(color[3]) * coverage).round_ties_even() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            if multiply {
+                surface.span(x as u32, y as u32, 1, |pixel, _| {
+                    for channel in 0..3 {
+                        let factor = 255 * (255 - alpha) + alpha * u32::from(color[channel]);
+                        pixel[channel] =
+                            ((u32::from(pixel[channel]) * factor + 32512) / 65025) as u8;
+                    }
+                });
+            } else {
+                surface.blend_pixel(x, y, [color[0], color[1], color[2], alpha as u8]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    #[test]
+    fn custom_radius_controls_extent_and_clips_at_surface_edges() {
+        let size = (300, 300);
+        for radius in [8, 41, 96, 128] {
+            for multiply in [false, true] {
+                for center in [(150, 150), (0, 0), (299, 299)] {
+                    let mut pixels = [255; 4].repeat(300 * 300);
+                    draw_highlight_to(
+                        &mut RgbaSurface {
+                            pixels: &mut pixels,
+                            dimensions: size,
+                        },
+                        center,
+                        [255, 255, 0, 255],
+                        multiply,
+                        radius,
+                    );
+                    let blue = |x: usize, y: usize| pixels[(y * 300 + x) * 4 + 2];
+                    assert_eq!(blue(center.0 as usize, center.1 as usize), 0);
+                    if center == (150, 150) {
+                        assert_eq!(blue(150 + radius as usize - 2, 150), 0);
+                        assert_eq!(blue(150 + radius as usize, 150), 255);
+                        assert_eq!(blue(150, 150 - radius as usize - 1), 255);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_preserves_black_and_tints_content_with_alpha() {
+        for (background, expected) in [
+            ([255, 255, 255, 255], [255, 255, 127, 255]),
+            ([0, 0, 0, 255], [0, 0, 0, 255]),
+            ([80, 120, 200, 255], [80, 120, 100, 255]),
+        ] {
+            let mut pixels = background.repeat(64 * 64);
+            draw_highlight_to(
+                &mut RgbaSurface {
+                    pixels: &mut pixels,
+                    dimensions: (64, 64),
+                },
+                (32, 32),
+                [255, 255, 0, 128],
+                true,
+                snow_recording_model::render::DEFAULT_MOUSE_HIGHLIGHT_RADIUS,
+            );
+            assert_eq!(
+                &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
+                &expected
+            );
+            assert_eq!(&pixels[..4], &background);
+        }
+    }
+    #[test]
+    fn highlight_clips_and_zero_alpha_is_identity() {
+        let mut pixels = vec![255; 96 * 96 * 4];
+        draw_highlight_to(
+            &mut RgbaSurface {
+                pixels: &mut pixels,
+                dimensions: (96, 96),
+            },
+            (0, 0),
+            [255, 255, 0, 0],
+            true,
+            snow_recording_model::render::DEFAULT_MOUSE_HIGHLIGHT_RADIUS,
+        );
+        assert!(pixels.iter().all(|v| *v == 255));
+        draw_highlight_to(
+            &mut RgbaSurface {
+                pixels: &mut pixels,
+                dimensions: (96, 96),
+            },
+            (0, 0),
+            [255, 255, 0, 255],
+            true,
+            snow_recording_model::render::DEFAULT_MOUSE_HIGHLIGHT_RADIUS,
+        );
+        assert_eq!(&pixels[..4], &[255, 255, 0, 255]);
+        assert!(pixels.chunks_exact(4).any(|p| p[2] > 0 && p[2] < 255));
+    }
+}

@@ -1,0 +1,29 @@
+<!--
+Translation symbol adapted from Ant Design Icons outlined/translation.svg.
+
+MIT License
+
+Copyright (c) 2018-present Ant UED, https://xtech.antfin.com/
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="currentColor" data-adqt-slot="primary">
+  <path d="M95.36 149.12h654.08v183.68h85.12V99.84c0-19.824-16.016-35.84-35.84-35.84H46.08c-19.824 0-35.84 16.016-35.84 35.84v824.32c0 19.824 16.016 35.84 35.84 35.84h609.28v-85.12H95.36V149.12z"/>
+  <path d="M402.58 225.28h-67.87c-3.81 0-7.17 2.46-8.51 6.05L183.84 643.49c-.34.9-.45 1.9-.45 2.91 0 4.93 4.03 8.96 8.96 8.96h61.71c3.81 0 7.17-2.46 8.51-6.05L299.2 543.36h219.74L411.2 231.33c-1.46-3.58-4.82-6.05-8.62-6.05zm13.89 255.36h-95.76L368.64 341.98 416.46 480.64zM986.88 529.92H834.56v-104.16c0-4.93-4.03-8.96-8.96-8.96h-62.72c-4.93 0-8.96 4.03-8.96 8.96v104.16H601.6c-14.9 0-26.88 11.98-26.88 26.88v197.12c0 14.9 11.98 26.88 26.88 26.88h152.32v170.24c0 4.93 4.03 8.96 8.96 8.96h62.72c4.93 0 8.96-4.03 8.96-8.96V780.8h152.32c14.9 0 26.88-11.98 26.88-26.88V556.8c0-14.9-11.98-26.88-26.88-26.88zM753.92 700.16h-98.56v-89.6h98.56v89.6zm179.2 0h-98.56v-89.6h98.56v89.6z"/>
+</svg>
