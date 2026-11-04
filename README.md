@@ -17,8 +17,10 @@ See [MCP interface documentation](snow_shot/MCP.md),
 
 **Licensing:** Original copyright and attribution notices are retained. Snow Shot
 and this distribution's original application/orchestration changes remain
-**GPL-3.0-or-later**, with no additional restrictions. Apache-2.0 components and
-third-party materials retain their own licenses. See [LICENSE.md](LICENSE.md),
+**GPL-3.0-or-later**, except where a nested file or package specifies otherwise.
+In particular, the MCP bridge package retains the upstream `GPL-3.0-only`
+declaration in its Cargo.toml. No additional restrictions are imposed.
+Apache-2.0 components and third-party materials retain their own licenses. See [LICENSE.md](LICENSE.md),
 [the complete GPLv3 text](snow_shot/LICENSE), component `COPYRIGHT` files and
 `THIRD_PARTY_NOTICES.md` files. No warranty is provided.
 

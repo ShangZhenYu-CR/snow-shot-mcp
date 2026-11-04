@@ -7,8 +7,10 @@ Base commit: 4234e42cde1b56549e34ea04d0edbf426db0c1d2
 
 This is an independent modified source snapshot, not an official upstream release.
 Original copyright, license, warranty and third-party notices are retained.
-Application and original build-orchestration modifications are GPL-3.0-or-later.
-Existing Apache-2.0 components are not relicensed. The three vcpkg overlay port
+Application and original build-orchestration modifications follow their existing
+GPL-3.0-or-later scope, except for nested file/package declarations. In particular,
+the MCP bridge package retains its upstream GPL-3.0-only Cargo.toml declaration;
+its changes do not change that license. Existing Apache-2.0 components are not relicensed. The three vcpkg overlay port
 changes retain the licensing and attribution of their respective upstream material.
 The complete license texts, component COPYRIGHT files, third-party notices and
 pinned OCR submodule reference are included; no additional restriction is imposed.
